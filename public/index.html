@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>eVolt UA</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background-color: #111; }
+        #map { height: 100vh; width: 100%; }
+        .leaflet-popup-content-wrapper { background: #222; color: #fff; border-radius: 8px; }
+        .leaflet-popup-tip { background: #222; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <script>
+        const defaultLat = 49.84;
+        const defaultLon = 24.02;
+
+        var map = L.map('map').setView([defaultLat, defaultLon], 13);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+async function fetchAndDisplayStations(lat, lon) {
+            console.log("Запитуємо станції для:", lat, lon);
+            try {
+                // Використовуємо надійне склеювання рядків через звичайні кавички:
+                const response = await fetch('/api/stations?lat=' + lat + '&lon=' + lon);
+                const data = await response.json();
+                
+                console.log("Реальні дані від сервера:", data);
+                
+                if (data.success && data.stations) {
+                    data.stations.forEach(station => {
+                        L.marker([station.lat, station.lon])
+                            .addTo(map)
+                            .bindPopup('<b>🔋 ' + (station.name || 'Зарядна станція') + '</b><br>Відстань: <b>' + station.distance.toFixed(2) + ' км</b>');
+                    });
+                }
+            } catch (error) {
+                console.error("Помилка завантаження станцій з API:", error);
+            }
+        }
+
+        // Одразу завантажуємо дефолтні станції для Львова
+        fetchAndDisplayStations(defaultLat, defaultLon);
+
+        // Спроба отримати точну геолокацію
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const userLat = position.coords.latitude;
+                    const userLon = position.coords.longitude;
+                    map.setView([userLat, userLon], 14);
+                    L.circle([userLat, userLon], { color: '#007bff', radius: 80 }).addTo(map).bindPopup("Ви тут");
+                    fetchAndDisplayStations(userLat, userLon);
+                },
+                (error) => { console.warn("Геопозицію не отримано."); },
+                { timeout: 5000 }
+            );
+        }
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js');
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "eVolt UA",
+  "short_name": "eVolt",
+  "start_url": "/pwa",
+  "display": "standalone",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3014/3014164.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ]
+}
