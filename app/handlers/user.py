@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo  # Додай цей імпорт замість timedelta
 from aiogram import Router, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -123,7 +124,7 @@ async def process_connector_selection(callback_query: types.CallbackQuery, state
     await callback_query.answer("Запуск...", cache_time=2)
     await callback_query.message.edit_reply_markup(reply_markup=None)
     
-    connector_name = callback_query.data.split(":")[1]
+    connector_name = callback_query.data.split(":", 1)[1]
     await state.clear()
     
     cost_kwh = 5.0
@@ -244,10 +245,9 @@ async def cmd_history(message: types.Message, state: FSMContext):
  
     text = "📜 **Ваші останні 5 операцій:**\n\n"
     for amt, t, date_str in rows:
-        dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-        
-        # Додаємо 3 години, щоб перевести UTC у Київський час
-        dt_local = dt + timedelta(hours=3)
+        # Конвертуємо час з UTC у Київський часовий пояс
+        dt_utc = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=ZoneInfo("UTC"))
+        dt_local = dt_utc.astimezone(ZoneInfo("Europe/Kyiv"))
         formatted_date = dt_local.strftime('%d.%m %H:%M')
 
         kwh_amount = uah_to_kwh(amt)
@@ -263,6 +263,7 @@ async def cmd_history(message: types.Message, state: FSMContext):
 
         text += f"📅 {formatted_date} | {label}: `{sign}{kwh_amount:.2f} кВт`\n"
  
+    # Цей рядок має бути на одному рівні з "text =", рівно 4 пробіли від краю!
     await message.answer(text, parse_mode="Markdown")
 
 # --- Голосове керування через Gemini ---
