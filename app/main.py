@@ -3,12 +3,14 @@ import logging
 from app.core.loader import dp, bot
 from app.handlers import user
 from app.database.connection import initialize_db 
+from app.handlers.charge import charge_router
 
 async def main():
     # 1. Ініціалізуємо базу даних
     await initialize_db()
     
     # 2. Реєструємо роутер
+    dp.include_router(charge_router)
     dp.include_router(user.router)
     
     # 3. Налаштовуємо логування та запуск
