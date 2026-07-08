@@ -21,7 +21,6 @@ def get_tariffs_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🔋 Пакет 50 кВт·год (750 грн)", callback_data="buy_pack_50")
     builder.button(text="🔥 Пакет 100 кВт·год (1350 грн) -10%", callback_data="buy_pack_100")
-    builder.button(text="🌙 Активувати Нічний Безліміт", callback_data="activate_night")
     builder.adjust(1, 1, 1)
     return builder.as_markup()
 
