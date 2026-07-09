@@ -221,68 +221,55 @@ async def process_text_voucher(message: types.Message, state: FSMContext):
 async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-@@router.message(F.successful_payment)
-async def process_successful_payment(message: Message):
-    """Хендлер, який викликається автоматично після успішної оплати пакета"""
+@router.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    user_id = message.from_user.id
+    payload = message.successful_payment.invoice_payload
+    uah_amount = message.successful_payment.total_amount / 100
     
-    # 1. Визначаємо, яка сума надійшла (Telegram передає її в копійках, ділимо на 100)
-    total_amount = message.successful_payment.total_amount / 100  # Буде 1350.00
-    
-    # 2. 💥 НАДВАЖЛИВО: Записуємо ці гроші в базу даних PostgreSQL!
+    # 💥 Записуємо гроші в базу даних PostgreSQL
     await update_user_balance(
-        user_id=message.from_user.id, 
-        amount_uah=total_amount, 
-        t_type="package_100_kwh"
+        user_id=user_id,
+        amount_uah=uah_amount,
+        t_type=f"package_{payload}" if payload else "package_100_kwh"
     )
     
-    # 3. Твій красивий текст про успішну оплату
+    # 💥 Твій красивий текст про успішну оплату
     await message.answer(
-        f"🎉 <b>Оплата успішна!</b>\n"
-        f"💰 На Ваш баланс успішно зараховано <code>{total_amount} грн</code>.\n\n"
-        f"Тепер Ви можете користуватися будь-якою зарядною станцією мережі eVolt UA!",
+        f"🎉 <b>Оплата успішна!</b>\n\n"
+        f"💰 На Ваш баланс успішно зараховано: <code>{uah_amount} грн</code>.\n"
+        f"⚡ Дякуємо, що обираєте мережу eVolt UA!",
         parse_mode="HTML"
     )
-# --- Команда історії операцій ---
 
-# 1. Переконайся, що на початку файлу імпорт datetime виглядає так:
-from datetime import datetime, timedelta
+# # --- Команда історії операцій ---
 
-# 2. Онови саму функцію історії:
 @router.message(Command("history"))
-async def cmd_history(message: types.Message, state: FSMContext):
-    await state.clear()
-    rows = await db.fetchall(
-        'SELECT amount, type, created_at FROM transactions WHERE user_id = ? ORDER BY transaction_id DESC LIMIT 5',
-        (message.from_user.id,)
-    )
-
+async def cmd_history(message: types.Message):
+    user_id = message.from_user.id
+    
+    # 💥 Замість неіснуючого "db" використовуємо наш пул підключень
+    from app.database.connection import pool
+    
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT amount, transaction_type, created_at FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5",
+            user_id
+        )
+        
     if not rows:
-        await message.answer("📝 У вас ще немає історії операцій.")
+        await message.answer("📜 <b>Історія операцій порожня.</b>", parse_mode="HTML")
         return
- 
-    text = "📜 **Ваші останні 5 операцій:**\n\n"
-    for amt, t, date_str in rows:
-        # Конвертуємо час з UTC у Київський часовий пояс
-        dt_utc = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=ZoneInfo("UTC"))
-        dt_local = dt_utc.astimezone(ZoneInfo("Europe/Kyiv"))
-        formatted_date = dt_local.strftime('%d.%m %H:%M')
-
-        kwh_amount = uah_to_kwh(amt)
-
-        type_labels = {
-            "deposit": "📥 Поповнення",
-            "charge": "⚡ Зарядка",
-            "admin_adjustment": "🛠 Коригування",
-            "admin_set": "⚙️ Встановлення"
-        }
-        label = type_labels.get(t, t)
-        sign = "+" if amt > 0 else ""
-
-        text += f"📅 {formatted_date} | {label}: `{sign}{kwh_amount:.2f} кВт`\n"
- 
-    # Цей рядок має бути на одному рівні з "text =", рівно 4 пробіли від краю!
-    await message.answer(text, parse_mode="Markdown")
-
+        
+    text = "📜 <b>Останні 5 операцій:</b>\n\n"
+    for row in rows:
+        # Гарно форматуємо знак плюс для поповнень
+        sign = "+" if row['amount'] > 0 else ""
+        date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
+        
+        text += f"📅 {date_str} | <b>{sign}{row['amount']:.2f} грн</b> ({row['transaction_type']})\n"
+        
+    await message.answer(text, parse_mode="HTML")
 # --- Голосове керування через Gemini ---
 
 @router.message(F.voice)
