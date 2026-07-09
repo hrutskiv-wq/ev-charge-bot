@@ -3,14 +3,38 @@ version: '3.8'
 services:
   bot:
     build: .
-    restart: unless-stopped
-    volumes:
-      - .:/app
+    container_name: ev-charge-bot-bot-1
+    restart: always
     depends_on:
       - redis
+      - postgres  # Бот чекатиме на запуск бази даних
     environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - LOGS_CHAT_ID=${LOGS_CHAT_ID}
       - REDIS_HOST=redis
+      - DB_URL=postgresql+asyncpg://ev_admin:ev_secure_pass_2026@postgres:5432/ev_charge_base
+    volumes:
+      - .:/app
 
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
+    container_name: ev-charge-bot-redis-1
     restart: always
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ev-charge-bot-postgres-1
+    restart: always
+    environment:
+      POSTGRES_USER: ev_admin
+      POSTGRES_PASSWORD: ev_secure_pass_2026
+      POSTGRES_DB: ev_charge_base
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data  # Щоб дані не зникали при перезапуску
+
+volumes:
+  pgdata:  # Оголошуємо постійне сховище для PostgreSQL
