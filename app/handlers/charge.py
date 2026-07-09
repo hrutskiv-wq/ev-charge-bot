@@ -102,7 +102,7 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
 
 # ХЕНДЛЕР 2: Клік на роз'єм
 @charge_router.callback_query(ConnectorCallback.filter())
-async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: aiogram.fsm.context.FSMContext):
+async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state:FSMContext):
     id_connector = callback_data.id_connector
     await state.set_state(ChargingStates.charging_active)
     await state.update_data(active_connector_id=id_connector)
@@ -120,7 +120,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
 # ХЕНДЛЕР 3: Ручна зупинка
 @charge_router.message(ChargingStates.charging_active, F.text == "🛑 Зупинити зарядку")
 @charge_router.message(ChargingStates.charging_active, Command("stop"))
-async def handle_stop_charging(message: Message, state: aiogram.fsm.context.FSMContext):
+async def handle_stop_charging(message: Message, state: FSMContext):
     user_data = await state.get_data()
     connector_id = user_data.get("active_connector_id", "Невідомий")
     await state.clear()
@@ -145,7 +145,7 @@ async def handle_stop_charging(message: Message, state: aiogram.fsm.context.FSMC
 # ХЕНДЛЕР 4: Статус
 @charge_router.message(ChargingStates.charging_active, F.text == "📊 Статус")
 @charge_router.message(ChargingStates.charging_active, Command("status"))
-async def command_status_charging(message: Message, state: aiogram.fsm.context.FSMContext):
+async def command_status_charging(message: Message, state: FSMContext):
     user_data = await state.get_data()
     await message.answer(f"⏳ <b>Автомобіль заряджається!</b>\n🔌 Порт: <code>{user_data.get('active_connector_id')}</code>", parse_mode="HTML")
 
