@@ -2,7 +2,7 @@ import logging
 import asyncio
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters.callback_data import CallbackData
+from aiogram.filters import CallbackData, Command  # Додали Command фільтр
 from aiogram.fsm.context import FSMContext
 
 # Імпортуємо кастомні стани
@@ -80,7 +80,7 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
                 text=(
                     f"🔔 <b>Сповіщення від eVolt UA</b>\n\n"
                     f"🔋 <b>Ваш електромобіль повністю зарядився до 100%!</b>\n"
-                    f"Сесію успішно завершено автоматично з боку станції.\n\n"
+                    f"Сесію успешно завершено автоматично з боку станції.\n\n"
                     f"🏁 Порт: <code>{conn_id}</code>\n"
                     f"Тепер ви можете знову ввести новий ID станції."
                 ),
@@ -113,7 +113,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
         f"⚡ Комплекс: Зубра HyperCharger\n"
         f"🔌 Порт ID: {id_connector}\n"
         f"Статус: Заряджання автомобіля...\n\n"
-        f"<i>Всі інші функції бота заблоковано до зупинки сесії (або поки машина не зарядиться).</i>",
+        f"<i>Всі інші функції бота заблоковано. Ви можете використовувати команди /status або /stop.</i>",
         parse_mode="HTML",
         reply_markup=stop_keyboard
     )
@@ -129,7 +129,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
     )
 
 
-# ХЕНДЛЕР 3: Ручна зупинка сесії водієм
+# ХЕНДЛЕР 3: Ручна зупинка сесії водієм через кнопку
 @charge_router.callback_query(ChargingStates.charging_active, F.data == "stop_charging")
 async def handle_stop_charging(call: CallbackQuery, state: FSMContext):
     user_data = await state.get_data()
@@ -141,5 +141,46 @@ async def handle_stop_charging(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"🛑 <b>Зарядну сесію порту [{connector_id}] успішно завершено!</b>\n\n"
         f"Дякуємо, що скористалися eVolt UA. Тепер ви можете знову ввести новий ID станції.",
+        parse_mode="HTML"
+    )
+
+
+# ХЕНДЛЕР 4: Примусова текстова зупинка через команду /stop під час зарядки
+@charge_router.message(ChargingStates.charging_active, Command("stop"))
+async def command_stop_charging(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    connector_id = user_data.get("active_connector_id", "Невідомий")
+    
+    await state.clear()  # Очищуємо стан FSM в Redis
+    await message.answer(
+        f"🛑 <b>Зарядну сесію порту [{connector_id}] примусово зупинено через команду /stop!</b>\n\n"
+        f"Станцію звільнено. Тепер ви можете ввести новий ID станції.",
+        parse_mode="HTML"
+    )
+
+
+# ХЕНДЛЕР 5: Перевірка поточного статусу зарядки через команду /status
+@charge_router.message(ChargingStates.charging_active, Command("status"))
+async def command_status_charging(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    connector_id = user_data.get("active_connector_id", "Невідомий")
+    
+    await message.answer(
+        f"⏳ <b>Поточний статус сесії:</b>\n\n"
+        f"🔌 Активний порт: <code>{connector_id}</code>\n"
+        f"⚡ Процес: Автомобіль зараз отримує енергію.\n\n"
+        f"<i>Якщо ви втратили кнопку зупинки, надішліть команду /stop для переривання процесу.</i>",
+        parse_mode="HTML"
+    )
+
+
+# ХЕНДЛЕР 6: Заглушка-перехоплювач для будь-якого іншого тексту під час зарядки
+@charge_router.message(ChargingStates.charging_active)
+async def process_text_during_charge(message: Message):
+    await message.answer(
+        "🚨 <b>У вас є активна зарядна сесія!</b>\n\n"
+        "Введення нових ID станцій або тексту заблоковано до завершення процесу.\n\n"
+        "ℹ️ <i>Щоб перевірити показники, введіть /status\n"
+        "ℹ️ Щоб примусово вимкнути кабель, введіть /stop</i>",
         parse_mode="HTML"
     )
