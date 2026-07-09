@@ -229,24 +229,25 @@ async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
 @router.message(F.successful_payment)
 async def process_successful_payment(message: types.Message):
     user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload
-    uah_amount = message.successful_payment.total_amount / 100
+    payload = message.successful_payment.invoice_payload  # Отримуємо "pack_50" або "pack_100"
     
-    # 💥 Записуємо гроші в базу даних PostgreSQL
+    # 🎯 Визначаємо чисту кількість кВт·год замість грошей
+    kwh_amount = 50.0 if payload == "pack_50" else 100.0
+    
+    # Записуємо кіловати в базу даних PostgreSQL
     await update_user_balance(
         user_id=user_id,
-        amount_uah=uah_amount,
-        t_type=f"package_{payload}" if payload else "package_100_kwh"
+        amount_uah=kwh_amount,  # Передаємо чисті кіловати в базу
+        t_type=f"buy_{payload}" if payload else "buy_pack_100"
     )
     
-    # 💥 Твій красивий текст про успішну оплату
+    # Виводимо повідомлення ТІЛЬКИ в кВт·год
     await message.answer(
-        f"🎉 <b>Оплата успішна!</b>\n\n"
-        f"💰 На Ваш баланс успішно зараховано: <code>{uah_amount} грн</code>.\n"
-        f"⚡ Дякуємо, що обираєте мережу eVolt UA!",
+        f"🎉 <b>Пакет активовано успішно!</b>\n\n"
+        f"🔋 На Ваш рахунок зараховано: <b>{kwh_amount} кВт·год</b>.\n"
+        f"⚡ Кнопка «Зарядка» активована. Приємної подорожі!",
         parse_mode="HTML"
     )
-
 # # --- Команда історії операцій ---
 
 @router.message(Command("history"))
