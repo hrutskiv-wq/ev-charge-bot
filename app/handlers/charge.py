@@ -5,12 +5,11 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 
-# Імпортуємо наші кастомні стани
+# Імпортуємо кастомні стани
 from app.states.charge_states import ChargingStates
 
 charge_router = Router()
 
-# 1. Фабрика для кнопок портів
 class ConnectorCallback(CallbackData, prefix="station_connector"):
     station_id: str
     id_connector: str
@@ -58,7 +57,7 @@ async def handle_station_id(message: Message):
     
     await message.answer(
         text=(
-            f"⚡ <b>Complex: Zubra HyperCharger</b>\n"
+            f"⚡ <b>Комплекс: Зубра HyperCharger</b>\n"
             f"🚉 Станція ID: <code>{station_id}</code>\n\n"
             f"Будь ласка, оберіть роз'єм (кабель), який ви підключили до свого електромобіля:"
         ),
@@ -67,16 +66,11 @@ async def handle_station_id(message: Message):
     )
 
 
-# ФОНОВА ТАСКА: Симулює сигнал від залізяки через 15 секунд
+# ФОНОВА ТАСКА: Симулює автоматичну зупинку від залізяки через 15 секунд
 async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
-    """
-    Ця функція працює у фоні. Вона чекає 15 секунд і перевіряє:
-    якщо водій досі заряджається, станція сама завершує сесію.
-    """
     await asyncio.sleep(15)  # Імітуємо 15 секунд активної зарядки
     
     current_state = await target_state.get_state()
-    # Якщо водій сам не натиснув кнопку "Зупинити" раніше часу
     if current_state == ChargingStates.charging_active:
         await target_state.clear()  # Скидаємо стан FSM "ззовні"
         
@@ -96,7 +90,7 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
             logging.error(f"Не вдалося надіслати сповіщення про автозупинку: {e}")
 
 
-# ХЕНДЛЕР 2: Обробка кліку на кнопку роз'єму (Вмикаємо зарядку)
+# ХЕНДЛЕР 2: Обробка кліку на кнопку роз'єму (Вмикаємо зарядку та стейт)
 @charge_router.callback_query(ConnectorCallback.filter())
 async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: FSMContext):
     station_id = callback_data.station_id
@@ -104,7 +98,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
     
     logging.info(f"Запуск порту ID {id_connector} на станції {station_id}")
     
-    # Активуємо стан зарядки
+    # Активуємо стан зарядки в Redis
     await state.set_state(ChargingStates.charging_active)
     await state.update_data(active_connector_id=id_connector)
     
@@ -124,7 +118,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
         reply_markup=stop_keyboard
     )
     
-    # 🚀 ЗАПУСКАЄМО ФОНОВУ СИМУЛЯЦІЮ АВТОЗУПИНКИ СТАНЦІЇ
+    # Запускаємо асинхронну фонову таску автозупинки станції
     asyncio.create_task(
         simulate_station_auto_stop(
             chat_id=call.from_user.id,
