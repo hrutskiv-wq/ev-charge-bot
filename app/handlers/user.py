@@ -38,8 +38,16 @@ async def cmd_start(message: types.Message):
     # Отримуємо чистий баланс кВт·год з PostgreSQL
     balance, discount = await get_user_data(user_id)
     
-    # Формуємо красиве меню з кнопками
-    from app.keyboards.reply import main_menu
+    # 🔥 Створюємо меню прямо тут, щоб назавжди уникнути помилок імпорту
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    main_menu = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Зарядка ⚡")],
+            [KeyboardButton(text="Як працює? 🤨")],
+            [KeyboardButton(text="Ваучер 🎫"), KeyboardButton(text="Online підтримка 📢")]
+        ],
+        resize_keyboard=True
+    )
     
     await message.answer(
         f"👋 <b>Доброго дня, {message.from_user.first_name}!</b>\n\n"
