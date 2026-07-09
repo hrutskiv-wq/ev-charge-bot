@@ -221,16 +221,27 @@ async def process_text_voucher(message: types.Message, state: FSMContext):
 async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-@router.message(F.successful_payment)
-async def process_successful_payment(message: types.Message):
-    user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload
-    kwh_amount = 50.0 if payload == "pack_50" else 100.0
-    uah_amount = message.successful_payment.total_amount / 100
-
-    await update_user_balance(user_id, uah_amount, "deposit")
-    await message.answer(f"🎉 **Оплата успішна!**\nНа баланс зараховано **{kwh_amount:.2f} кВт·год**.", reply_markup=get_main_menu())
-
+@@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    """Хендлер, який викликається автоматично після успішної оплати пакета"""
+    
+    # 1. Визначаємо, яка сума надійшла (Telegram передає її в копійках, ділимо на 100)
+    total_amount = message.successful_payment.total_amount / 100  # Буде 1350.00
+    
+    # 2. 💥 НАДВАЖЛИВО: Записуємо ці гроші в базу даних PostgreSQL!
+    await update_user_balance(
+        user_id=message.from_user.id, 
+        amount_uah=total_amount, 
+        t_type="package_100_kwh"
+    )
+    
+    # 3. Твій красивий текст про успішну оплату
+    await message.answer(
+        f"🎉 <b>Оплата успішна!</b>\n"
+        f"💰 На Ваш баланс успішно зараховано <code>{total_amount} грн</code>.\n\n"
+        f"Тепер Ви можете користуватися будь-якою зарядною станцією мережі eVolt UA!",
+        parse_mode="HTML"
+    )
 # --- Команда історії операцій ---
 
 # 1. Переконайся, що на початку файлу імпорт datetime виглядає так:
