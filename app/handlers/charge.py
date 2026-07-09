@@ -2,7 +2,8 @@ import logging
 import asyncio
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CallbackData, Command  # Додали Command фільтр
+from aiogram.filters import Command  # 🔗 Тільки Command
+from aiogram.filters.callback_data import CallbackData  # 🔗 CallbackData окремо
 from aiogram.fsm.context import FSMContext
 
 # Імпортуємо кастомні стани
