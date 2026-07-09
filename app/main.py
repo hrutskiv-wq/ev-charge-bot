@@ -10,6 +10,9 @@ from aiogram.types import ErrorEvent
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio.client import Redis
 
+# Імпорти для PostgreSQL
+from app.database.connection import init_postgres, close_postgres
+
 # Імпортуємо роутери
 from app.handlers.user import router as user_router
 from app.handlers.charge import charge_router
@@ -19,7 +22,6 @@ async def global_error_handler(event: ErrorEvent, bot: Bot):
     exception = event.exception
     update = event.update
     
-    # Ігноруємо дублюючі кліки (double-tap), щоб не спамити в чат логів
     if "message is not modified" in str(exception):
         try:
             if update.callback_query:
@@ -57,7 +59,8 @@ async def global_error_handler(event: ErrorEvent, bot: Bot):
         if update.message:
             await update.message.answer(
                 "⚠️ <b>Вибачте, виникла тимчасова технічна помилка.</b>\n"
-                "Наші інженери вже отримали звіт і виправляють її. Спробуйте, будь ласка, за хвилину!"
+                "Наші інженери вже отримали звіт і виправляють її. Спробуйте, будь ласка, за хвилину!",
+                parse_mode="HTML"  # Тепер теги будуть красивими і жирними
             )
         elif update.callback_query:
             await update.callback_query.answer(
@@ -74,10 +77,11 @@ async def main():
 
     bot = Bot(token=bot_token)
 
+    # 💥 ЗАПУСКАЄМО ПУЛ POSTGRESQL ТА СТВОРЮЄМО ТАБЛИЦІ
+    await init_postgres()
+
     # НАЛАШТУВАННЯ REDIS ДЛЯ ЗБЕРЕЖЕННЯ СТАНІВ FSM
     redis_host = os.getenv("REDIS_HOST", "redis" if os.path.exists("/.dockerenv") else "localhost")
-    logging.info(f"Connecting FSM to Redis storage at {redis_host}:6379")
-    
     redis_client = Redis(host=redis_host, port=6379, decode_responses=True)
     storage = RedisStorage(redis=redis_client)
 
@@ -91,10 +95,15 @@ async def main():
     dp.include_router(user_router)
 
     logging.basicConfig(level=logging.INFO)
-    print("Бот запущено з підтримкою залізобетонних станів Redis!")
+    print("Бот запущено з підтримкою Redis та PostgreSQL!")
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # 🔒 ЗАКРИВАЄМО ПУЛ ПРИ ЗУПИНЦІ БОТА
+        await close_postgres()
 
 
 if __name__ == "__main__":
