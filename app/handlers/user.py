@@ -237,19 +237,16 @@ async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
 @router.message(F.successful_payment)
 async def process_successful_payment(message: types.Message):
     user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload  # Отримуємо "pack_50" або "pack_100"
+    payload = message.successful_payment.invoice_payload
     
-    # 🎯 Визначаємо чисту кількість кВт·год замість грошей
+    # Скільки грошей прийшло від Telegram (750 або 1350)
+    uah_amount = message.successful_payment.total_amount / 100
+    # Визначаємо чистий об'єм кВт·год для тексту повідомлення
     kwh_amount = 50.0 if payload == "pack_50" else 100.0
     
-    # Записуємо кіловати в базу даних PostgreSQL
-    await update_user_balance(
-        user_id=user_id,
-        amount_uah=kwh_amount,  # Передаємо чисті кіловати в базу
-        t_type=f"buy_{payload}" if payload else "buy_pack_100"
-    )
+    # Нараховуємо суму в базу даних (750 одиниць бази = 50 кВт·год)
+    await update_user_balance(user_id, uah_amount, f"buy_{payload}")
     
-    # Виводимо повідомлення ТІЛЬКИ в кВт·год
     await message.answer(
         f"🎉 <b>Пакет активовано успішно!</b>\n\n"
         f"🔋 На Ваш рахунок зараховано: <b>{kwh_amount} кВт·год</b>.\n"
