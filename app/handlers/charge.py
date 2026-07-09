@@ -5,9 +5,9 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
-from aiogram.filters import CallbackData, Command
+from aiogram.filters import Command
+from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-
 # 💥 Імпортуємо функції роботи з PostgreSQL
 from app.database.connection import (
     get_user_data, update_user_balance, PRICE_PER_KWH, kwh_to_uah
@@ -66,7 +66,7 @@ async def handle_station_id(message: Message):
 
 
 # ФОНОВА ТАСКА: Списання грошей після 15 секунд зарядки
-async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
+async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: aiogram.fsm.context.FSMContext, conn_id: str):
     await asyncio.sleep(15)  # Симулюємо сесію
     
     current_state = await target_state.get_state()
@@ -102,7 +102,7 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
 
 # ХЕНДЛЕР 2: Клік на роз'єм
 @charge_router.callback_query(ConnectorCallback.filter())
-async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: FSMContext):
+async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: aiogram.fsm.context.FSMContext):
     id_connector = callback_data.id_connector
     await state.set_state(ChargingStates.charging_active)
     await state.update_data(active_connector_id=id_connector)
@@ -120,7 +120,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
 # ХЕНДЛЕР 3: Ручна зупинка
 @charge_router.message(ChargingStates.charging_active, F.text == "🛑 Зупинити зарядку")
 @charge_router.message(ChargingStates.charging_active, Command("stop"))
-async def handle_stop_charging(message: Message, state: FSMContext):
+async def handle_stop_charging(message: Message, state: aiogram.fsm.context.FSMContext):
     user_data = await state.get_data()
     connector_id = user_data.get("active_connector_id", "Невідомий")
     await state.clear()
@@ -145,7 +145,7 @@ async def handle_stop_charging(message: Message, state: FSMContext):
 # ХЕНДЛЕР 4: Статус
 @charge_router.message(ChargingStates.charging_active, F.text == "📊 Статус")
 @charge_router.message(ChargingStates.charging_active, Command("status"))
-async def command_status_charging(message: Message, state: FSMContext):
+async def command_status_charging(message: Message, state: aiogram.fsm.context.FSMContext):
     user_data = await state.get_data()
     await message.answer(f"⏳ <b>Автомобіль заряджається!</b>\n🔌 Порт: <code>{user_data.get('active_connector_id')}</code>", parse_mode="HTML")
 
