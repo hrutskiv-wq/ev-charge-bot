@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio  # 💥 ДОДАЙ ЦЕЙ РЯДОК, щоб запрацював sleep()
 import asyncpg
 
 PRICE_PER_KWH = 15.0  # Вартість 1 кВт для конвертації
@@ -11,11 +12,10 @@ def kwh_to_uah(amount_kwh): return amount_kwh * PRICE_PER_KWH
 db_pool = None
 
 async def init_postgres():
-    """Ініціалізація пулу підключень та створення таблиць при старті бота"""
+    """Ініціалізація пулу підключень із механізмом повторних спроб для Docker"""
     global db_pool
     db_url = os.getenv("DB_URL")
     
-    # Коригуємо префікс для драйвера asyncpg
     if db_url and db_url.startswith("postgresql+asyncpg://"):
         db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
         
@@ -23,16 +23,25 @@ async def init_postgres():
         logging.error("❌ Змінну оточення DB_URL не знайдено!")
         return
 
-    try:
-        logging.info("Підключення до бази даних PostgreSQL...")
-        db_pool = await asyncpg.create_pool(dsn=db_url, min_size=2, max_size=10)
-        logging.info("✅ Пул підключень до PostgreSQL успішно створено!")
-        
-        # Створюємо таблиці, якщо їх немає
-        await create_tables()
-    except Exception as e:
-        logging.error(f"💥 Помилка ініціалізації PostgreSQL: {e}", exc_info=True)
-
+    # Робимо до 5 спроб підключення з паузою, щоб дати Postgres час завантажитися
+    retries = 5
+    for attempt in range(1, retries + 1):
+        try:
+            logging.info(f"Спроба підключення до PostgreSQL {attempt}/{retries}...")
+            db_pool = await asyncpg.create_pool(dsn=db_url, min_size=2, max_size=10)
+            logging.info("✅ Пул підключень до PostgreSQL успішно створено!")
+            
+            # Створюємо таблиці
+            await create_tables()
+            return  # Успішно підключилися, виходимо з функції
+            
+        except Exception as e:
+            logging.warning(f"⚠️ База даних ще не готова (спроба {attempt}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(3)  # Чекаємо 3 секунди перед наступною спробою
+            else:
+                logging.error("💥 Не вдалося підключитися до PostgreSQL після всіх спроб!")
+                raise e  # Кидаємо помилку далі, щоб Docker перезапустив контейнер бота
 
 async def create_tables():
     """Створення таблиць (аналог вашого initialize_db)"""
@@ -138,7 +147,6 @@ async def update_user_balance(user_id, amount_uah, t_type="deposit"):
         
         await conn.execute('UPDATE users SET balance = balance + $1 WHERE user_id = $2', amount_uah, user_id)
         await log_transaction(user_id, amount_uah, t_type)
-
 
 async def set_user_discount(user_id, discount_value):
     """Встановлення індивідуальної знижки для водія"""
