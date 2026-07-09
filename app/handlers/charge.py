@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 
-# 💥 Імпортуємо чисті функції роботи з PostgreSQL (без грн та тарифів)
+# Імпортуємо функції роботи з PostgreSQL
 from app.database.connection import (
     get_user_data, update_user_balance, get_station_by_id
 )
@@ -22,18 +22,28 @@ class ConnectorCallback(CallbackData, prefix="station_connector"):
     id_connector: str
     connector_type: str
 
+# 1. Меню, яке показується ПІД ЧАС зарядки
 charging_reply_menu = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛑 Зупинити зарядку")]],
+    keyboard=[[KeyboardButton(text="📊 Status"), KeyboardButton(text="🛑 Зупинити зарядку")]],
+    resize_keyboard=True
+)
+
+# 2. 🔥 ГОЛОВНЕ МЕНЮ, в яке бот буде повертати водія після закінчення сесії
+main_reply_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Зарядка ⚡")],
+        [KeyboardButton(text="Як працює? 🤨")],
+        [KeyboardButton(text="Ваучер 🎫"), KeyboardButton(text="Online підтримка 📢")]
+    ],
     resize_keyboard=True
 )
 
 
-# ХЕНДЛЕР 1: Обробка введення ID станції (Динамічні роз'єми з БД)
+# ХЕНДЛЕР 1: Обробка введення ID станції
 @charge_router.message(F.text.regexp(r"OCM-\d+"))
 async def handle_station_id(message: Message):
     station_id = message.text.strip()
     
-    # Перевіряємо залишок пакета кВт·год перед тим, як дозволити запуск
     balance, discount = await get_user_data(message.from_user.id)
     if balance <= 0:
         await message.answer(
@@ -44,15 +54,14 @@ async def handle_station_id(message: Message):
         )
         return
 
-    # Отримуємо реальні дані станції з бази даних PostgreSQL
     station_data = await get_station_by_id(station_id)
     buttons = []
     
-    if station_data and station_data[2]:  # station_data[2] — це рядок із роз'ємами
+    if station_data and station_data[2]:
         raw_connectors = [c.strip() for c in station_data[2].split(",") if c.strip()]
         for i, conn_name in enumerate(raw_connectors):
             short_type = conn_name.split("(")[0].strip()[:10]
-            conn_id = f"P{i+1}"  # Унікальний ID порту (P1, P2...)
+            conn_id = f"P{i+1}"
             display_text = f"🔌 Увімкнути {conn_name}"
             buttons.append([
                 InlineKeyboardButton(
@@ -65,7 +74,6 @@ async def handle_station_id(message: Message):
                 )
             ])
     else:
-        # Резервний дефолтний варіант, якщо станції тимчасово немає в локальній БД
         mock_api_response = [
             {"id": "4501", "type": "CCS (Type 2)", "power": "120"},
             {"id": "4502", "type": "CHAdeMO", "power": "50"}
@@ -85,21 +93,16 @@ async def handle_station_id(message: Message):
     )
 
 
-# ФОНОВА ТАСКА: Автоматична зупинка (Списання чистих кВт·год)
+# ФОНОВА ТАСКА: Автоматична зупинка
 async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
-    await asyncio.sleep(15)  # Симулюємо сесію заправки
+    await asyncio.sleep(15)
     
     current_state = await target_state.get_state()
     if current_state == ChargingStates.charging_active:
         await target_state.clear()
         
-        # Симулюємо споживання в кВт·год
         consumed_kwh = 8.5
-        
-        # 💥 Списуємо чисті кВт·год з бази даних (передаємо мінусове значення)
         await update_user_balance(chat_id, -consumed_kwh, t_type="charge_session")
-        
-        # Беремо свіжий пакетний баланс водія після списання
         new_balance, _ = await get_user_data(chat_id)
         
         try:
@@ -110,10 +113,10 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
                     f"🏁 Порт: <code>{conn_id}</code>\n"
                     f"🔋 Спожито за сесію: <b>{consumed_kwh} кВт·год</b>\n"
                     f"📉 Ваш залишок пакета: <b>{new_balance} кВт·год</b>\n\n"
-                    f"Дякуємо, що обираєте мережу eVolt UA!"
+                    f"Повертаємось до головного меню мережі eVolt UA:"
                 ),
                 parse_mode="HTML",
-                reply_markup=ReplyKeyboardRemove()
+                reply_markup=main_reply_menu  # 🔥 ТУТ: автоматично повертаємо кнопки головного меню
             )
         except Exception as e:
             logging.error(f"Помилка надсилання сповіщення: {e}")
@@ -136,7 +139,7 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
     asyncio.create_task(simulate_station_auto_stop(chat_id=call.from_user.id, message_bot=call.bot, target_state=state, conn_id=id_connector))
 
 
-# ХЕНДЛЕР 3: Ручна зупинка водієм (Списання чистих кВт·год)
+# ХЕНДЛЕР 3: Ручна зупинка водієм
 @charge_router.message(ChargingStates.charging_active, F.text == "🛑 Зупинити зарядку")
 @charge_router.message(ChargingStates.charging_active, Command("stop"))
 async def handle_stop_charging(message: Message, state: FSMContext):
@@ -144,10 +147,7 @@ async def handle_stop_charging(message: Message, state: FSMContext):
     connector_id = user_data.get("active_connector_id", "Невідомий")
     await state.clear()
     
-    # При ручній зупинці списуємо менше, наприклад 2.0 кВт·год
     consumed_kwh = 2.0
-    
-    # 💥 Списуємо чисті кВт·год з бази danych
     await update_user_balance(message.from_user.id, -consumed_kwh, t_type="charge_manual_stop")
     new_balance, _ = await get_user_data(message.from_user.id)
     
@@ -155,9 +155,10 @@ async def handle_stop_charging(message: Message, state: FSMContext):
         f"🛑 <b>Зарядку зупинено водієм!</b>\n\n"
         f"🏁 Порт: <code>{connector_id}</code>\n"
         f"🔋 Спожито за сесію: <b>{consumed_kwh} кВт·год</b>\n"
-        f"📉 Ваш залишок пакета: <b>{new_balance} кВт·год</b>",
+        f"📉 Ваш залишок пакета: <b>{new_balance} кВт·год</b>\n\n"
+        f"Повертаємось до головного меню мережі eVolt UA:",
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=main_reply_menu  # 🔥 ТУТ: повертаємо кнопки головного меню при ручній зупинці
     )
 
 
@@ -169,7 +170,7 @@ async def command_status_charging(message: Message, state: FSMContext):
     await message.answer(f"⏳ <b>Автомобіль заряджається!</b>\n🔌 Порт: <code>{user_data.get('active_connector_id')}</code>", parse_mode="HTML")
 
 
-# ХЕНДЛЕР 5: Заглушка текстів під час зарядки
+# ХЕНДЛЕР 5: Заглушка
 @charge_router.message(ChargingStates.charging_active)
 async def process_text_during_charge(message: Message):
     await message.answer("🚨 <b>Йде зарядка!</b> Використовуйте нижні кнопки керування.", parse_mode="HTML")
