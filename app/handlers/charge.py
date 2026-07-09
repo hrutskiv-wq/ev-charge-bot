@@ -1,42 +1,43 @@
 import logging
 import asyncio
-from aiogram import Router, F, Bot
+from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+
+# Імпортуємо наші кастомні стани
+from app.states.charge_states import ChargingStates
 
 charge_router = Router()
 
-# 1. Оновлюємо фабрику: тепер вона вміє зберігати точний ID конкретного порту
+# 1. Фабрика для кнопок портів
 class ConnectorCallback(CallbackData, prefix="station_connector"):
     station_id: str
-    id_connector: str  # Додали унікальний ID порту (наприклад, "4501")
+    id_connector: str
     connector_type: str
 
 
-# 2. ХЕНДЛЕР 1: Обробка введення ID станції (наприклад, OCM-307584)
+# ХЕНДЛЕР 1: Обробка введення ID станції (OCM-307584)
 @charge_router.message(F.text.regexp(r"OCM-\d+"))
 async def handle_station_id(message: Message):
     station_id = message.text.strip()
     logging.info(f"Запит роз'ємів для станції: {station_id}")
     
-    # СИМУЛЯЦІЯ ВІДПОВІДІ API (як для станції в Зубрі):
-    # У реальному житті цей список прилетить із сервера еVolt/Toka
     mock_api_response = [
-        {"id": "4501", "type": "CCS (Type 2)", "power": 240},
-        {"id": "4502", "type": "CCS (Type 2)", "power": 240},  # Другий такий самий кабель
-        {"id": "4503", "type": "GB-T DC", "power": 240},
-        {"id": "4504", "type": "Type 2", "power": 22}
+        {"id": "4501", "type": "CCS (Type 2)", "power": "240"},
+        {"id": "4502", "type": "CCS (Type 2)", "power": "240"},
+        {"id": "4503", "type": "GB-T DC", "power": "160"},
+        {"id": "4504", "type": "Type 2", "power": "22"}
     ]
     
     buttons = []
-    ccs_counter = 0  # Лічильник суто для гарного маркування портів CCS
+    ccs_counter = 0
     
     for conn in mock_api_response:
         text_type = conn['type']
         power = conn['power']
         
-        # Якщо це CCS і це швидка зарядка, нумеруємо порти, щоб водій не плутався
-        if text_type == "CCS (Type 2)" and power > 50:
+        if text_type == "CCS (Type 2)":
             ccs_counter += 1
             display_text = f"🔌 Увімкнути CCS (Type 2) [Порт {ccs_counter}] ({power} кВт)"
         else:
@@ -45,10 +46,9 @@ async def handle_station_id(message: Message):
         buttons.append([
             InlineKeyboardButton(
                 text=display_text,
-                # Зашиваємо точні дані в кнопку
                 callback_data=ConnectorCallback(
                     station_id=station_id,
-                    id_connector=str(conn['id']),  # Тепер передається точний ID порту!
+                    id_connector=str(conn['id']),
                     connector_type=text_type
                 ).pack()
             )
@@ -58,8 +58,8 @@ async def handle_station_id(message: Message):
     
     await message.answer(
         text=(
-            f"⚡️ <b>Комплекс: Зубра HyperCharger</b>\n"
-            f"Станція ID: <code>{station_id}</code>\n\n"
+            f"⚡ <b>Complex: Zubra HyperCharger</b>\n"
+            f"🚉 Станція ID: <code>{station_id}</code>\n\n"
             f"Будь ласка, оберіть роз'єм (кабель), який ви підключили до свого електромобіля:"
         ),
         reply_markup=keyboard,
@@ -67,38 +67,85 @@ async def handle_station_id(message: Message):
     )
 
 
-# 3. ХЕНДЛЕР 2: Обробка кліку на кнопку роз'єму
+# ФОНОВА ТАСКА: Симулює сигнал від залізяки через 15 секунд
+async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
+    """
+    Ця функція працює у фоні. Вона чекає 15 секунд і перевіряє:
+    якщо водій досі заряджається, станція сама завершує сесію.
+    """
+    await asyncio.sleep(15)  # Імітуємо 15 секунд активної зарядки
+    
+    current_state = await target_state.get_state()
+    # Якщо водій сам не натиснув кнопку "Зупинити" раніше часу
+    if current_state == ChargingStates.charging_active:
+        await target_state.clear()  # Скидаємо стан FSM "ззовні"
+        
+        try:
+            await message_bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔔 <b>Сповіщення від eVolt UA</b>\n\n"
+                    f"🔋 <b>Ваш електромобіль повністю зарядився до 100%!</b>\n"
+                    f"Сесію успішно завершено автоматично з боку станції.\n\n"
+                    f"🏁 Порт: <code>{conn_id}</code>\n"
+                    f"Тепер ви можете знову ввести новий ID станції."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Не вдалося надіслати сповіщення про автозупинку: {e}")
+
+
+# ХЕНДЛЕР 2: Обробка кліку на кнопку роз'єму (Вмикаємо зарядку)
 @charge_router.callback_query(ConnectorCallback.filter())
-async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback):
+async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: FSMContext):
     station_id = callback_data.station_id
-    id_connector = callback_data.id_connector  # Отримуємо точний ID кабелю
-    connector_type = callback_data.connector_type 
-    # Виводимо в логи сервера точну інформацію, який кабель запускається
-    logging.info(f"Запуск порту ID {id_connector} ({connector_type}) на станції {station_id}")
+    id_connector = callback_data.id_connector
+    
+    logging.info(f"Запуск порту ID {id_connector} на станції {station_id}")
+    
+    # Активуємо стан зарядки
+    await state.set_state(ChargingStates.charging_active)
+    await state.update_data(active_connector_id=id_connector)
     
     await call.answer("Автентифікація сесії...")
     
+    stop_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Зупинити зарядку", callback_data="stop_charging")]
+    ])
+    
     await call.message.edit_text(
-        text=(
-            f"⏳ <b>Авторизація сесії...</b>\n"
-            f"Підключення до кабелю [ID: {id_connector}] на станції {station_id}...\n\n"
-            f"Будь ласка, зачекайте."
-        ),
-        parse_mode="HTML"
+        f"🔋 <b>Зарядка успішно активована!</b>\n\n"
+        f"⚡ Комплекс: Зубра HyperCharger\n"
+        f"🔌 Порт ID: {id_connector}\n"
+        f"Статус: Заряджання автомобіля...\n\n"
+        f"<i>Всі інші функції бота заблоковано до зупинки сесії (або поки машина не зарядиться).</i>",
+        parse_mode="HTML",
+        reply_markup=stop_keyboard
     )
     
-    # Тут у майбутньому буде реальний запит на запуск:
-    # await api.start_charging(station_id, id_connector)
+    # 🚀 ЗАПУСКАЄМО ФОНОВУ СИМУЛЯЦІЮ АВТОЗУПИНКИ СТАНЦІЇ
+    asyncio.create_task(
+        simulate_station_auto_stop(
+            chat_id=call.from_user.id,
+            message_bot=call.bot,
+            target_state=state,
+            conn_id=id_connector
+        )
+    )
+
+
+# ХЕНДЛЕР 3: Ручна зупинка сесії водієм
+@charge_router.callback_query(ChargingStates.charging_active, F.data == "stop_charging")
+async def handle_stop_charging(call: CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    connector_id = user_data.get("active_connector_id", "Невідомий")
     
-    await asyncio.sleep(1.5)
+    await call.answer("Зупиняємо сесію...")
+    await state.clear()  # Скидаємо стан
     
     await call.message.edit_text(
-        text=(
-            f"✅ <b>Зарядку успішно активовано!</b>\n\n"
-            f"• Станція: {station_id}\n"
-            f"• Порт у системі: ID {id_connector} ({connector_type})\n"
-            f"• Списано (резерв): 5.00 кВт·год\n"
-            f"💰 Залишок на балансі: 163.00 кВт·год"
-        ),
+        f"🛑 <b>Зарядну сесію порту [{connector_id}] успішно завершено!</b>\n\n"
+        f"Дякуємо, що скористалися eVolt UA. Тепер ви можете знову ввести новий ID станції.",
         parse_mode="HTML"
     )

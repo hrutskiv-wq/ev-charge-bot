@@ -10,14 +10,25 @@ from aiogram.types import ErrorEvent
 from app.handlers.user import router as user_router
 from app.handlers.charge import charge_router
 
-# ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
+    # ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
 async def global_error_handler(event: ErrorEvent, bot: Bot):
-    """
-    Ця функція автоматично спрацьовує при будь-якій помилці в боті.
-    """
     exception = event.exception
     update = event.update
     
+    # --- ДОДАЙ ЦЕЙ БЛОК СЮДИ ---
+    # Ігноруємо дублюючі кліки, щоб не спамити в чат логів
+    if "message is not modified" in str(exception):
+        try:
+            if update.callback_query:
+                await update.callback_query.answer() # Просто знімаємо "годинничок" завантаження з кнопки
+        except Exception:
+            pass
+        return # Виходимо з функції, звіт в чат не надсилаємо
+    # ----------------------------
+    
+    # 1. Логуємо помилку в консоль сервера
+    logging.error(f"💥 Критична помилка: {exception}", exc_info=True)
+    ...
     # 1. Логуємо помилку в консоль сервера
     logging.error(f"💥 Критична помилка: {exception}", exc_info=True)
     
