@@ -16,8 +16,8 @@ from app.keyboards.reply import (
     get_main_menu, get_charge_menu, get_tariffs_keyboard,
     get_single_station_keyboard, get_connectors_keyboard
 )
-from app.database.connection import (
-    db, get_user_data, uah_to_kwh, kwh_to_uah,
+from app.database.connection import ( 
+    get_user_data, uah_to_kwh, kwh_to_uah,
     get_station_by_id, update_user_balance, set_user_discount
 )
 from app.services.ocm_service import find_three_nearest_stations
@@ -33,10 +33,16 @@ class BotStates(StatesGroup):
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await db.execute_commit('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (message.from_user.id,))
+    # Функція get_user_data сама автоматично зареєструє водія в PostgreSQL, якщо його ще немає
+    balance, discount = await get_user_data(message.from_user.id)
+    
     await message.answer(
-        f"Доброго дня, {message.from_user.first_name}! Оберіть розділ меню:", 
-        reply_markup=get_main_menu()
+        f"👋 <b>Доброго дня, {message.from_user.first_name}!</b>\n\n"
+        f"🔋 Вітаємо в мережі зарядних станцій eVolt UA.\n"
+        f"💰 Ваш поточний баланс: <code>{balance} грн</code>\n\n"
+        f"Щоб розпочати сесію, введіть ID станції вручну або скористайтеся меню:",
+        reply_markup=get_main_menu(),
+        parse_mode="HTML"
     )
 
 @router.message(lambda m: m.text and "головне меню" in m.text.lower())
