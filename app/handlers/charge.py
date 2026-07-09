@@ -35,7 +35,6 @@ main_reply_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
 # ХЕНДЛЕР 1: ID станції
 @charge_router.message(F.text.regexp(r"OCM-\d+"))
 async def handle_station_id(message: Message):
@@ -62,15 +61,29 @@ async def handle_station_id(message: Message):
         for i, conn_name in enumerate(raw_connectors):
             short_type = conn_name.split("(")[0].strip()[:10]
             conn_id = f"P{i+1}"
-            buttons.append([[InlineKeyboardButton(text=f"🔌 Увімкнути {conn_name}", callback_data=ConnectorCallback(station_id=station_id, id_connector=conn_id, connector_type=short_type).pack())]])
+            # 🔥 ТУТ: Має бути тільки одна пара [ ] всередині append!
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔌 Увімкнути {conn_name}", 
+                    callback_data=ConnectorCallback(station_id=station_id, id_connector=conn_id, connector_type=short_type).pack()
+                )
+            ])
     else:
         mock_api_response = [{"id": "4501", "type": "CCS (Type 2)", "power": "120"}]
         for conn in mock_api_response:
-            buttons.append([[InlineKeyboardButton(text=f"🔌 Увімкнути {conn['type']}", callback_data=ConnectorCallback(station_id=station_id, id_connector=conn['id'], connector_type=conn['type']).pack())]])
+            # 🔥 ТУТ: Теж прибрали зайві дужки
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔌 Увімкнути {conn['type']}", 
+                    callback_data=ConnectorCallback(station_id=station_id, id_connector=conn['id'], connector_type=conn['type']).pack()
+                )
+            ])
         
-    await message.answer(text=f"⚡ <b>Станція ID: {station_id}</b>\n\nОберіть кабель:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-
-
+    await message.answer(
+        text=f"⚡ <b>Станція ID: {station_id}</b>\n\nОберіть кабель:", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), 
+        parse_mode="HTML"
+    )
 # ФОНОВА ТАСКА: Автоматична зупинка
 async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
     await asyncio.sleep(15)
