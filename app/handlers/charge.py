@@ -66,7 +66,7 @@ async def handle_station_id(message: Message):
 
 
 # ФОНОВА ТАСКА: Списання грошей після 15 секунд зарядки
-async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: aiogram.fsm.context.FSMContext, conn_id: str):
+async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
     await asyncio.sleep(15)  # Симулюємо сесію
     
     current_state = await target_state.get_state()
