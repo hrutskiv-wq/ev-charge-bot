@@ -33,15 +33,20 @@ class BotStates(StatesGroup):
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Функція get_user_data сама автоматично зареєструє водія в PostgreSQL, якщо його ще немає
-    balance, discount = await get_user_data(message.from_user.id)
+    user_id = message.from_user.id
+    
+    # Отримуємо чистий баланс кВт·год з PostgreSQL
+    balance, discount = await get_user_data(user_id)
+    
+    # Формуємо красиве меню з кнопками
+    from app.keyboards.reply import main_menu
     
     await message.answer(
         f"👋 <b>Доброго дня, {message.from_user.first_name}!</b>\n\n"
         f"🔋 Вітаємо в мережі зарядних станцій eVolt UA.\n"
-        f"💰 Ваш поточний баланс: <code>{balance} грн</code>\n\n"
+        f"💰 Ваш доступний запас енергії: <b>{balance} кВт·год</b>\n\n"
         f"Щоб розпочати сесію, введіть ID станції вручну або скористайтеся меню:",
-        reply_markup=get_main_menu(),
+        reply_markup=main_menu,
         parse_mode="HTML"
     )
 
