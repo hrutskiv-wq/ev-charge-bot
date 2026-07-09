@@ -72,8 +72,7 @@ async def handle_station_id(message: Message):
 async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback):
     station_id = callback_data.station_id
     id_connector = callback_data.id_connector  # Отримуємо точний ID кабелю
-    connector_type = callback_data.connector_type
-    
+    connector_type = callback_data.connector_type 
     # Виводимо в логи сервера точну інформацію, який кабель запускається
     logging.info(f"Запуск порту ID {id_connector} ({connector_type}) на станції {station_id}")
     
