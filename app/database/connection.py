@@ -44,13 +44,30 @@ async def init_postgres():
                 raise e  # Кидаємо помилку далі, щоб Docker перезапустив контейнер бота
 
 async def create_tables():
-    """Створення таблиць (аналог вашого initialize_db)"""
+    """Створення базових таблиць + нової Ledger-архітектури білінгу"""
     global db_pool
     if not db_pool:
         return
         
     async with db_pool.acquire() as conn:
-        # 1. Таблиця користувачів (BIGINT ідеально підходить для великих Telegram ID)
+        # --- 0. Створення ENUM типів для білінгу ---
+        await conn.execute("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'payment_status') THEN
+                    CREATE TYPE payment_status AS ENUM ('pending', 'success', 'failed', 'refunded');
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'payment_provider') THEN
+                    CREATE TYPE payment_provider AS ENUM ('liqpay', 'monobank');
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'transaction_type') THEN
+                    CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal', 'bonus', 'correction');
+                END IF;
+            END $$;
+        """)
+
+        # --- 1. Базові таблиці проєкту ---
+        # Таблиця користувачів (BIGINT ідеально підходить для великих Telegram ID)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -59,7 +76,7 @@ async def create_tables():
             );
         """)
         
-        # 2. Таблиця станцій
+        # Таблиця станцій
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stations (
                 station_id VARCHAR(50) PRIMARY KEY,
@@ -71,7 +88,7 @@ async def create_tables():
             );
         """)
         
-        # 3. Таблиця транзакцій (SERIAL замість AUTOINCREMENT)
+        # Стара таблиця транзакцій (залишаємо для сумісності)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 transaction_id SERIAL PRIMARY KEY,
@@ -81,7 +98,42 @@ async def create_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        logging.info("📊 Усі таблиці PostgreSQL успішно перевірені/створені!")
+
+        # --- 2. НОВІ ТАБЛИЦІ БІЛІНГУ ---
+        # Нова таблиця фіксації рахунків / інвойсів
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                invoice_id VARCHAR(100) UNIQUE NOT NULL,
+                amount NUMERIC(10, 2) NOT NULL,
+                provider payment_provider NOT NULL,
+                status payment_status DEFAULT 'pending',
+                payload JSONB,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Журнал балансу електроенергії (кВт·год) Ledger
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS kw_transactions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                type transaction_type NOT NULL,
+                amount NUMERIC(8, 2) NOT NULL,
+                payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+                session_id INTEGER,
+                description TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Створення високопродуктивних індексів
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_kw_transactions_user ON kw_transactions(user_id);")
+
+        logging.info("📊 Усі таблиці PostgreSQL (включаючи білінг) успішно перевірені/створені!")
 
 
 async def close_postgres():
@@ -154,3 +206,21 @@ async def set_user_discount(user_id, discount_value):
     async with db_pool.acquire() as conn:
         await conn.execute('INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING', user_id)
         await conn.execute('UPDATE users SET discount = $1 WHERE user_id = $2', discount_value, user_id)
+
+
+# --- НОВА ФУНКЦІЯ ДЛЯ СТВОРЕННЯ РАХУНКУ ПЕРЕД ОПЛАТОЮ ---
+async def create_pending_payment(user_id: int, invoice_id: str, amount: float, provider: str = "monobank"):
+    """
+    Реєструє новий рахунок у таблиці payments зі статусом 'pending'
+    """
+    global db_pool
+    if not db_pool:
+        logging.error("❌ Пул бази даних не ініціалізовано!")
+        return
+        
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO payments (user_id, invoice_id, amount, provider, status)
+            VALUES ($1, $2, $3, $4, 'pending')
+        """, user_id, invoice_id, amount, provider)
+        logging.info(f"📝 Створено рахунок {invoice_id} на суму {amount} грн для користувача {user_id} ({provider})")
