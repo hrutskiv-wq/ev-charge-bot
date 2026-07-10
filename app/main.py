@@ -5,6 +5,7 @@ import traceback
 import html
 from aiogram import Bot, Dispatcher
 from aiogram.types import ErrorEvent
+from app.api.payments import payments_router
 
 # Інструменти для зв'язку Aiogram FSM з Redis
 from aiogram.fsm.storage.redis import RedisStorage

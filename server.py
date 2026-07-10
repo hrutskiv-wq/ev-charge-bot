@@ -8,14 +8,20 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
-# Імпортуємо потрібні об'єкти та функції з main.py
-from main import bot, dp, find_three_nearest_stations, initialize_db, db_connection
+# 🔥 Імпортуємо Aiogram для створення бота прямо тут
+from aiogram import Bot, Dispatcher
 
+# 🔥 Імпортуємо функції та об'єкт підключення з нашої бази даних
+from app.database.connection import initialize_db, find_three_nearest_stations, db_connection
+from app.api.payments import payments_router
+
+# Завантажуємо змінні з .env файлу
 load_dotenv()
-OCM_KEY = os.getenv("OCM_KEY")
 
-logging.basicConfig(level=logging.INFO)
-
+# 🎯 Ініціалізуємо Бота та Диспетчер прямо в server.py
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 # Механізм Lifespan для фонового запуска бота разом із сервером
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,7 +46,6 @@ async def lifespan(app: FastAPI):
         logging.info("З'єднання з базою даних закрито.")
 
 app = FastAPI(title="eVolt UA API Server", lifespan=lifespan)
-
 # Дозволяємо крос-доменні запити (CORS) для нашого PWA
 app.add_middleware(
     CORSMiddleware,
