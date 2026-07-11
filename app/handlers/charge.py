@@ -1,7 +1,8 @@
 import os
 import asyncio
 import logging
-import time  # Імпортуємо для розрахунку тривалості сесії
+import time
+import re  # Імпортуємо для пошуку множників типу x2
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -24,7 +25,7 @@ class ConnectorCallback(CallbackData, prefix="station_connector"):
     connector_type: str
 
 charging_reply_menu = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📊 Статус"), KeyboardButton(text="🛑 Зупинити зарядку")]],
+    keyboard=[[KeyboardButton(text="📊 Status"), KeyboardButton(text="🛑 Stop Charging")]],
     resize_keyboard=True
 )
 
@@ -57,8 +58,24 @@ async def handle_station_id(message: Message):
     buttons = []
     
     if station_data and station_data[2]:
-        raw_connectors = [c.strip() for c in station_data[2].split(",") if c.strip()]
-        for i, conn_name in enumerate(raw_connectors):
+        # 1. Нормалізуємо розділювачі
+        normalized_connectors = station_data[2].replace(";", ",")
+        raw_connectors = [c.strip() for c in normalized_connectors.split(",") if c.strip()]
+        
+        # 2. Розмножуємо порти, якщо є приписка x2, x3 тощо
+        expanded_connectors = []
+        for conn in raw_connectors:
+            match = re.search(r'\s*x\s*(\d+)\s*$', conn)
+            if match:
+                count = int(match.group(1))
+                clean_name = conn[:match.start()].strip()
+                for idx in range(count):
+                    expanded_connectors.append(f"{clean_name} #{idx+1}")
+            else:
+                expanded_connectors.append(conn)
+        
+        # 3. Генеруємо кнопки для кожного фізичного порту
+        for i, conn_name in enumerate(expanded_connectors):
             short_type = conn_name.split("(")[0].strip()[:10]
             conn_id = f"P{i+1}"
             buttons.append([
@@ -68,12 +85,14 @@ async def handle_station_id(message: Message):
                 )
             ])
     else:
-        mock_api_response = [{"id": "4501", "type": "CCS (Type 2)", "power": "120"}]
-        for conn in mock_api_response:
+        # Резервна заглушка, якщо станції взагалі немає в базі
+        mock_api_response = ["CCS (Type 2) (120 кВт)", "Type 2 (22 кВт)"]
+        for i, conn_name in enumerate(mock_api_response):
+            conn_id = f"P{i+1}"
             buttons.append([
                 InlineKeyboardButton(
-                    text=f"🔌 Увімкнути {conn['type']}", 
-                    callback_data=ConnectorCallback(station_id=station_id, id_connector=conn['id'], connector_type=conn['type']).pack()
+                    text=f"🔌 Увімкнути {conn_name}", 
+                    callback_data=ConnectorCallback(station_id=station_id, id_connector=conn_id, connector_type="Backup").pack()
                 )
             ])
         
@@ -85,7 +104,7 @@ async def handle_station_id(message: Message):
 
 # --- ФОНОВА ТАСКА: Автоматична зупинка ---
 async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FSMContext, conn_id: str):
-    await asyncio.sleep(15)  # Емуляція 15 секунд сесії
+    await asyncio.sleep(15)
     current_state = await target_state.get_state()
     
     if current_state == ChargingStates.charging_active:
@@ -98,7 +117,6 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
         await update_user_balance(chat_id, consumed_kwh, t_type="charge_session")
         balance_kwh, _ = await get_user_data(chat_id)
         
-        # Рахуємо тривалість автоматичної сесії
         if started_at:
             duration_seconds = int(time.time() - started_at)
             minutes = duration_seconds // 60
@@ -130,16 +148,15 @@ async def handle_connector_selection(call: CallbackQuery, callback_data: Connect
     id_connector = callback_data.id_connector
     await state.set_state(ChargingStates.charging_active)
     
-    # Фіксуємо точний час запуску в секундах
     await state.update_data(active_connector_id=id_connector, started_at=time.time())
     await call.answer("Автентифікація сесії...")
     
-    await call.message.edit_text(f"🔋 <b>Зарядка успішно активована!</b>\n🔌 Порт ID: {id_connector}\n\n<i>Кіловат-години будуть списані в кінці сесії.</i>", parse_mode="HTML")
+    await call.message.edit_text(f"🔋 <b>Зарядка успешно активована!</b>\n🔌 Порт ID: {id_connector}\n\n<i>Кіловат-години будуть списані в кінці сесії.</i>", parse_mode="HTML")
     await call.message.answer(text="🎛️ Пульт керування:", reply_markup=charging_reply_menu)
     asyncio.create_task(simulate_station_auto_stop(chat_id=call.from_user.id, message_bot=call.bot, target_state=state, conn_id=id_connector))
 
 # --- ХЕНДЛЕР 3: Ручна зупинка водієм ---
-@charge_router.message(ChargingStates.charging_active, F.text == "🛑 Зупинити зарядку")
+@charge_router.message(ChargingStates.charging_active, F.text == "🛑 Stop Charging")
 @charge_router.message(ChargingStates.charging_active, Command("stop"))
 async def handle_stop_charging(message: Message, state: FSMContext):
     user_data = await state.get_data()
@@ -152,7 +169,6 @@ async def handle_stop_charging(message: Message, state: FSMContext):
     await update_user_balance(message.from_user.id, consumed_kwh, t_type="charge_manual_stop")
     balance_kwh, _ = await get_user_data(message.from_user.id)
     
-    # Рахуємо тривалість для ручної зупинки
     if started_at:
         duration_seconds = int(time.time() - started_at)
         minutes = duration_seconds // 60
@@ -173,7 +189,7 @@ async def handle_stop_charging(message: Message, state: FSMContext):
     )
 
 # --- ХЕНДЛЕР 4: Статус ---
-@charge_router.message(ChargingStates.charging_active, F.text == "📊 Статус")
+@charge_router.message(ChargingStates.charging_active, F.text == "📊 Status")
 @charge_router.message(ChargingStates.charging_active, Command("status"))
 async def command_status_charging(message: Message, state: FSMContext):
     user_data = await state.get_data()
