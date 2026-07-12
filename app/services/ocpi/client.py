@@ -19,59 +19,35 @@ class OCPIClient:
             try:
                 url = f"{self.config.CPO_BASE_URL}/ocpi/versions"
                 response = await client.get(url, headers=self.headers, timeout=10.0)
-                if response.status_code == 200:
-                    return response.json()
+                if response.status_code == 200: return response.json()
                 return None
             except Exception as e:
-                logger.error(f"Помилка при запиті версій: {str(e)}")
+                logger.error(f"Помилка версій: {str(e)}")
                 return None
 
     async def get_version_details(self, version_url: str):
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(version_url, headers=self.headers, timeout=10.0)
-                if response.status_code == 200:
-                    return response.json()
+                if response.status_code == 200: return response.json()
                 return None
             except Exception as e:
-                logger.error(f"Помилка при запиті деталей версії: {str(e)}")
+                logger.error(f"Помилка деталей: {str(e)}")
                 return None
 
-    async def get_locations(self, locations_url: str):
+    async def send_remote_command(self, base_commands_url: str, command: str, payload: dict):
+        """Новий метод: Надсилає асинхронну команду START або STOP на сервер оператора"""
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(locations_url, headers=self.headers, timeout=10.0)
+                # Формуємо URL виду: http://127.0.0.1:8080/ocpi/cpo/2.2.1/commands/START_SESSION
+                url = f"{base_commands_url}/{command.upper()}"
+                logger.info(f"📡 Відправка OCPI команди [{command.upper()}] на ендпоінт: {url}")
+                
+                response = await client.post(url, headers=self.headers, json=payload, timeout=10.0)
                 if response.status_code == 200:
                     return response.json()
+                logger.error(f"Оператор повернув помилку виконання команди. Статус: {response.status_code}")
                 return None
             except Exception as e:
-                logger.error(f"Помилка при отриманні локацій: {str(e)}")
-                return None
-
-    async def get_tariffs(self, tariffs_url: str):
-        """Запитує комерційні тарифи оператора"""
-        async with httpx.AsyncClient() as client:
-            try:
-                logger.info(f"💳 Отримання тарифів OCPI з: {tariffs_url}")
-                response = await client.get(tariffs_url, headers=self.headers, timeout=10.0)
-                if response.status_code == 200:
-                    return response.json()
-                logger.error(f"Не вдалося отримати тарифи. Статус: {response.status_code}")
-                return None
-            except Exception as e:
-                logger.error(f"Мережева помилка при отриманні тарифів: {str(e)}")
-                return None
-
-    async def get_sessions(self, sessions_url: str):
-        """Запитує список поточних сесій заряджання"""
-        async with httpx.AsyncClient() as client:
-            try:
-                logger.info(f"🔋 Отримання активних сесій OCPI з: {sessions_url}")
-                response = await client.get(sessions_url, headers=self.headers, timeout=10.0)
-                if response.status_code == 200:
-                    return response.json()
-                logger.error(f"Не вдалося отримати сесії. Статус: {response.status_code}")
-                return None
-            except Exception as e:
-                logger.error(f"Мережева помилка при отриманні сесій: {str(e)}")
+                logger.error(f"Мережева помилка відправки команди OCPI: {str(e)}")
                 return None
