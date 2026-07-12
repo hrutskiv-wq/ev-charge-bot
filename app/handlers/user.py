@@ -30,13 +30,13 @@ class BotStates(StatesGroup):
     waiting_for_station_id = State()
     waiting_for_connector = State()
 
-# --- Базові команди меню ---
+# --- Базові команди меню (з підтримкою скидання будь-яких станів) ---
 
-@router.message(Command("start"))
-async def cmd_start(message: types.Message):
+@router.message(Command("start"), StateFilter("*"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     
-    # Отримуємо реальний загальний баланс кВт·год
     balance, discount = await get_user_data(user_id)
     
     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -58,23 +58,26 @@ async def cmd_start(message: types.Message):
         parse_mode="HTML"
     )
 
-@router.message(lambda m: m.text and "головне меню" in m.text.lower())
+@router.message(lambda m: m.text and "головне меню" in m.text.lower(), StateFilter("*"))
 async def cmd_back_to_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Повертаємось до головного меню мережі eVolt UA:", reply_markup=get_main_menu())
 
-@router.message(lambda m: m.text and "як працює" in m.text.lower())
-async def process_help_click(message: types.Message):
+@router.message(lambda m: m.text and "як працює" in m.text.lower(), StateFilter("*"))
+async def process_help_click(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer("ℹ️ **Інструкція мережі eVolt UA:**\n1. Підключіть кабель.\n2. Знайдіть станцію по GPS.\n3. Оберіть роз'єм у чаті для старту сесії.")
 
-@router.message(lambda m: m.text and "підтримка" in m.text.lower())
-async def process_support_click(message: types.Message):
+@router.message(lambda m: m.text and "підтримка" in m.text.lower(), StateFilter("*"))
+async def process_support_click(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer("📢 Зв'язок з оператором підтримки eVolt UA: @your_support_username")
 
 # --- Логіка зарядки та списання ---
 
-@router.message(lambda m: m.text and "зарядка" in m.text.lower())
-async def process_charge_click(message: types.Message):
+@router.message(lambda m: m.text and "зарядка" in m.text.lower(), StateFilter("*"))
+async def process_charge_click(message: types.Message, state: FSMContext):
+    await state.clear()  # Витягуємо користувача з будь-якого завислого стану
     balance, _ = await get_user_data(message.from_user.id)
     if balance <= 0:
         await message.answer(f"❌ **Недостатньо коштів.**\nБаланс: {balance:.2f} кВт·год.\nБудь ласка, поповніть рахунок у меню Ваучер 🎫.")
@@ -86,12 +89,12 @@ async def process_charge_click(message: types.Message):
             reply_markup=get_charge_menu()
         )
 
-@router.message(lambda m: m.text and "ввести id" in m.text.lower())
+@router.message(lambda m: m.text and "ввести id" in m.text.lower(), StateFilter("*"))
 async def manual_id_entry(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_station_id)
     await message.answer("Введіть ID зарядної станції (наприклад: `OCM-307584`):")
 
-@router.message(F.location)
+@router.message(F.location, StateFilter("*"))
 async def handle_location(message: types.Message, state: FSMContext):
     await message.answer("🔍 **Шукаємо 3 найближчих об'єкти в Open Charge Map...**")
     stations = await find_three_nearest_stations(message.location.latitude, message.location.longitude)
@@ -138,12 +141,19 @@ async def process_station_id(message: types.Message, state: FSMContext):
     else:
         await message.answer("❌ Станцію з таким ID не знайдено в локальній базі. Спочатку надішліть геопозицію.", reply_markup=get_main_menu())
 
+# --- Хендлер вибору роз'єму ---
+
 @router.callback_query(lambda c: c.data.startswith('select_conn:'), StateFilter(BotStates.waiting_for_connector))
 async def process_connector_selection(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer("Запуск...", cache_time=2)
+    await callback_query.answer("Обробка...", cache_time=2)
     await callback_query.message.edit_reply_markup(reply_markup=None)
     
     connector_name = callback_query.data.split(":", 1)[1]
+    
+    state_data = await state.get_data()
+    station_id = state_data.get("chosen_station_id", "LOC-001")
+    station_name = state_data.get("chosen_station_name", "⚡ Ево-Заряд Комплекс")
+    
     await state.clear()
     
     cost_kwh = 5.0
@@ -155,33 +165,34 @@ async def process_connector_selection(callback_query: types.CallbackQuery, state
         await callback_query.message.answer("❌ Недостатньо кВт·год на рахунку для початку сесії!", reply_markup=get_main_menu())
         return
     
-    await callback_query.message.answer(f"⏳ Авторизація сесії... Підключення до порту `{connector_name}`...")
-    await asyncio.sleep(1.5)
-    
-    # Примусово і явно віднімаємо кВт·год, виключаючи будь-яке подвійне трактування знаків
-    async with db_conn.db_pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) - CAST($1 AS NUMERIC) WHERE user_id = $2", cost_kwh, user_id)
-            await conn.execute("""
-                INSERT INTO kw_transactions (user_id, type, amount, description) 
-                VALUES ($1, 'withdrawal', $2, $3)
-            """, user_id, cost_kwh, f"Списання запуск зарядки (Порт: {connector_name})")
-
-    # Зчитуємо фінальний баланс прямо з бази, щоб не було розбіжностей
-    final_balance, _ = await get_user_data(user_id)
-
-    await callback_query.message.answer(
-        f"✅ <b>Зарядку успішно активовано!</b>\n\n"
-        f"• <b>Списано:</b> {cost_kwh:.2f} кВт·год\n"
-        f"💰 <b>Поточний загальний баланс:</b> {final_balance:.2f} кВт·год",
-        reply_markup=get_main_menu(),
-        parse_mode="HTML"
+    text = (
+        f"🏢 <b>Зарядна станція:</b> {station_name}\n"
+        f"🔌 <b>Обраний роз'єм:</b> <code>{connector_name}</code>\n"
+        f"💳 <b>Вартість старту:</b> {cost_kwh:.2f} кВт·год\n"
+        f"🟢 <b>Статус:</b> Готова до запуску\n\n"
+        f"Переконайся, що кабель підключено до авто, та натисни кнопку нижче:"
     )
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="⚡ Запустити зарядку", 
+                callback_data=f"ocpi_start_{station_id}:{connector_name}:{cost_kwh}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Скасувати", callback_data=f"ocpi_refresh_{station_id}")
+        ]
+    ])
+
+    await callback_query.message.answer(text, parse_mode="HTML", reply_markup=confirm_keyboard)
 
 # --- Тарифи, Ваучери та Платежі ---
 
-@router.message(lambda m: m.text and "ваучер" in m.text.lower())
+@router.message(lambda m: m.text and "ваучер" in m.text.lower(), StateFilter("*"))
 async def process_voucher_click(message: types.Message, state: FSMContext):
+    await state.clear()
     balance_kwh, _ = await get_user_data(message.from_user.id)
     
     await message.answer(
@@ -192,7 +203,7 @@ async def process_voucher_click(message: types.Message, state: FSMContext):
     )
     await state.set_state(BotStates.waiting_for_code)
 
-@router.callback_query(lambda c: c.data.startswith('buy_pack_') or c.data == 'activate_night')
+@router.callback_query(lambda c: c.data.startswith('buy_pack_') or c.data == 'activate_night', StateFilter("*"))
 async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     await state.clear()
@@ -246,11 +257,11 @@ async def process_text_voucher(message: types.Message, state: FSMContext):
 
 # --- Обробка платіжних інвойсів Telegram ---
 
-@router.pre_checkout_query()
+@router.pre_checkout_query(StateFilter("*"))
 async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-@router.message(F.successful_payment)
+@router.message(F.successful_payment, StateFilter("*"))
 async def process_successful_payment(message: types.Message):
     user_id = message.from_user.id
     payload = message.successful_payment.invoice_payload
@@ -273,7 +284,7 @@ async def process_successful_payment(message: types.Message):
 
 # --- Команда історії операцій ---
 
-@router.message(Command("history"))
+@router.message(Command("history"), StateFilter("*"))
 async def cmd_history(message: types.Message):
     user_id = message.from_user.id
     
@@ -301,7 +312,7 @@ async def cmd_history(message: types.Message):
 
 # --- Голосове керування через Gemini ---
 
-@router.message(F.voice)
+@router.message(F.voice, StateFilter("*"))
 async def handle_voice(message: types.Message, state: FSMContext):
     await bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
     ogg_path = f"v_{message.from_user.id}.ogg"
@@ -330,15 +341,15 @@ async def handle_voice(message: types.Message, state: FSMContext):
         clean_text = recognized_text.lower()
         
         if "зарядка" in clean_text:
-            await process_charge_click(message)
+            await process_charge_click(message, state)
         elif "ваучер" in clean_text:
             await process_voucher_click(message, state)
         elif "меню" in clean_text or "головне" in clean_text:
             await cmd_back_to_menu(message, state)
         elif "як працює" in clean_text:
-            await process_help_click(message)
+            await process_help_click(message, state)
         elif "підтримка" in clean_text:
-            await process_support_click(message)
+            await process_support_click(message, state)
         else:
             await handle_ai_chat(message)
     except Exception as e:
@@ -350,7 +361,7 @@ async def handle_voice(message: types.Message, state: FSMContext):
 
 # --- Універсальний ШІ-чат ---
 
-@router.message(lambda m: m.text and not m.text.startswith('/'))
+@router.message(lambda m: m.text and not m.text.startswith('/'), StateFilter("*"))
 async def handle_ai_chat(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     

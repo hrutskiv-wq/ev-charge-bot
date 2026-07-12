@@ -145,15 +145,53 @@ async def simulate_station_auto_stop(chat_id: int, message_bot, target_state: FS
 # --- ХЕНДЛЕР 2: Клік на роз'єм ---
 @charge_router.callback_query(ConnectorCallback.filter())
 async def handle_connector_selection(call: CallbackQuery, callback_data: ConnectorCallback, state: FSMContext):
+    await call.answer("Обробка...", cache_time=2)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    
     id_connector = callback_data.id_connector
-    await state.set_state(ChargingStates.charging_active)
     
-    await state.update_data(active_connector_id=id_connector, started_at=time.time())
-    await call.answer("Автентифікація сесії...")
+    state_data = await state.get_data()
+    station_id = state_data.get("chosen_station_id", "LOC-001")
+    station_name = state_data.get("chosen_station_name", "⚡ Ево-Заряд Комплекс")
     
-    await call.message.edit_text(f"🔋 <b>Зарядка успешно активована!</b>\n🔌 Порт ID: {id_connector}\n\n<i>Кіловат-години будуть списані в кінці сесії.</i>", parse_mode="HTML")
-    await call.message.answer(text="🎛️ Пульт керування:", reply_markup=charging_reply_menu)
-    asyncio.create_task(simulate_station_auto_stop(chat_id=call.from_user.id, message_bot=call.bot, target_state=state, conn_id=id_connector))
+    await state.clear()
+    
+    cost_kwh = 5.0
+    user_id = call.from_user.id
+    
+    from app.database.connection import get_user_data
+    balance_kwh, _ = await get_user_data(user_id)
+    
+    from app.keyboards.reply import get_main_menu
+    if balance_kwh < cost_kwh:
+        await call.message.answer("❌ Недостатньо кВт·год на рахунку для початку сесії!", reply_markup=get_main_menu())
+        return
+    
+    text = (
+        f"🏢 <b>Зарядна станція:</b> {station_name}\n"
+        f"🔌 <b>Обраний роз'єм:</b> <code>{id_connector}</code>\n"
+        f"💳 <b>Вартість старту:</b> {cost_kwh:.2f} кВт·год\n"
+        f"🟢 <b>Статус:</b> Готова до запуску\n\n"
+        f"Переконайся, що кабель підключено до авто, та натисни кнопку нижче:"
+    )
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="⚡ Запустити зарядку", 
+                callback_data=f"ocpi_start_{station_id}:{id_connector}:{cost_kwh}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Скасувати", callback_data=f"ocpi_refresh_{station_id}")
+        ]
+    ])
+    
+    await call.message.answer(text, parse_mode="HTML", reply_markup=confirm_keyboard)
 
 # --- ХЕНДЛЕР 3: Ручна зупинка водієм ---
 @charge_router.message(ChargingStates.charging_active, F.text == "🛑 Stop Charging")
