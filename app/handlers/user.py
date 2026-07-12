@@ -2,23 +2,24 @@ import os
 import asyncio
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo  # Додай цей імпорт замість timedelta
+from zoneinfo import ZoneInfo
 from aiogram import Router, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from google.genai import types as genai_types
 
-# Імпортуємо ядро з нашого loader
 from app.core.loader import bot, ai_client 
 
 from app.keyboards.reply import (
     get_main_menu, get_charge_menu, get_tariffs_keyboard,
     get_single_station_keyboard, get_connectors_keyboard
 )
+
+import app.database.connection as db_conn
 from app.database.connection import ( 
     get_user_data, uah_to_kwh, kwh_to_uah,
-    get_station_by_id, update_user_balance, set_user_discount
+    get_station_by_id, set_user_discount
 )
 from app.services.ocm_service import find_three_nearest_stations
 
@@ -35,10 +36,9 @@ class BotStates(StatesGroup):
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     
-    # Отримуємо чистий баланс кВт·год з PostgreSQL
+    # Отримуємо реальний загальний баланс кВт·год
     balance, discount = await get_user_data(user_id)
     
-    # 🔥 Створюємо меню прямо тут, щоб назавжди уникнути помилок імпорту
     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
     main_menu = ReplyKeyboardMarkup(
         keyboard=[
@@ -52,7 +52,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 <b>Доброго дня, {message.from_user.first_name}!</b>\n\n"
         f"🔋 Вітаємо в мережі зарядних станцій eVolt UA.\n"
-        f"💰 Ваш доступний запас енергії: <b>{balance} кВт·год</b>\n\n"
+        f"💰 Загальний баланс: <b>{balance:.2f} кВт·год</b>\n\n"
         f"Щоб розпочати сесію, введіть ID станції вручну або скористайтеся меню:",
         reply_markup=main_menu,
         parse_mode="HTML"
@@ -71,13 +71,13 @@ async def process_help_click(message: types.Message):
 async def process_support_click(message: types.Message):
     await message.answer("📢 Зв'язок з оператором підтримки eVolt UA: @your_support_username")
 
-# --- Логіка зарядки та пошуку ---
+# --- Логіка зарядки та списання ---
 
 @router.message(lambda m: m.text and "зарядка" in m.text.lower())
 async def process_charge_click(message: types.Message):
     balance, _ = await get_user_data(message.from_user.id)
     if balance <= 0:
-        await message.answer(f"❌ **Недостатньо коштів.**\nБаланс: {balance:.2f} грн.\nПоповніть рахунок.")
+        await message.answer(f"❌ **Недостатньо коштів.**\nБаланс: {balance:.2f} кВт·год.\nБудь ласка, поповніть рахунок у меню Ваучер 🎫.")
     else:
         await message.answer(
             "🔌 **Оберіть спосіб пошуку станції:**\n\n"
@@ -147,10 +147,9 @@ async def process_connector_selection(callback_query: types.CallbackQuery, state
     await state.clear()
     
     cost_kwh = 5.0
-    cost_uah = kwh_to_uah(cost_kwh)
+    user_id = callback_query.from_user.id
     
-    balance_uah, _ = await get_user_data(callback_query.from_user.id)
-    balance_kwh = uah_to_kwh(balance_uah)
+    balance_kwh, _ = await get_user_data(user_id)
 
     if balance_kwh < cost_kwh:
         await callback_query.message.answer("❌ Недостатньо кВт·год на рахунку для початку сесії!", reply_markup=get_main_menu())
@@ -159,26 +158,34 @@ async def process_connector_selection(callback_query: types.CallbackQuery, state
     await callback_query.message.answer(f"⏳ Авторизація сесії... Підключення до порту `{connector_name}`...")
     await asyncio.sleep(1.5)
     
-    await update_user_balance(callback_query.from_user.id, -cost_uah, "charge")
-    new_balance_kwh = uah_to_kwh(balance_uah - cost_uah)
+    # Примусово і явно віднімаємо кВт·год, виключаючи будь-яке подвійне трактування знаків
+    async with db_conn.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) - CAST($1 AS NUMERIC) WHERE user_id = $2", cost_kwh, user_id)
+            await conn.execute("""
+                INSERT INTO kw_transactions (user_id, type, amount, description) 
+                VALUES ($1, 'withdrawal', $2, $3)
+            """, user_id, cost_kwh, f"Списання запуск зарядки (Порт: {connector_name})")
+
+    # Зчитуємо фінальний баланс прямо з бази, щоб не було розбіжностей
+    final_balance, _ = await get_user_data(user_id)
 
     await callback_query.message.answer(
-        f"✅ **Зарядку успішно активовано!**\n\n"
-        f"• **Списано (резерв):** {cost_kwh:.2f} кВт·год\n"
-        f"💰 **Залишок:** {new_balance_kwh:.2f} кВт·год",
+        f"✅ <b>Зарядку успішно активовано!</b>\n\n"
+        f"• <b>Списано:</b> {cost_kwh:.2f} кВт·год\n"
+        f"💰 <b>Поточний загальний баланс:</b> {final_balance:.2f} кВт·год",
         reply_markup=get_main_menu(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # --- Тарифи, Ваучери та Платежі ---
 
 @router.message(lambda m: m.text and "ваучер" in m.text.lower())
 async def process_voucher_click(message: types.Message, state: FSMContext):
-    balance_uah, _ = await get_user_data(message.from_user.id)
-    balance_kwh = uah_to_kwh(balance_uah)
+    balance_kwh, _ = await get_user_data(message.from_user.id)
     
     await message.answer(
-        f"💳 **Ваш balance:** `{balance_kwh:.2f} кВт·год`\n\n"
+        f"💳 **Ваш загальний баланс:** `{balance_kwh:.2f} кВт·год`\n\n"
         f"🎁 Оберіть тарифний пакет:",
         reply_markup=get_tariffs_keyboard(),
         parse_mode="Markdown"
@@ -221,10 +228,19 @@ async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FS
 async def process_text_voucher(message: types.Message, state: FSMContext):
     user_code = message.text.strip()
     await state.clear()
-    if user_code == "VOLTie100" or user_code == "VOLT100":
-        await update_user_balance(message.from_user.id, kwh_to_uah(100.0), "deposit")
-        balance, _ = await get_user_data(message.from_user.id)
-        await message.answer(f"✅ Код прийнято! Баланс оновлено.", reply_markup=get_main_menu())
+    user_id = message.from_user.id
+    
+    if user_code in ["VOLTie100", "VOLT100"]:
+        bonus_kwh = 100.0
+        async with db_conn.db_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", bonus_kwh, user_id)
+                await conn.execute("""
+                    INSERT INTO kw_transactions (user_id, type, amount, description) 
+                    VALUES ($1, 'deposit', $2, $3)
+                """, user_id, bonus_kwh, f"Активація текстового ваучера {user_code}")
+                
+        await message.answer(f"✅ Код прийнято! Нараховано +100.00 кВт·год.", reply_markup=get_main_menu())
     else:
         await message.answer("❌ Невірний код ваучера.", reply_markup=get_main_menu())
 
@@ -238,49 +254,51 @@ async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
 async def process_successful_payment(message: types.Message):
     user_id = message.from_user.id
     payload = message.successful_payment.invoice_payload
-    
-    # Скільки грошей прийшло від Telegram (750 або 1350)
-    uah_amount = message.successful_payment.total_amount / 100
-    # Визначаємо чистий об'єм кВт·год для тексту повідомлення
     kwh_amount = 50.0 if payload == "pack_50" else 100.0
     
-    # Нараховуємо суму в базу даних (750 одиниць бази = 50 кВт·год)
-    await update_user_balance(user_id, uah_amount, f"buy_{payload}")
+    async with db_conn.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", kwh_amount, user_id)
+            await conn.execute("""
+                INSERT INTO kw_transactions (user_id, type, amount, description) 
+                VALUES ($1, 'deposit', $2, $3)
+            """, user_id, kwh_amount, f"Поповнення через Telegram Invoice ({payload})")
     
     await message.answer(
         f"🎉 <b>Пакет активовано успішно!</b>\n\n"
         f"🔋 На Ваш рахунок зараховано: <b>{kwh_amount} кВт·год</b>.\n"
-        f"⚡ Кнопка «Зарядка» активована. Приємної подорожі!",
+        f"⚡ Поточний баланс оновлено.",
         parse_mode="HTML"
     )
-# # --- Команда історії операцій ---
+
+# --- Команда історії операцій ---
 
 @router.message(Command("history"))
 async def cmd_history(message: types.Message):
     user_id = message.from_user.id
     
-    # 💥 Замість неіснуючого "db" використовуємо наш пул підключень
-    from app.database.connection import pool
-    
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT amount, transaction_type, created_at FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5",
-            user_id
-        )
+    async with db_conn.db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT amount, type, created_at 
+            FROM kw_transactions 
+            WHERE user_id = $1 
+            ORDER BY created_at DESC LIMIT 5
+        """, user_id)
         
     if not rows:
         await message.answer("📜 <b>Історія операцій порожня.</b>", parse_mode="HTML")
         return
         
-    text = "📜 <b>Останні 5 операцій:</b>\n\n"
+    text = "📜 <b>Останні 5 Ledger-операцій (кВт·год):</b>\n\n"
     for row in rows:
-        # Гарно форматуємо знак плюс для поповнень
-        sign = "+" if row['amount'] > 0 else ""
+        sign = "+" if row['type'] == 'deposit' else "-"
         date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
+        op_type = "Поповнення" if row['type'] == 'deposit' else "Зарядка/Витрата"
         
-        text += f"📅 {date_str} | <b>{sign}{row['amount']:.2f} грн</b> ({row['transaction_type']})\n"
+        text += f"📅 {date_str} | <b>{sign}{row['amount']:.2f} кВт·год</b> ({op_type})\n"
         
     await message.answer(text, parse_mode="HTML")
+
 # --- Голосове керування через Gemini ---
 
 @router.message(F.voice)

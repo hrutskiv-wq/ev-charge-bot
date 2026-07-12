@@ -4,7 +4,7 @@ import asyncio
 import traceback
 import html
 import uvicorn
-from contextlib import asynccontextmanager  # <-- Додали для керування життєвим циклом
+from contextlib import asynccontextmanager  # <-- Керування життєвим циклом
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher
 from aiogram.types import ErrorEvent
@@ -19,6 +19,7 @@ from app.database.connection import init_postgres, close_postgres
 # Імпортуємо роутери
 from app.handlers.user import router as user_router
 from app.handlers.charge import charge_router
+from app.handlers.ocpi_stations import router as ocpi_router  # <-- ДОДАЛИ НАШ OCPI РОУТЕР
 
 # =====================================================================
 # ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК ТЕЛЕГРАМ
@@ -100,7 +101,9 @@ async def lifespan(app: FastAPI):
     storage = RedisStorage(redis=redis_client)
     dp = Dispatcher(storage=storage)
 
+   # Реєстрація обробників та роутерів
     dp.errors.register(global_error_handler)
+    dp.include_router(ocpi_router)   # <-- ТЕПЕР ВІН ПЕРШИЙ І ПЕРЕХОПЛЮЄ КОМАНДУ ОДРАЗУ!
     dp.include_router(charge_router)
     dp.include_router(user_router)
 
@@ -124,7 +127,7 @@ async def lifespan(app: FastAPI):
     logging.info("💤 Система чисто закрила всі підключення.")
 
 
-# Ініціалізуємо FastAPI з прив'язкою до нашого життєвого циклу
+# Инициализируем FastAPI с привязкой к нашему жизненному циклу
 fastapi_app = FastAPI(title="eVolt UA API", lifespan=lifespan)
 
 
