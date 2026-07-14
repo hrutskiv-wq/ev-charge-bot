@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 # Створюємо роутер для FastAPI
 payments_router = APIRouter()
 
+# Підтримуємо обидва варіанти виклику ендпоінту
 @payments_router.post("/webhook/monobank")
+@payments_router.post("/webhook/mono")
 async def monobank_webhook(request: Request):
     """
     Ендпоінт (Webhook), куди сервери Monobank будуть миттєво 
@@ -27,7 +29,6 @@ async def monobank_webhook(request: Request):
         item = data.get("statementItem", {})
         
         # Монобанк присилає суму в копійках. Переводимо в чисті гривні.
-        # (Надходження йдуть зі знаком плюс, витрати зі знаком мінус)
         raw_amount = item.get("amount", 0)
         amount_uah = raw_amount / 100
         
@@ -49,20 +50,18 @@ async def monobank_webhook(request: Request):
                 kwh_to_add = 100.0
             else:
                 # На випадок, якщо водій скинув іншу суму вручну (пропорційно тарифу)
-                kwh_to_add = round(amount_uah / PRICE_PER_KWH, 2)
+                kwh_to_add = round(amount_uah / PRICE_PER_KWH, 2)            
             
             # Конвертуємо кіловати у внутрішні одиниці бази даних (множимо на 15)
-            # 750 грн = 750 одиниць бази, що дасть водієві рівно 50 кВт·год
             db_units = kwh_to_add * PRICE_PER_KWH
             
-            # 💥 Зараховуємо кошти в PostgreSQL
+            # Зараховуємо кошти в PostgreSQL
             await update_user_balance(user_id, db_units, t_type="monobank_jar")
             logger.info(f"Успішно зараховано {kwh_to_add} кВт·год для користувача {user_id} через Банку Моно")
             
-            # 🔔 НАДВАЖЛИВО: Локальний імпорт бота всередині функції.
-            # Це рятує додаток від Circular Import при старті сервера!
+            # Отримуємо бот безпосередньо з FastAPI State! Це на 100% запобігає Circular Import!
             try:
-                from server import bot
+                bot = request.app.state.bot
                 await bot.send_message(
                     chat_id=user_id,
                     text=(
@@ -80,6 +79,4 @@ async def monobank_webhook(request: Request):
                 f"Отримано платіж на {amount_uah} грн, але коментар не є Telegram ID: '{comment_raw}'"
             )
             
-    # Monobank вимагає, щоб ми завжди повертали статус 200 OK у відповідь на його вебхук,
-    # інакше він подумає, що наш сервер впав, і почне спамити повторними запитами.
     return Response(status_code=status.HTTP_200_OK)
