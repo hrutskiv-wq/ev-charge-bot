@@ -12,48 +12,87 @@ from app.database.connection import get_user_data
 router = Router()
 logger = logging.getLogger(__name__)
 
-def get_mock_data():
-    return {
-        "id": "LOC-001",
-        "name": "⚡ Ево-Заряд Зубра Центр",
-        "address": "Львівська обл., с. Зубра, вул. Лісна, 14",
-        "status": "AVAILABLE",
-        "price": "12.50 UAH/кВт·год"
-    }
+async def get_station_data_from_db(location_id: str = "LOC-001"):
+    """Отримує повні дані про локацію, конектори та тариф безпосередньо з PostgreSQL"""
+    try:
+        pool = await db_conn.get_db_pool()
+        async with pool.acquire() as conn:
+            # 1. Зчитуємо саму локацію
+            loc = await conn.fetchrow("SELECT name, address, city FROM ocpi_locations WHERE id = $1", location_id)
+            if not loc:
+                return None
+                
+            # 2. Зчитуємо тариф
+            tariff = await conn.fetchrow("SELECT price, currency FROM ocpi_tariffs LIMIT 1")
+            price = float(tariff['price']) if tariff else 12.50
+            currency = tariff['currency'] if tariff else "UAH"
+            
+            # 3. Зчитуємо конектори та їх статус
+            connectors = await conn.fetch("""
+                SELECT c.standard, c.power_type, e.status 
+                FROM ocpi_connectors c
+                JOIN ocpi_evses e ON c.evse_uid = e.uid
+                WHERE e.location_id = $1
+            """, location_id)
+            
+            conn_list = [{"standard": r['standard'], "power_type": r['power_type'], "status": r['status']} for r in connectors]
+            status = conn_list[0]['status'] if conn_list else "UNKNOWN"
+            
+            return {
+                "id": location_id,
+                "name": loc['name'],
+                "address": f"Львівська обл., с. {loc['city']}, {loc['address']}",
+                "status": status,
+                "price": f"{price:.2f} {currency}/кВт·год",
+                "raw_price": price,
+                "connectors": conn_list
+            }
+    except Exception as e:
+        logger.error(f"Помилка зчитування станції з БД: {e}")
+        return None
 
 @router.message(Command("ocpi"), StateFilter("*"))
 async def cmd_ocpi_stations(message: Message, state: FSMContext):
     await state.clear()  
-    data = get_mock_data()
+    data = await get_station_data_from_db("LOC-001")
+    if not data:
+        await message.answer("❌ Зарядна станція наразі оффлайн.")
+        return
+        
     from app.keyboards.ocpi_kb import get_station_keyboard
     text = (
-        f"🏢 **Зарядна станція:** {data['name']}\n"
-        f"📍 **Адреса:** {data['address']}\n"
-        f"💳 **Вартість:** {data['price']}\n"
-        f"🟢 **Поточний статус:** {data['status']}"
+        f"🏢 <b>Зарядна станція:</b> {data['name']}\n"
+        f"📍 <b>Адреса:</b> {data['address']}\n"
+        f"💳 <b>Вартість:</b> {data['price']}\n"
+        f"🟢 <b>Поточний статус:</b> {data['status']}"
     )
-    await message.answer(text, parse_mode="Markdown", reply_markup=get_station_keyboard(data["id"]))
+    await message.answer(text, parse_mode="HTML", reply_markup=get_station_keyboard(data["id"], data["connectors"], data["raw_price"]))
 
 @router.callback_query(F.data.startswith("ocpi_refresh_"), StateFilter("*"))
 async def handle_refresh(callback: CallbackQuery):
-    data = get_mock_data()
+    payload = callback.data.split("_")
+    station_id = payload[-1] if len(payload) > 1 else "LOC-001"
+    
+    data = await get_station_data_from_db(station_id)
+    if not data:
+        await callback.answer("❌ Помилка завантаження даних.")
+        return
+        
     text = (
-        f"🏢 **Зарядна станція:** {data['name']}\n"
-        f"📍 **Адреса:** {data['address']}\n"
-        f"💳 **Вартість:** {data['price']}\n"
-        f"🟢 **Поточний статус:** {data['status']}\n\n"
-        f"🕒 _Дані оновлено з локальної БД оператора!_"
+        f"🏢 <b>Зарядна станція:</b> {data['name']}\n"
+        f"📍 <b>Адреса:</b> {data['address']}\n"
+        f"💳 <b>Вартість:</b> {data['price']}\n"
+        f"🟢 <b>Поточний статус:</b> {data['status']}\n\n"
+        f"🕒 <i>Дані оновлено з PostgreSQL мережі eVolt!</i>"
     )
     from app.keyboards.ocpi_kb import get_station_keyboard
     try:
-        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_station_keyboard(data["id"]))
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_station_keyboard(data["id"], data["connectors"], data["raw_price"]))
     except Exception:
         pass
     await callback.answer("Дані оновлено!")
 
-# =====================================================================
-# ХЕНДЛЕР РЕАЛЬНОГО ЗАПУСКУ ТА СПИСАННЯ З БАЗИ
-# =====================================================================
+
 @router.callback_query(F.data.startswith("ocpi_start_"), StateFilter("*"))
 async def handle_start_charging(callback: CallbackQuery):
     user_id = callback.from_user.id
