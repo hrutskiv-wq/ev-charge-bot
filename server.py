@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
         logging.info("З'єднання з базою даних закрито.")
 
 app = FastAPI(title="eVolt UA API Server", lifespan=lifespan)
+
+from app.api.ocpi import router as ocpi_router
+app.include_router(ocpi_router)
 # Дозволяємо крос-доменні запити (CORS) для нашого PWA
 app.add_middleware(
     CORSMiddleware,

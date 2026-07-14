@@ -7,7 +7,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import ErrorEvent
 
 from app.database.connection import init_postgres, close_postgres 
-from app.handlers.ocpi_stations import router as ocpi_router
+from app.handlers.ocpi_stations import router as bot_stations_router
+from app.api.ocpi import router as api_cdr_router
 from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
 from app.api.payments import payments_router
@@ -47,11 +48,15 @@ async def lifespan(app: FastAPI):
 # Створюємо FastAPI додаток з прив'язкою до нашого lifespan
 app = FastAPI(lifespan=lifespan)
 
+app.include_router(api_cdr_router)
+
+
+
 # Зберігаємо бот у state додатка для доступу з ендпоінтів без циклічного імпорту
 app.state.bot = bot
 
 # Реєстрація роутерів aiogram (Telegram-апдейти)
-dp.include_router(ocpi_router)
+dp.include_router(bot_stations_router)
 dp.include_router(user_router)
 dp.include_router(charge_router)
 
