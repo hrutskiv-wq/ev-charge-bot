@@ -56,7 +56,7 @@ async def monobank_webhook(request: Request):
             db_units = kwh_to_add * PRICE_PER_KWH
             
             # Зараховуємо кошти в PostgreSQL
-            await update_user_balance(user_id, db_units, t_type="monobank_jar")
+            await update_user_balance(user_id, kwh_to_add, t_type="monobank_jar")
             logger.info(f"Успішно зараховано {kwh_to_add} кВт·год для користувача {user_id} через Банку Моно")
             
             # Отримуємо бот безпосередньо з FastAPI State! Це на 100% запобігає Circular Import!

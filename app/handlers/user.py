@@ -287,6 +287,8 @@ async def process_successful_payment(message: types.Message):
 @router.message(Command("history"), StateFilter("*"))
 async def cmd_history(message: types.Message):
     user_id = message.from_user.id
+    # Підтягуємо актуальний баланс користувача
+    balance_kwh, _ = await get_user_data(user_id)
     
     async with db_conn.db_pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -297,16 +299,16 @@ async def cmd_history(message: types.Message):
         """, user_id)
         
     if not rows:
-        await message.answer("📜 <b>Історія операцій порожня.</b>", parse_mode="HTML")
+        await message.answer(f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Історія операцій порожня.</b>", parse_mode="HTML")
         return
         
-    text = "📜 <b>Останні 5 Ledger-операцій (кВт·год):</b>\n\n"
+    text = f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Останні 5 Ledger-операцій (кВт·год):</b>\n\n"
     for row in rows:
         sign = "+" if row['type'] == 'deposit' else "-"
         date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
         op_type = "Поповнення" if row['type'] == 'deposit' else "Зарядка/Витрата"
         
-        text += f"📅 {date_str} | <b>{sign}{row['amount']:.2f} кВт·год</b> ({op_type})\n"
+        text += f"📅 {date_str} | <b>{sign}{abs(row['amount']):.2f} кВт·год</b> ({op_type})\n"
         
     await message.answer(text, parse_mode="HTML")
 

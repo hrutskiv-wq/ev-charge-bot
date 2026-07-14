@@ -159,7 +159,7 @@ async def update_user_balance(user_id: int, amount_kwh: float, t_type: str = "de
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-            if t_type == "deposit":
+            if t_type in ["deposit", "monobank_jar"]:
                 await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id)
                 await conn.execute("""
                     INSERT INTO kw_transactions (user_id, type, amount, description) 
