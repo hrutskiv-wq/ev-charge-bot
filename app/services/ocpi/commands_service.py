@@ -32,7 +32,6 @@ class OCPICommandsService:
         session_token = f"EVOLT-{user_id}-{uuid.uuid4().hex[:6].upper()}"
 
         # 3. Формуємо стандартний payload згідно специфікації OCPI 2.2.1
-        # Тут вказуємо правильний response_url з повним шляхом роутера
         payload = {
             "response_url": f"{self.emsp_base_url}/ocpi/emsp/2.2.1/callback/commands/START_SESSION/{user_id}",
             "token": {
@@ -60,3 +59,26 @@ class OCPICommandsService:
             return {"status": "ACCEPTED", "message": "⚡ Запит на запуск надіслано на станцію. Очікуйте блокування кабелю та увімкнення..."}
             
         return {"status": "FAILED", "message": "❌ Станція відхилила запит на запуск. Спробуйте ще раз або змініть конектор."}
+
+    async def initiate_stop_session(self, user_id: int, session_id: str, base_commands_url: str) -> dict:
+        """
+        Метод для зупинки активної сесії заряджання через OCPI.
+        """
+        # Формуємо payload для STOP_SESSION згідно зі специфікацією OCPI 2.2.1
+        payload = {
+            "response_url": f"{self.emsp_base_url}/ocpi/emsp/2.2.1/callback/commands/STOP_SESSION/{user_id}",
+            "session_id": session_id
+        }
+
+        # Викликаємо твій метод з OCPIClient для відправки STOP_SESSION
+        result = await self.client.send_remote_command(
+            base_commands_url=base_commands_url,
+            command="STOP_SESSION",
+            payload=payload
+        )
+
+        if result and result.get("statusCode") == 1000:
+            logger.info(f"CPO успішно прийняв команду зупинки для сесії {session_id} (користувач {user_id}).")
+            return {"status": "ACCEPTED", "message": "🛑 Запит на зупинку надіслано. Очікуйте завершення сесії..."}
+            
+        return {"status": "FAILED", "message": "❌ Не вдалося надіслати команду зупинки. Будь ласка, спробуйте знову."}

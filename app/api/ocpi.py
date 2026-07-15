@@ -115,3 +115,45 @@ async def ocpi_start_session_callback(user_id: int, request: Request):
         "status_message": "Success",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     }
+
+
+@router.post("/callback/commands/STOP_SESSION/{user_id}")
+async def ocpi_stop_session_callback(user_id: int, request: Request):
+    """
+    Асинхронний Callback від CPO про статус фізичної зупинки сесії заряджання.
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error(f"Помилка парсингу JSON у callback STOP_SESSION: {e}")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+    result = payload.get("result")  # ACCEPTED, REJECTED, FAILED
+    message = payload.get("message", "")
+    
+    logger.info(f"📡 Отримано callback STOP_SESSION для користувача {user_id}. Результат: {result}, Повідомлення: {message}")
+
+    try:
+        bot = request.app.state.bot
+        if result == "ACCEPTED":
+            text = (
+                f"🏁 <b>Зарядку успішно завершено!</b>\n\n"
+                f"🛑 Подачу струму припинено, кабель розблоковано.\n"
+                f"Дякуємо, що користуєтесь eVolt UA! ⚡"
+            )
+        else:
+            text = (
+                f"⚠️ <b>Проблема при зупинці зарядки</b>\n\n"
+                f"Станція повернула статус: <b>{result}</b>\n"
+                f"Причина: {message or 'Не вдалося зупинити сесію автоматично.'}\n\n"
+                f"Спробуйте зупинити сесію ще раз або зверніться до підтримки."
+            )
+        await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    except Exception as tg_err:
+        logger.error(f"Не вдалося надіслати повідомлення про зупинку користувачу {user_id}: {tg_err}")
+
+    return {
+        "status_code": 1000,
+        "status_message": "Success",
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
