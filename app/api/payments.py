@@ -1,8 +1,10 @@
 import logging
+import json
 from fastapi import APIRouter, Request, Response, status
 
-# Імпортуємо функції роботи з базою даних та тариф
-from app.database.connection import update_user_balance, PRICE_PER_KWH
+# Імпортуємо централізоване підключення та тариф
+from app.database import connection
+from app.database.connection import PRICE_PER_KWH
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,12 @@ async def monobank_webhook(request: Request):
         data = payload.get("data", {})
         item = data.get("statementItem", {})
         
+        # 1. Отримуємо унікальний ID транзакції від Монобанку для захисту від дублікатів
+        transaction_id = item.get("id")
+        if not transaction_id:
+            logger.error("Monobank Webhook: у виписці відсутній унікальний id транзакції")
+            return Response(status_code=status.HTTP_200_OK)
+
         # Монобанк присилає суму в копійках. Переводимо в чисті гривні.
         raw_amount = item.get("amount", 0)
         amount_uah = raw_amount / 100
@@ -36,7 +44,7 @@ async def monobank_webhook(request: Request):
         if amount_uah <= 0:
             return Response(status_code=status.HTTP_200_OK)
             
-        # Дістаємо коментар до платежу, куди ми зашили Telegram ID водія
+        # Дістаємо коментар до платежу, куди мы зашили Telegram ID водія
         comment_raw = item.get("comment", "").strip()
         
         # Перевіряємо, чи в коментарі дійсно лежить числовий Telegram ID
@@ -52,14 +60,48 @@ async def monobank_webhook(request: Request):
                 # На випадок, якщо водій скинув іншу суму вручну (пропорційно тарифу)
                 kwh_to_add = round(amount_uah / PRICE_PER_KWH, 2)            
             
-            # Конвертуємо кіловати у внутрішні одиниці бази даних (множимо на 15)
-            db_units = kwh_to_add * PRICE_PER_KWH
+            # --- АТОМАРНИЙ ЗАПИС У ПОСТГРЕС (НОВА СХЕМА) ---
+            try:
+                async with connection.db_pool.acquire() as conn:
+                    async with conn.transaction():
+                        
+                        # Перевіряємо, чи цей платіж вже оброблявся раніше
+                        existing_payment = await conn.fetchrow(
+                            "SELECT id FROM payments WHERE invoice_id = $1", 
+                            transaction_id
+                        )
+                        
+                        if existing_payment:
+                            logger.info(f"Транзакція Monobank {transaction_id} вже була успішно оброблена раніше. Пропускаємо.")
+                            return Response(status_code=status.HTTP_200_OK)
+                        
+                        # Оскільки це Моно-Банка, платіж фіксується одразу як успішний ('success')
+                        payment_id = await conn.fetchval(
+                            """
+                            INSERT INTO payments (user_id, invoice_id, amount, provider, status, payload, created_at, updated_at)
+                            VALUES ($1, $2, $3, 'monobank', 'success', $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            RETURNING id
+                            """,
+                            user_id, transaction_id, amount_uah, json.dumps(payload)
+                        )
+                        
+                        # Створюємо фінансовий лог нарахування внутрішнього балансу
+                        description = f"Успішна оплата пакету: {kwh_to_add} кВт·год через Банку Monobank"
+                        await conn.execute(
+                            """
+                            INSERT INTO kw_transactions (user_id, type, amount, payment_id, description, created_at)
+                            VALUES ($1, 'deposit', $2, $3, $4, CURRENT_TIMESTAMP)
+                            """,
+                            user_id, kwh_to_add, payment_id, description
+                        )
+                        
+                logger.info(f"Успішно фінансово зараховано {kwh_to_add} кВт·год для користувача {user_id} через Банку Моно")
+                
+            except Exception as db_err:
+                logger.error(f"Критична помилка транзакції бази даних для платежу {transaction_id}: {db_err}")
+                return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
-            # Зараховуємо кошти в PostgreSQL
-            await update_user_balance(user_id, kwh_to_add, t_type="monobank_jar")
-            logger.info(f"Успішно зараховано {kwh_to_add} кВт·год для користувача {user_id} через Банку Моно")
-            
-            # Отримуємо бот безпосередньо з FastAPI State! Це на 100% запобігає Circular Import!
+            # --- ВІДПРАВКА МИТТЄВОГО СПОВІЩЕННЯ В ТЕЛЕГРАМ ---
             try:
                 bot = request.app.state.bot
                 await bot.send_message(
@@ -67,7 +109,7 @@ async def monobank_webhook(request: Request):
                     text=(
                         f"🎉 <b>Тарифний пакет активовано!</b>\n\n"
                         f"💳 Отримано платіж через Monobank: <b>{amount_uah:.2f} грн</b>\n"
-                        f"🔋 На Ваш рахунок успішно зараховано: <b>{kwh_to_add} кВт·год</b>\n\n"
+                        f"🔋 На Ваш рахунок успешно зараховано: <b>{kwh_to_add} кВт·год</b>\n\n"
                         f"⚡ Можете надсилати ID станції. Приємної зарядки з eVolt UA!"
                     ),
                     parse_mode="HTML"
