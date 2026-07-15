@@ -12,17 +12,18 @@ load_dotenv()
 
 config = context.config
 
-# 2. Динамічно підставляємо DATABASE_URL з оточення
-database_url = os.getenv("DATABASE_URL")
+# 2. Динамічно підставляємо DB_URL з оточення
+database_url = os.getenv("DB_URL")
 if database_url:
-    # Alembic в асинхронному режимі вимагає префікс postgresql+asyncpg://
-    if database_url.startswith("postgresql://"):
+    # SQLAlchemy вимагає префікс postgresql+asyncpg:// для асинхронних з'єднань
+    if database_url.startswith("postgresql://") and not database_url.startswith("postgresql+asyncpg://"):
         database_url = database_url.replace("postgresql://", "postgresql+asyncpg://")
     config.set_main_option("sqlalchemy.url", database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Ми працюємо з чистим SQL, тому ORM-метадані не потрібні
 target_metadata = None
 
 
