@@ -1,7 +1,10 @@
 import json
+import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, status
-from app.database import connection  # Імпортуємо модуль повністю для динамічного доступу до пулу
+from fastapi import APIRouter, HTTPException, Request, Response, status
+from app.database import connection
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ocpi/emsp/2.2.1", tags=["OCPI EMSP CDRs"])
 
@@ -29,7 +32,6 @@ async def receive_cdr(cdr: dict):
             detail="Відсутні обов'язкові поля: id, session_id або auth_id."
         )
 
-    # Звертаємося до актуального стану пулу через модуль connection
     if not connection.db_pool:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
@@ -68,4 +70,48 @@ async def receive_cdr(cdr: dict):
         "status_code": 1000,
         "status_message": "Success",
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    }
+
+
+# --- CALLBACK ENDPOINT FOR REMOTE COMMANDS (OCPI 2.2.1) ---
+
+@router.post("/callback/commands/START_SESSION/{user_id}")
+async def ocpi_start_session_callback(user_id: int, request: Request):
+    """
+    Асинхронний Callback від CPO про статус фізичного запуску сесії заряджання.
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error(f"Помилка парсингу JSON у callback: {e}")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+    result = payload.get("result")  # ACCEPTED, REJECTED, FAILED
+    message = payload.get("message", "")
+    
+    logger.info(f"📡 Отримано callback START_SESSION для користувача {user_id}. Результат: {result}, Повідомлення: {message}")
+
+    try:
+        bot = request.app.state.bot
+        if result == "ACCEPTED":
+            text = (
+                f"🔌 <b>Зарядку успішно активовано!</b>\n\n"
+                f"🔋 Станція підтвердила фізичний старт сесії.\n"
+                f"Приємної зарядки з eVolt UA! ⚡"
+            )
+        else:
+            text = (
+                f"❌ <b>Помилка фізичного запуску зарядки</b>\n\n"
+                f"Станція повернула статус: <b>{result}</b>\n"
+                f"Причина: {message or 'Фізична помилка підключення кабелю.'}\n\n"
+                f"Будь ласка, перевірте з'єднання з електромобілем та спробуйте ще раз."
+            )
+        await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    except Exception as tg_err:
+        logger.error(f"Не вдалося надіслати повідомлення користувачу {user_id}: {tg_err}")
+
+    return {
+        "status_code": 1000,
+        "status_message": "Success",
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     }
