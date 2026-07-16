@@ -15,8 +15,7 @@ if not api_key:
 llm = ChatAnthropic(
     model="claude-sonnet-5",
     api_key=api_key,
-    temperature=0.2
-)
+    )
 
 # 1. Агент-Архітектор
 architect = Agent(
