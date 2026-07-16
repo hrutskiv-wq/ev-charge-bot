@@ -17,15 +17,18 @@ logger = logging.getLogger(__name__)
 commands_service = OCPICommandsService()
 
 async def get_user_balance(user_id: int) -> float:
-    """Динамічно рахує баланс користувача по історії транзакцій kw_transactions"""
+    """
+    Повертає баланс користувача (кВт·год).
+
+    Раніше тут окремим запитом рахувалась SUM(kw_transactions.amount) —
+    третє незалежне джерело балансу в кодовій базі (на додачу до
+    users.balance в get_user_data і до перевірки в OCPICommandsService),
+    яке з часом розходилось з тим, що бачив користувач в /start. Тепер усі
+    три місця читають те саме кешоване users.balance.
+    """
     try:
-        pool = await db_conn.get_db_pool()
-        async with pool.acquire() as conn:
-            balance = await conn.fetchval(
-                "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1",
-                user_id
-            )
-            return float(balance)
+        balance, _ = await db_conn.get_user_data(user_id)
+        return float(balance)
     except Exception as e:
         logger.error(f"Помилка отримання балансу для {user_id}: {e}")
         return 0.0

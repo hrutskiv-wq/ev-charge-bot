@@ -1,3 +1,8 @@
+# Продакшн-залежності застосунку (бот + FastAPI API).
+# Тестові/дев-залежності (crewai, pytest, langchain-anthropic) винесені в
+# requirements-dev.txt — раніше вони стояли тут же і встановлювались навіть
+# у продакшн-образ Docker, а версія crewai==1.15.2 тут конфліктувала з
+# crewai==0.28.8 у ai_agent/requirements.txt.
 aiocache==0.12.3
 aiofiles==25.1.0
 aiogram==3.29.0
@@ -60,16 +65,5 @@ websockets==16.0
 yarl==1.24.2
 redis==5.3.0
 asyncpg==0.29.0
-fastapi
-uvicorn
 alembic
 sqlalchemy
-asyncpg
-python-dotenv
-crewai==1.15.2
-crewai-cli==1.15.2
-crewai-core==1.15.2
-langchain-anthropic==1.4.8
-pytest==9.1.1
-pytest-asyncio==1.4.0
-pytest-mock==3.15.1

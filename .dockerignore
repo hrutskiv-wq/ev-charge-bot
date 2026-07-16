@@ -2,5 +2,20 @@ __pycache__
 *.pyc
 *.db
 .env
+.env.example
 .git
+.gitignore
 .vscode
+.idea
+
+# Дев/адмінські скрипти та експерименти — не потрібні в продакшн-образі,
+# лише роздувають його і збільшують поверхню атаки, якщо туди хтось
+# отримає доступ.
+check_db.py
+check_tables.py
+mock_cpo.py
+inject_deposit.py
+test_*.py
+ai_agent/
+requirements-dev.txt
+billing.sql

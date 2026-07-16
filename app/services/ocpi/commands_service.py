@@ -16,17 +16,18 @@ class OCPICommandsService:
         """
         Високорівневий метод для перевірки умов та запуску зарядки через OCPI.
         """
-        # 1. Фінансова безпека: перевіряємо поточний баланс користувача в PostgreSQL
-        async with connection.db_pool.acquire() as conn:
-            balance = await conn.fetchval(
-                "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1",
-                user_id
-            )
-            
-            # Якщо баланс нульовий або мінусовий — блокуємо запуск
-            if balance <= 0:
-                logger.warning(f"Користувач {user_id} намагався запустити зарядку з нульовим балансом ({balance} кВт·год)")
-                return {"status": "REJECTED", "message": "❌ Недостатньо кВт·год на балансі для старту зарядки."}
+        # 1. Фінансова безпека: перевіряємо поточний баланс користувача.
+        #    Читаємо users.balance (через get_user_data) — це те саме кешоване
+        #    значення, яке показується користувачу в боті, і воно завжди
+        #    оновлюється атомарно разом із kw_transactions в update_user_balance().
+        #    Раніше тут рахувалась SUM(kw_transactions.amount) окремим запитом —
+        #    інше джерело правди, ніж те, що бачив користувач в /start.
+        balance, _ = await connection.get_user_data(user_id)
+
+        # Якщо баланс нульовий або мінусовий — блокуємо запуск
+        if balance <= 0:
+            logger.warning(f"Користувач {user_id} намагався запустити зарядку з нульовим балансом ({balance} кВт·год)")
+            return {"status": "REJECTED", "message": "❌ Недостатньо кВт·год на балансі для старту зарядки."}
 
         # 2. Генеруємо унікальний токен авторизації для цієї сесії (вимоги OCPI 2.2.1)
         session_token = f"EVOLT-{user_id}-{uuid.uuid4().hex[:6].upper()}"

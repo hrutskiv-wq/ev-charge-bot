@@ -1,75 +1,18 @@
-import os
-import asyncio
-import logging
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
+"""
+Сумісний шім для `uvicorn server:app`.
 
-# 🔥 Імпортуємо Aiogram для створення бота прямо тут
-from aiogram import Bot, Dispatcher
+Раніше цей файл був повноцінним, але окремим від app/main.py входом у
+застосунок: власний Bot()/Dispatcher(), власний lifespan, і що найгірше —
+імпортував з app.database.connection функції initialize_db,
+find_three_nearest_stations та об'єкт db_connection, яких там не існує.
+Через це `uvicorn server:app` (саме так налаштований evolt_bot.service)
+падав з ImportError одразу при старті — systemd-сервіс фактично не міг
+піднятись.
 
-# 🔥 Імпортуємо функції та об'єкт підключення з нашої бази даних
-from app.database.connection import initialize_db, find_three_nearest_stations, db_connection
-from app.api.payments import payments_router
+Єдине реальне джерело правди — app/main.py (там і Bot/Dispatcher з
+app.core.loader, і PWA-ендпоінти, і CORS, і lifespan з ініціалізацією БД).
+Цей файл лишається лише для зворотної сумісності зі старими скриптами
+запуску; краще оновити їх на `app.main:app` напряму (див. evolt_bot.service).
+"""
 
-# Завантажуємо змінні з .env файлу
-load_dotenv()
-
-# 🎯 Ініціалізуємо Бота та Диспетчер прямо в server.py
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-# Механізм Lifespan для фонового запуска бота разом із сервером
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logging.info("Ініціалізація ресурсів...")
-    await initialize_db()  # Ініціалізуємо БД
-
-    logging.info("🤖 Запуск Telegram-бота у фоновому режимі...")
-    # Створюємо фонову задачу для aiogram, щоб вона не блокувала вебсервер
-    polling_task = asyncio.create_task(dp.start_polling(bot))
-    
-    yield  # Тут сервер активний і приймає запити від PWA
-    
-    logging.info("🛑 Зупинка фонових задач та звільнення ресурсів...")
-    polling_task.cancel()
-    try:
-        await polling_task
-    except asyncio.CancelledError:
-        logging.info("Фоновий процес бота успішно вимкнено.")
-    
-    if db_connection:
-        await db_connection.close()
-        logging.info("З'єднання з базою даних закрито.")
-
-app = FastAPI(title="eVolt UA API Server", lifespan=lifespan)
-
-from app.api.ocpi import router as ocpi_router
-app.include_router(ocpi_router)
-# Дозволяємо крос-доменні запити (CORS) для нашого PWA
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Ендпоінт, який PWA викликатиме для отримання 3 станцій
-@app.get("/api/stations")
-async def get_stations(lat: float = Query(...), lon: float = Query(...)):
-    stations = await find_three_nearest_stations(lat, lon)
-    if not stations:
-        return {"success": False, "stations": []}
-    return {"success": True, "stations": stations}
-
-# Ендпоінт, який буде віддавати інтерфейс нашого PWA додатка
-@app.get("/pwa")
-async def get_pwa_index():
-    return FileResponse("public/index.html")
-
-# Підключаємо статичні файли (маніфест, іконки, сервіс-воркер)
-app.mount("/", StaticFiles(directory="public"), name="public")
+from app.main import app  # noqa: F401
