@@ -131,7 +131,27 @@ async def create_tables(pool=None):
                 type transaction_type NOT NULL,
                 amount NUMERIC(10, 2) NOT NULL,
                 payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+                session_id VARCHAR(100),
                 description TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # На старих БД, розгорнутих до додавання цієї колонки, ADD COLUMN
+        # IF NOT EXISTS підтягне схему без ручного запуску Alembic-міграції.
+        await conn.execute("ALTER TABLE kw_transactions ADD COLUMN IF NOT EXISTS session_id VARCHAR(100);")
+
+        # 6. CDR-и, отримані від CPO по OCPI. Раніше ця таблиця створювалась
+        # лише в Alembic-міграції, тому на щойно розгорнутій базі (без
+        # `alembic upgrade head`) прийом CDR падав з UndefinedTableError.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ocpi_cdrs (
+                id SERIAL PRIMARY KEY,
+                cdr_id VARCHAR(100) UNIQUE NOT NULL,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                session_id VARCHAR(100) NOT NULL,
+                total_energy NUMERIC(10, 4) NOT NULL,
+                total_cost NUMERIC(10, 2) NOT NULL,
+                raw_payload JSONB,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -139,6 +159,8 @@ async def create_tables(pool=None):
         # Високопродуктивні індекси
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_kw_transactions_user ON kw_transactions(user_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ocpi_cdrs_user_id ON ocpi_cdrs(user_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ocpi_cdrs_session_id ON ocpi_cdrs(session_id);")
         logging.info("📊 Усі таблиці PostgreSQL та індекси верифіковано.")
 
 async def close_postgres():
@@ -154,23 +176,69 @@ async def get_user_data(user_id: int):
         row = await conn.fetchrow("SELECT balance, discount FROM users WHERE user_id = $1", user_id)
         return float(row['balance']), float(row['discount'])
 
-async def update_user_balance(user_id: int, amount_kwh: float, t_type: str = "deposit"):
+async def update_user_balance(
+    user_id: int,
+    amount_kwh: float,
+    t_type: str = "deposit",
+    conn=None,
+    session_id: str = None,
+    payment_id: int = None,
+    description: str = None,
+):
+    """
+    Єдина точка запису балансу (кВт·год). Атомарно оновлює кешоване
+    users.balance І пише запис у журнал kw_transactions в одній транзакції,
+    тому вони ніколи не розходяться між собою.
+
+    ВАЖЛИВО про знак amount у kw_transactions: депозит пишеться додатним
+    числом, списання — від'ємним. Це зроблено навмисно, бо в кількох
+    місцях системи (app/services/ocpi/commands_service.py,
+    app/handlers/ocpi_stations.py) баланс рахується як
+    SUM(kw_transactions.amount) — якщо списання зберігати додатним числом,
+    ця сума лише зростає і ніколи не відображає реальні витрати.
+
+    Якщо передано `conn` — операція виконується в межах транзакції
+    викликача (наприклад, разом із записом CDR в app/api/ocpi.py), інакше
+    функція сама відкриває з'єднання та транзакцію.
+    """
+
+    async def _apply(active_conn):
+        await active_conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+        )
+        if t_type in ["deposit", "monobank_jar"]:
+            await active_conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
+            )
+            desc = description or "Поповнення балансу (Ваучер / Адмін)"
+            await active_conn.execute(
+                """
+                INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
+                VALUES ($1, 'deposit', $2, $3, $4, $5)
+                """,
+                user_id, amount_kwh, payment_id, session_id, desc,
+            )
+        else:
+            await active_conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount_kwh, user_id
+            )
+            desc = description or f"Списання за сесію зарядки ({t_type})"
+            await active_conn.execute(
+                """
+                INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
+                VALUES ($1, 'withdrawal', $2, $3, $4, $5)
+                """,
+                user_id, -amount_kwh, payment_id, session_id, desc,
+            )
+
+    if conn is not None:
+        await _apply(conn)
+        return
+
     pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-            if t_type in ["deposit", "monobank_jar"]:
-                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id)
-                await conn.execute("""
-                    INSERT INTO kw_transactions (user_id, type, amount, description) 
-                    VALUES ($1, 'deposit', $2, 'Поповнення балансу (Ваучер / Адмін)')
-                """, user_id, amount_kwh)
-            else:
-                await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount_kwh, user_id)
-                await conn.execute("""
-                    INSERT INTO kw_transactions (user_id, type, amount, description) 
-                    VALUES ($1, 'withdrawal', $2, $3)
-                """, user_id, amount_kwh, f"Списання за сесію зарядки ({t_type})")
+    async with pool.acquire() as new_conn:
+        async with new_conn.transaction():
+            await _apply(new_conn)
 
 async def get_user_transactions(user_id: int, limit: int = 10):
     pool = await get_db_pool()

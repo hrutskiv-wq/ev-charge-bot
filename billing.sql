@@ -1,35 +1,17 @@
-DROP TABLE IF EXISTS kw_transactions CASCADE;
-DROP TABLE IF EXISTS payments CASCADE;
-DROP TYPE IF EXISTS transaction_type CASCADE;
-DROP TYPE IF EXISTS payment_provider CASCADE;
-DROP TYPE IF EXISTS payment_status CASCADE;
-
-CREATE TYPE payment_status AS ENUM ('pending', 'success', 'failed', 'refunded');
-CREATE TYPE payment_provider AS ENUM ('liqpay', 'monobank');
-CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal', 'bonus', 'correction');
-
-CREATE TABLE payments (
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    invoice_id VARCHAR(100) UNIQUE NOT NULL,
-    amount NUMERIC(10, 2) NOT NULL,
-    provider payment_provider NOT NULL,
-    status payment_status DEFAULT 'pending',
-    payload JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE kw_transactions (
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    type transaction_type NOT NULL,
-    amount NUMERIC(8, 2) NOT NULL,
-    payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
-    session_id INTEGER,
-    description TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_payments_invoice ON payments(invoice_id);
-CREATE INDEX idx_kw_transactions_user ON kw_transactions(user_id);
+-- ЗАСТАРІЛО / НЕ ВИКОРИСТОВУВАТИ.
+--
+-- Цей файл був третім, розбіжним джерелом схеми БД (на додачу до
+-- app/database/connection.py та Alembic-міграцій у migrations/versions/).
+-- Розбіжності, які тут були і які могли зламати базу, якщо цей скрипт
+-- виконали б на продакшні:
+--   * payment_provider містив 'liqpay' замість 'telegram';
+--   * kw_transactions.session_id мав тип INTEGER, а не VARCHAR(100) —
+--     несумісно з реальними ідентифікаторами сесій OCPI (рядки на кшталт
+--     "session_evolt_123456");
+--   * файл починався з DROP TABLE ... CASCADE по kw_transactions і
+--     payments — випадковий запуск на продакшн-базі знищив би всю
+--     історію балансу та платежів.
+--
+-- Єдине джерело правди для схеми БД — Alembic-міграції в
+-- migrations/versions/. Якщо потрібно щось змінити в схемі — робіть це
+-- новою міграцією (alembic revision), а не редагуванням цього файлу.

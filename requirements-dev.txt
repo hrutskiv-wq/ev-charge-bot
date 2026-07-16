@@ -1,0 +1,17 @@
+# Залежності для тестів і для ai_agent/ (crewai-scaffolding, окремий
+# інструмент для генерації коду AI-агентами, не імпортується основним
+# застосунком і не потрібен у продакшн-образі).
+#
+# Встановлення: pip install -r requirements.txt -r requirements-dev.txt
+#
+# ПРИМІТКА: якщо продовжуєте розвивати ai_agent/ окремо, тримайте версію
+# crewai тут синхронною з ai_agent/requirements.txt (там була
+# crewai==0.28.8 проти crewai==1.15.2 тут — обирайте одну і використовуйте
+# в обох місцях, інакше pip install -r обох файлів одразу поламається).
+crewai==1.15.2
+crewai-cli==1.15.2
+crewai-core==1.15.2
+langchain-anthropic==1.4.8
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-mock==3.15.1

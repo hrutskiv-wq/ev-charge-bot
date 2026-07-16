@@ -1,5 +1,15 @@
 version: '3.8'
 
+# ВАЖЛИВО: усі секрети (паролі, токени) тепер задаються лише через .env і
+# змінні середовища хосту, а не хардкодяться в цьому файлі. Раніше пароль
+# Postgres лежав прямим текстом і в POSTGRES_PASSWORD, і в DB_URL — якщо
+# цей файл коли-небудь потрапляв у git (окремо від .gitignore, який був
+# зламаний — див. .gitignore), пароль БД опинявся в історії репозиторію.
+# Перед першим запуском додайте у ваш .env:
+#   POSTGRES_USER=ev_admin
+#   POSTGRES_PASSWORD=<згенеруйте новий надійний пароль>
+#   POSTGRES_DB=ev_charge_base
+
 services:
   bot:
     build: .
@@ -7,12 +17,12 @@ services:
     restart: always
     depends_on:
       - redis
-      - postgres  # Бот чекатиме на запуск бази даних
+      - postgres
+    env_file:
+      - .env
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - LOGS_CHAT_ID=${LOGS_CHAT_ID}
       - REDIS_HOST=redis
-      - DB_URL=postgresql+asyncpg://ev_admin:ev_secure_pass_2026@postgres:5432/ev_charge_base
+      - DB_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     volumes:
       - .:/app
     ports:
@@ -29,14 +39,16 @@ services:
     image: postgres:16-alpine
     container_name: ev-charge-bot-postgres-1
     restart: always
+    env_file:
+      - .env
     environment:
-      POSTGRES_USER: ev_admin
-      POSTGRES_PASSWORD: ev_secure_pass_2026
-      POSTGRES_DB: ev_charge_base
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data  # Щоб дані не зникали при перезапуску
+      - pgdata:/var/lib/postgresql/data
 
 volumes:
-  pgdata:  # Оголошуємо постійне сховище для PostgreSQL
+  pgdata:

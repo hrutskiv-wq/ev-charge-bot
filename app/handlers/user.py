@@ -308,6 +308,7 @@ async def cmd_history(message: types.Message):
         date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
         op_type = "Поповнення" if row['type'] == 'deposit' else "Зарядка/Витрата"
         
+        logging.info(f"DEBUG_HISTORY: {row}")
         text += f"📅 {date_str} | <b>{sign}{abs(row['amount']):.2f} кВт·год</b> ({op_type})\n"
         
     await message.answer(text, parse_mode="HTML")

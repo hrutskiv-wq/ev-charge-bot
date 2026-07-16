@@ -5,12 +5,33 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 
-# Імпортуємо інструменти для роботи з твоєю базою даних
+# Імпортуємо інструменти для роботи з PostgreSQL та сервіс команд
 import app.database.connection as db_conn
-from app.database.connection import get_user_data
+from app.services.ocpi.commands_service import OCPICommandsService
+from app.services.ocpi.config import OCPIConfig
 
+# Ініціалізуємо роутер та логгер
 router = Router()
 logger = logging.getLogger(__name__)
+
+commands_service = OCPICommandsService()
+
+async def get_user_balance(user_id: int) -> float:
+    """
+    Повертає баланс користувача (кВт·год).
+
+    Раніше тут окремим запитом рахувалась SUM(kw_transactions.amount) —
+    третє незалежне джерело балансу в кодовій базі (на додачу до
+    users.balance в get_user_data і до перевірки в OCPICommandsService),
+    яке з часом розходилось з тим, що бачив користувач в /start. Тепер усі
+    три місця читають те саме кешоване users.balance.
+    """
+    try:
+        balance, _ = await db_conn.get_user_data(user_id)
+        return float(balance)
+    except Exception as e:
+        logger.error(f"Помилка отримання балансу для {user_id}: {e}")
+        return 0.0
 
 async def get_station_data_from_db(location_id: str = "LOC-001"):
     """Отримує повні дані про локацію, конектори та тариф безпосередньо з PostgreSQL"""
@@ -27,15 +48,24 @@ async def get_station_data_from_db(location_id: str = "LOC-001"):
             price = float(tariff['price']) if tariff else 12.50
             currency = tariff['currency'] if tariff else "UAH"
             
-            # 3. Зчитуємо конектори та їх статус
+            # 3. Зчитуємо конектори (включаючи ID та UID для OCPI)
             connectors = await conn.fetch("""
-                SELECT c.standard, c.power_type, e.status 
+                SELECT c.id as connector_id, c.standard, c.power_type, e.uid as evse_uid, e.status 
                 FROM ocpi_connectors c
                 JOIN ocpi_evses e ON c.evse_uid = e.uid
                 WHERE e.location_id = $1
             """, location_id)
             
-            conn_list = [{"standard": r['standard'], "power_type": r['power_type'], "status": r['status']} for r in connectors]
+            conn_list = [
+                {
+                    "connector_id": r['connector_id'],
+                    "standard": r['standard'],
+                    "power_type": r['power_type'],
+                    "evse_uid": r['evse_uid'],
+                    "status": r['status']
+                } 
+                for r in connectors
+            ]
             status = conn_list[0]['status'] if conn_list else "UNKNOWN"
             
             return {
@@ -93,62 +123,57 @@ async def handle_refresh(callback: CallbackQuery):
     await callback.answer("Дані оновлено!")
 
 
-@router.callback_query(F.data.startswith("ocpi_start_"), StateFilter("*"))
+@router.callback_query(F.data.startswith("ocpi_st_"), StateFilter("*"))
 async def handle_start_charging(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Розпаковуємо дані з кнопки (формат: ocpi_start_ID:Порт:Вартість)
-    payload = callback.data.split(":")
-    station_id = payload[0].split("_")[-1]
-    connector_name = payload[1] if len(payload) > 1 else "Type 2"
-    cost_kwh = float(payload[2]) if len(payload) > 2 else 5.0
-    
-    await callback.answer("Авторизація сесії... 🔌")
-    
-    # Імітуємо підключення до заліза, як у твоєму оригінальному коді
-    status_msg = await callback.message.answer(f"⏳ Авторизація сесії... Підключення до порту `{connector_name}`...")
-    await asyncio.sleep(1.5)
-    await status_msg.delete()
-
+    # Розпаковуємо дані з кнопки: ocpi_st_LOCATION_ID:EVSE_UID:CONNECTOR_ID
     try:
-        # --- ТВОЯ РЕАЛЬНА ТРАНЗАКЦІЯ В ПОСТГРЕС ---
-        async with db_conn.db_pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. Знімаємо кВт·години з балансу
-                await conn.execute(
-                    "UPDATE users SET balance = CAST(balance AS NUMERIC) - CAST($1 AS NUMERIC) WHERE user_id = $2", 
-                    cost_kwh, user_id
-                )
-                # 2. Фіксуємо витрату в Ledger історії операцій
-                await conn.execute("""
-                    INSERT INTO kw_transactions (user_id, type, amount, description)
-                    VALUES ($1, 'withdrawal', $2, $3)
-                """, user_id, cost_kwh, f"Списання запуск зарядки (Порт: {connector_name})")
-                
-        # Зчитуємо чистий баланс прямо з бази для відображення
-        final_balance, _ = await get_user_data(user_id)
-        
+        payload = callback.data.split(":")
+        location_id = payload[0].split("_")[-1]
+        evse_uid = payload[1]
+        connector_id = payload[2]
     except Exception as e:
-        logger.error(f"Database error during session start: {e}")
-        await callback.message.answer("❌ Сталася помилка бази даних при запуску сесії.")
+        logger.error(f"Помилка парсингу callback_data: {e}")
+        await callback.answer("❌ Помилка зчитування даних роз'єму.")
+        return
+        
+    await callback.answer("Ініціалізація OCPI сесії... 🔌")
+    
+    config = OCPIConfig()
+    base_commands_url = f"{config.CPO_BASE_URL}/ocpi/cpo/2.2.1/commands"
+
+    # Викликаємо асинхронний сервіс старту
+    response = await commands_service.initiate_start_session(
+        user_id=user_id,
+        location_id=location_id,
+        evse_uid=evse_uid,
+        connector_id=connector_id,
+        base_commands_url=base_commands_url
+    )
+
+    if response["status"] != "ACCEPTED":
+        await callback.message.answer(response["message"], parse_mode="HTML")
         return
 
-    # Виводимо екран активної зарядки
+    current_balance = await get_user_balance(user_id)
+    test_session_id = f"session_evolt_{user_id}"
+
     text = (
-        f"⚡ **ЗАРЯДНУ СЕСІЮ РОЗПОЧАТО!**\n\n"
-        f"🏢 **Станція:** ⚡ Мережа eVolt UA\n"
-        f"🔌 **Активний роз'єм:** `{connector_name}`\n"
-        f"🔋 **Поточний статус:** 🔵 CHARGING (ЗАРЯДЖАЄТЬСЯ)\n"
-        f"📉 **Списано за старт:** {cost_kwh:.2f} кВт·год\n"
-        f"💰 **Залишок на балансі:** {final_balance:.2f} кВт·год\n\n"
-        f"🤖 _Контролер успішно запустив реле подачі струму._"
+        f"⚡ <b>ЗАПИТ НА ЗАРЯДКУ НАДІСЛАНО!</b>\n\n"
+        f"🏢 <b>Станція:</b> ⚡ Мережа eVolt UA\n"
+        f"🔌 <b>Контролер роз'єму:</b> `{evse_uid}` (Порт: {connector_id})\n"
+        f"🔋 <b>Статус команди:</b> 🟡 ACCEPTED (ПРИЙНЯТО В ОБРОБКУ)\n"
+        f"💰 <b>Твій поточний баланс:</b> {current_balance:.2f} кВт·год\n\n"
+        f"🤖 <i>Зараз залізо CPO розблокує кабель. Зачекайте кілька секунд до початку заряджання...</i>"
     )
     
     charging_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛑 Зупинити зарядку", callback_data=f"ocpi_stop_{station_id}:{connector_name}")]
+        [InlineKeyboardButton(text="🛑 Зупинити зарядку", callback_data=f"ocpi_stop_{location_id}:{test_session_id}")]
     ])
     
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=charging_keyboard)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=charging_keyboard)
+
 
 # =====================================================================
 # ХЕНДЛЕР ЗУПИНКИ ЗАРЯДКИ
@@ -156,19 +181,38 @@ async def handle_start_charging(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("ocpi_stop_"), StateFilter("*"))
 async def handle_stop_charging(callback: CallbackQuery):
     user_id = callback.from_user.id
-    payload = callback.data.split(":")
-    connector_name = payload[1] if len(payload) > 1 else "Type 2"
     
-    real_balance, _ = await get_user_data(user_id)
+    # Формат callback_data: ocpi_stop_LOCATION_ID:SESSION_ID
+    try:
+        payload = callback.data.split(":")
+        session_id = payload[1]
+    except Exception as e:
+        logger.error(f"Помилка розпарсингу даних зупинки: {e}")
+        await callback.answer("❌ Помилка ідентифікації сесії.")
+        return
+
+    await callback.answer("Зупинка сесії через OCPI... 🔌")
     
+    config = OCPIConfig()
+    base_commands_url = f"{config.CPO_BASE_URL}/ocpi/cpo/2.2.1/commands"
+
+    # Викликаємо асинхронний метод зупинки
+    response = await commands_service.initiate_stop_session(
+        user_id=user_id,
+        session_id=session_id,
+        base_commands_url=base_commands_url
+    )
+
+    if response["status"] != "ACCEPTED":
+        await callback.message.answer(response["message"], parse_mode="HTML")
+        return
+
+    # Повідомляємо водія про успішний запит на зупинку
     text = (
-        f"🏁 **ЗАРЯДНУ СЕСІЮ УСПІШНО ЗАВЕРШЕНО!**\n\n"
-        f"🛑 **Зарядку порту `{connector_name}` зупинено водієм.**\n"
-        f"⏱️ **Тривалість сесії:** 0 г. 1 хв.\n"
-        f"💰 **Твій фінальний баланс в базі:** {real_balance:.2f} кВт·год\n\n"
-        f"Дякуємо, що заряджаєтесь в мережі eVolt UA!"
+        f"🛑 <b>ЗАПИТ НА ЗУПИНКУ НАДІСЛАНО!</b>\n\n"
+        f"🔌 <b>Сесія ID:</b> `{session_id}`\n"
+        f"⏳ <b>Статус:</b> 🟡 Очікуємо підтвердження від заліза про вимкнення реле..."
     )
     
     from app.keyboards.reply import get_main_menu
-    await callback.message.answer(text, parse_mode="Markdown", reply_markup=get_main_menu())
-    await callback.answer("Зарядку успішно зупинено!")
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())

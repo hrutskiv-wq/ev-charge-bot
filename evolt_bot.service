@@ -15,7 +15,12 @@ WorkingDirectory=/home/admin/ev_charge_bot
 # Команда для запуску uvicorn сервера.
 # Шлях до uvicorn може відрізнятися, якщо ви використовуєте віртуальне середовище.
 # Наприклад: /home/admin/ev_charge_bot/venv/bin/uvicorn
-ExecStart=/usr/local/bin/uvicorn server:app --host 0.0.0.0 --port 8000
+#
+# ВАЖЛИВО: раніше тут було "server:app" — окремий, застарілий вхід у
+# застосунок з власним (і зламаним) кодом ініціалізації БД/бота. Єдине
+# робоче джерело правди — app/main.py, тому вказуємо його напряму.
+# server.py лишається лише тонким сумісним шімом навколо app.main:app.
+ExecStart=/usr/local/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # Автоматичний перезапуск сервісу у разі збою
 Restart=always
