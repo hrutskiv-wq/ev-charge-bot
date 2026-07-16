@@ -7,7 +7,9 @@ services:
     restart: always
     depends_on:
       - redis
-      - postgres  # Бот чекатиме на запуск бази даних
+      - postgres
+    env_file:
+      - .env
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - LOGS_CHAT_ID=${LOGS_CHAT_ID}
@@ -36,7 +38,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data  # Щоб дані не зникали при перезапуску
+      - pgdata:/var/lib/postgresql/data
 
 volumes:
-  pgdata:  # Оголошуємо постійне сховище для PostgreSQL
+  pgdata:
