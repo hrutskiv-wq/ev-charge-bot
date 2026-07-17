@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from aiogram.types import ErrorEvent
 
@@ -14,6 +14,7 @@ from aiogram.types import ErrorEvent
 # токеном одночасно (ризик 409 Conflict від Telegram getUpdates).
 from app.core.loader import bot, dp
 
+from app.database import connection
 from app.database.connection import init_postgres, close_postgres
 from app.services.ocm_service import find_three_nearest_stations
 from app.handlers.ocpi_stations import router as bot_stations_router
@@ -86,6 +87,48 @@ dp.include_router(charge_router)
 async def global_error_handler(event: ErrorEvent, bot):
     logging.error(f"Global error: {event.exception}")
     return True
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Перевірка живучості для docker-compose (`condition: service_healthy`) і
+    зовнішнього моніторингу аптайму. Раніше такого ендпоінту не було взагалі
+    — контейнер вважався "здоровим", якщо просто відповідав на HTTP, навіть
+    якщо реально відвалилось з'єднання з Postgres (бот при цьому міг далі
+    приймати запити й падати на кожному, що торкається БД).
+    """
+    checks = {}
+    healthy = True
+
+    try:
+        if connection.db_pool is None:
+            raise RuntimeError("пул підключень до PostgreSQL ще не ініціалізовано")
+        async with connection.db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        checks["postgres"] = "ok"
+    except Exception as e:
+        checks["postgres"] = f"error: {e}"
+        healthy = False
+
+    # Redis перевіряємо, лише якщо FSM реально налаштований на RedisStorage
+    # (див. app/core/loader.py) — при MemoryStorage (локальна розробка без
+    # Redis) відсутність Redis не є ознакою нездорового застосунку.
+    redis_client = getattr(dp.storage, "redis", None)
+    if redis_client is not None:
+        try:
+            await redis_client.ping()
+            checks["redis"] = "ok"
+        except Exception as e:
+            checks["redis"] = f"error: {e}"
+            healthy = False
+    else:
+        checks["redis"] = "not configured (MemoryStorage)"
+
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ok" if healthy else "degraded", "checks": checks},
+    )
 
 
 # --- PWA / веб-інтерфейс (раніше жило окремо у дублюючому server.py) ---
