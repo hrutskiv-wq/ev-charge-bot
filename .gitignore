@@ -3,6 +3,11 @@
 users.db
 *.db
 
+# Дампи PostgreSQL (scripts/backup_postgres.sh) — фінансові дані користувачів,
+# ніколи не повинні потрапляти в git-історію.
+backups/
+*.sql.gz
+
 # Python
 __pycache__/
 *.py[cod]
