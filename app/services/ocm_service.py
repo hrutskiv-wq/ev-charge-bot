@@ -12,7 +12,16 @@ def location_key_builder(func, user_lat, user_lon, *args, **kwargs):
     rounded_lon = round(user_lon, 3)
     return f"{func.__module__}:{func.__name__}:{rounded_lat}:{rounded_lon}"
 
-@cached(ttl=300, key_builder=location_key_builder, serializer=JsonSerializer())
+@cached(
+    ttl=300,
+    key_builder=location_key_builder,
+    serializer=JsonSerializer(),
+    # Без цього @cached кешував би й None (помилка/timeout OCM API) на ті
+    # самі 300с, що й успішний результат — один тимчасовий збій OCM API
+    # "заморожував" би відповідь для цієї локації на 5 хв, навіть якщо API
+    # відновлювалось за секунди. Кешуємо лише реальні (успішні) результати.
+    skip_cache_func=lambda result: result is None,
+)
 async def find_three_nearest_stations(user_lat, user_lon):
     url = "https://api.openchargemap.io/v3/poi/"
     
