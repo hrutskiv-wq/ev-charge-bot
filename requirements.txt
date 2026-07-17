@@ -4,12 +4,14 @@
 # у продакшн-образ Docker, а версія crewai==1.15.2 тут конфліктувала з
 # crewai==0.28.8 у ai_agent/requirements.txt.
 aiocache==0.12.3
-aiofiles==25.1.0
+aiofiles~=24.1.0  # версія навмисно узгоджена з crewai==1.15.2 (requirements-dev.txt), який жорстко вимагає ~=24.1.0; aiogram 3.29.0 приймає 23.2.1-26.0, тож конфлікту з ним немає
 aiogram==3.29.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.14.1
 aiosignal==1.4.0
-aiosqlite==0.22.1
+# aiosqlite прибрано (2026-07-17): ніде в коді не імпортується (перевірено
+# grep по всьому репо) — залишок з часів до переходу на Postgres, і додатково
+# конфліктував з crewai==1.15.2 (requirements-dev.txt), який вимагає ~=0.21.0.
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.1
@@ -46,8 +48,10 @@ protobuf==5.29.6
 pyasn1==0.6.3
 pyasn1_modules==0.4.2
 pycparser==3.0
-pydantic==2.13.4
-pydantic_core==2.46.4
+pydantic>=2.12.5,<2.13  # діапазон, сумісний одразу з crewai (<2.13) і google-genai (>=2.12.5); див. requirements-dev.txt
+# pydantic_core прибрано: це внутрішня залежність pydantic з жорстко
+# прив'язаною версією (кожен реліз pydantic вимагає точну версію
+# pydantic-core) — окремий пін тут просто застарів і конфліктував.
 pydub==0.25.1
 pyparsing==3.3.2
 python-dotenv==1.2.2
@@ -63,7 +67,7 @@ urllib3==2.7.0
 uvicorn==0.49.0
 websockets==16.0
 yarl==1.24.2
-redis==5.3.0
+redis>=5.0.0,<5.3.0  # 5.3.0 додав жорстку залежність PyJWT~=2.9.0 (Entra ID auth, нам не потрібен), що конфліктує з crewai (потребує pyjwt>=2.13.0); нам достатньо базового redis.asyncio client, він є з версії 4.2+
 asyncpg==0.29.0
 alembic
 sqlalchemy
