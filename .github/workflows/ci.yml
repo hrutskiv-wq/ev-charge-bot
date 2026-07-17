@@ -29,9 +29,12 @@ jobs:
 
       - name: Run tests
         env:
-          # Мінімум, потрібний лише для того, щоб app.services.ocpi.config
-          # не впав при імпорті (OCPIConfig навмисно кидає RuntimeError без
-          # цієї змінної) — реальний секрет тут не потрібен, тести його не
-          # використовують для звернення до живого CPO.
+          # Мінімум, потрібний лише для того, щоб модулі не падали при
+          # імпорті (test_health.py тягне app.main -> app.core.loader,
+          # який створює Bot()/genai.Client() ще на рівні модуля) — це
+          # НЕ реальні секрети, мережевих викликів до Telegram/Gemini/CPO
+          # ці тести не роблять, значення лише мають правильний формат.
           OCPI_SECRET_TOKEN: ci-placeholder-token
+          BOT_TOKEN: "123456:ci-placeholder-bot-token"
+          GEMINI_API_KEY: ci-placeholder-gemini-key
         run: pytest -v
