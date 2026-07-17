@@ -39,23 +39,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     balance, discount = await get_user_data(user_id)
-    
-    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-    main_menu = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Зарядка ⚡")],
-            [KeyboardButton(text="Як працює? 🤨")],
-            [KeyboardButton(text="Ваучер 🎫"), KeyboardButton(text="Online підтримка 📢")]
-        ],
-        resize_keyboard=True
-    )
-    
+
+    # Раніше тут будувалось власне, окреме ReplyKeyboardMarkup з іншими
+    # емодзі, ніж у get_main_menu() (наприклад, "Ваучер 🎫" тут проти
+    # "Ваучер 🧾" в get_main_menu()) — два незалежних джерела правди для
+    # того самого меню, які легко розсинхронити (нову кнопку "Баланс"
+    # довелось би додавати в двох місцях). Тепер обидва місця використовують
+    # єдиний get_main_menu().
     await message.answer(
         f"👋 <b>Доброго дня, {message.from_user.first_name}!</b>\n\n"
         f"🔋 Вітаємо в мережі зарядних станцій eVolt UA.\n"
         f"💰 Загальний баланс: <b>{balance:.2f} кВт·год</b>\n\n"
         f"Щоб розпочати сесію, введіть ID станції вручну або скористайтеся меню:",
-        reply_markup=main_menu,
+        reply_markup=get_main_menu(),
         parse_mode="HTML"
     )
 
@@ -324,35 +320,58 @@ async def process_successful_payment(message: types.Message):
         parse_mode="HTML"
     )
 
-# --- Команда історії операцій ---
+# --- Баланс та історія операцій ---
+
+async def _build_balance_and_history_text(user_id: int) -> str:
+    """
+    Спільна логіка для кнопки "Баланс" та команди /history, щоб не
+    дублювати формат балансу втретє (після /start і кнопки "Ваучер").
+
+    Раніше `sign`/`op_type` вважали "не-deposit" операцію завжди
+    "Зарядка/Витрата" з мінусом — це коректно для withdrawal/ocpi_session,
+    але некоректно для типу 'refund' (доданого пізніше цієї сесії): рефанд
+    це нарахування користувачу, а показувався б як "-" списання. Виправлено.
+    """
+    balance_kwh, _ = await get_user_data(user_id)
+
+    async with db_conn.db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT amount, type, created_at
+            FROM kw_transactions
+            WHERE user_id = $1
+            ORDER BY created_at DESC LIMIT 5
+        """, user_id)
+
+    if not rows:
+        return f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Історія операцій порожня.</b>"
+
+    text = f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Останні 5 Ledger-операцій (кВт·год):</b>\n\n"
+    for row in rows:
+        is_credit = row['type'] in ("deposit", "refund")
+        sign = "+" if is_credit else "-"
+        date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
+        if row['type'] == 'deposit':
+            op_type = "Поповнення"
+        elif row['type'] == 'refund':
+            op_type = "Повернення коштів"
+        else:
+            op_type = "Зарядка/Витрата"
+
+        text += f"📅 {date_str} | <b>{sign}{abs(row['amount']):.2f} кВт·год</b> ({op_type})\n"
+
+    return text
+
+
+@router.message(lambda m: m.text and "баланс" in m.text.lower(), StateFilter("*"))
+async def process_balance_click(message: types.Message, state: FSMContext):
+    await state.clear()
+    text = await _build_balance_and_history_text(message.from_user.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
+
 
 @router.message(Command("history"), StateFilter("*"))
 async def cmd_history(message: types.Message):
-    user_id = message.from_user.id
-    # Підтягуємо актуальний баланс користувача
-    balance_kwh, _ = await get_user_data(user_id)
-    
-    async with db_conn.db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT amount, type, created_at 
-            FROM kw_transactions 
-            WHERE user_id = $1 
-            ORDER BY created_at DESC LIMIT 5
-        """, user_id)
-        
-    if not rows:
-        await message.answer(f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Історія операцій порожня.</b>", parse_mode="HTML")
-        return
-        
-    text = f"💳 <b>Ваш поточний баланс:</b> <code>{balance_kwh:.2f} кВт·год</code>\n\n📜 <b>Останні 5 Ledger-операцій (кВт·год):</b>\n\n"
-    for row in rows:
-        sign = "+" if row['type'] == 'deposit' else "-"
-        date_str = row['created_at'].strftime("%d.%m.%Y %H:%M")
-        op_type = "Поповнення" if row['type'] == 'deposit' else "Зарядка/Витрата"
-        
-        logging.info(f"DEBUG_HISTORY: {row}")
-        text += f"📅 {date_str} | <b>{sign}{abs(row['amount']):.2f} кВт·год</b> ({op_type})\n"
-        
+    text = await _build_balance_and_history_text(message.from_user.id)
     await message.answer(text, parse_mode="HTML")
 
 # --- Голосове керування через Gemini ---
@@ -387,6 +406,8 @@ async def handle_voice(message: types.Message, state: FSMContext):
         
         if "зарядка" in clean_text:
             await process_charge_click(message, state)
+        elif "баланс" in clean_text:
+            await process_balance_click(message, state)
         elif "ваучер" in clean_text:
             await process_voucher_click(message, state)
         elif "меню" in clean_text or "головне" in clean_text:

@@ -3,10 +3,11 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 def get_main_menu():
     builder = ReplyKeyboardBuilder()
     builder.button(text="Зарядка ⚡")
+    builder.button(text="Баланс 💳")
     builder.button(text="Як працює? 🙄")
     builder.button(text="Ваучер 🧾")
     builder.button(text="Online підтримка 📢")
-    builder.adjust(1, 1, 2)
+    builder.adjust(1, 1, 1, 2)
     return builder.as_markup(resize_keyboard=True)
 
 def get_charge_menu():
