@@ -43,9 +43,12 @@ async def test_deposit_increases_balance_and_stores_positive_amount():
     assert balance_args == (10.0, 123)
 
     ledger_query, ledger_args = _find_call(conn, "INSERT INTO kw_transactions")
-    assert "'deposit'" in ledger_query
-    # amount передається другим параметром INSERT (user_id, amount, payment_id, session_id, description)
-    assert ledger_args[1] == 10.0  # додатне значення для поповнення
+    # тип тепер передається параметром (з явним ::transaction_type кастом),
+    # а не літералом у тексті запиту — перевіряємо значення параметра.
+    # Параметри INSERT: (user_id, type, amount, payment_id, session_id, description)
+    assert "$2::transaction_type" in ledger_query
+    assert ledger_args[1] == "deposit"
+    assert ledger_args[2] == 10.0  # додатне значення для поповнення
 
 
 async def test_withdrawal_decreases_balance_and_stores_negative_amount():
@@ -69,8 +72,26 @@ async def test_monobank_jar_deposit_treated_as_deposit():
         user_id=789, amount_kwh=3.0, t_type="monobank_jar", conn=conn,
     )
     ledger_query, ledger_args = _find_call(conn, "INSERT INTO kw_transactions")
-    assert "'deposit'" in ledger_query
-    assert ledger_args[1] == 3.0
+    assert "$2::transaction_type" in ledger_query
+    assert ledger_args[1] == "deposit"
+    assert ledger_args[2] == 3.0
+
+
+async def test_refund_increases_balance_and_stores_refund_type_not_deposit():
+    """t_type='refund' — кредит (як депозит), але в журналі має бути тип
+    'refund', а не 'deposit', щоб компенсації відрізнялись від поповнень."""
+    conn = FakeConnection()
+    await update_user_balance(
+        user_id=321, amount_kwh=5.0, t_type="refund", conn=conn,
+    )
+
+    balance_query, balance_args = _find_call(conn, "UPDATE users SET balance = balance +")
+    assert balance_args == (5.0, 321)
+
+    ledger_query, ledger_args = _find_call(conn, "INSERT INTO kw_transactions")
+    assert "$2::transaction_type" in ledger_query
+    assert ledger_args[1] == "refund"  # тип у журналі — саме 'refund'
+    assert ledger_args[2] == 5.0  # додатне значення, як і депозит
 
 
 async def test_balance_and_ledger_share_the_same_transaction_connection():

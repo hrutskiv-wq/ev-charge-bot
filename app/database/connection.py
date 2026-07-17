@@ -200,23 +200,36 @@ async def update_user_balance(
     Якщо передано `conn` — операція виконується в межах транзакції
     викликача (наприклад, разом із записом CDR в app/api/ocpi.py), інакше
     функція сама відкриває з'єднання та транзакцію.
+
+    t_type="refund" — компенсація користувачу (наприклад, CDR прийшов і
+    кВт·год списались, а фізична сесія зарядки не відбулась). Це КРЕДИТ
+    (додає до балансу, як і депозит), але в журналі kw_transactions
+    записується окремим типом 'refund' (не 'deposit'), щоб відрізняти
+    компенсації від звичайних поповнень у звітності й реконсиляції.
+    Раніше в enum transaction_type взагалі не було значення 'refund' у
+    реальній (Alembic) схемі — див. migrations/versions/0008_add_refund_transaction_type.py.
     """
 
     async def _apply(active_conn):
         await active_conn.execute(
             "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
         )
-        if t_type in ["deposit", "monobank_jar"]:
+        if t_type in ["deposit", "monobank_jar", "refund"]:
             await active_conn.execute(
                 "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
             )
-            desc = description or "Поповнення балансу (Ваучер / Адмін)"
+            ledger_type = "refund" if t_type == "refund" else "deposit"
+            default_desc = (
+                "Повернення коштів (компенсація)" if t_type == "refund"
+                else "Поповнення балансу (Ваучер / Адмін)"
+            )
+            desc = description or default_desc
             await active_conn.execute(
                 """
                 INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
-                VALUES ($1, 'deposit', $2, $3, $4, $5)
+                VALUES ($1, $2::transaction_type, $3, $4, $5, $6)
                 """,
-                user_id, amount_kwh, payment_id, session_id, desc,
+                user_id, ledger_type, amount_kwh, payment_id, session_id, desc,
             )
         else:
             await active_conn.execute(
