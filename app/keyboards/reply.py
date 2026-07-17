@@ -4,10 +4,15 @@ def get_main_menu():
     builder = ReplyKeyboardBuilder()
     builder.button(text="Зарядка ⚡")
     builder.button(text="Баланс 💳")
-    builder.button(text="Як працює? 🙄")
     builder.button(text="Ваучер 🧾")
     builder.button(text="Online підтримка 📢")
-    builder.adjust(1, 1, 1, 2)
+    # "Як працює?" прибрано з меню — інструкція там була фактично
+    # дублікатом кроків, які й так показує "Зарядка ⚡" по кліку.
+    # Хендлер process_help_click лишається (спрацьовує з тексту/голосу),
+    # просто не винесений окремою кнопкою.
+    # Баланс і Ваучер (поповнення) в одному рядку поруч, як логічна пара
+    # "перевірити скільки є / поповнити ще".
+    builder.adjust(1, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
 def get_charge_menu():
