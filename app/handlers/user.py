@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime
@@ -263,18 +264,59 @@ async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
 
 @router.message(F.successful_payment, StateFilter("*"))
 async def process_successful_payment(message: types.Message):
+    """
+    Раніше цей хендлер писав напряму: UPDATE users SET balance = ... +
+    INSERT INTO kw_transactions, в обхід і update_user_balance(), і таблиці
+    payments — тобто жодного запису про сам платіж Telegram (суму, валюту,
+    унікальний ID від Telegram) взагалі не зберігалось. Це третій, ніким не
+    помічений шлях запису балансу в обхід єдиної точки (після OCPI-CDR і
+    Monobank-webhook, які вже виправлялись раніше) — і оскільки платежу немає
+    в `payments`, реконсиляція (reconcile_payments.py) не могла б його
+    перевірити взагалі. Тепер: спершу фіксуємо сам платіж у payments
+    (invoice_id = унікальний telegram_payment_charge_id — Telegram гарантує
+    його унікальність і незмінність), потім нараховуємо кВт·год через
+    update_user_balance() з прив'язкою payment_id, як і для Monobank.
+    """
     user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload
+    sp = message.successful_payment
+    payload = sp.invoice_payload
     kwh_amount = 50.0 if payload == "pack_50" else 100.0
-    
+    amount_uah = sp.total_amount / 100  # Telegram теж присилає суму в копійках
+
     async with db_conn.db_pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", kwh_amount, user_id)
-            await conn.execute("""
-                INSERT INTO kw_transactions (user_id, type, amount, description) 
-                VALUES ($1, 'deposit', $2, $3)
-            """, user_id, kwh_amount, f"Поповнення через Telegram Invoice ({payload})")
-    
+            existing_payment = await conn.fetchrow(
+                "SELECT id FROM payments WHERE invoice_id = $1",
+                sp.telegram_payment_charge_id,
+            )
+            if existing_payment:
+                logging.info(
+                    f"Telegram-платіж {sp.telegram_payment_charge_id} вже оброблений раніше. Пропускаємо."
+                )
+                return
+
+            payment_id = await conn.fetchval(
+                """
+                INSERT INTO payments (user_id, invoice_id, amount, provider, status, payload, created_at, updated_at)
+                VALUES ($1, $2, $3, 'telegram', 'success', $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                RETURNING id
+                """,
+                user_id, sp.telegram_payment_charge_id, amount_uah,
+                json.dumps({
+                    "invoice_payload": payload,
+                    "provider_payment_charge_id": sp.provider_payment_charge_id,
+                    "currency": sp.currency,
+                }),
+            )
+            await db_conn.update_user_balance(
+                user_id=user_id,
+                amount_kwh=kwh_amount,
+                t_type="deposit",
+                conn=conn,
+                payment_id=payment_id,
+                description=f"Поповнення через Telegram Invoice ({payload})",
+            )
+
     await message.answer(
         f"🎉 <b>Пакет активовано успішно!</b>\n\n"
         f"🔋 На Ваш рахунок зараховано: <b>{kwh_amount} кВт·год</b>.\n"
