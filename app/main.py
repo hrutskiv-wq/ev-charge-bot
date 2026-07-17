@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI):
         pass
 
     await bot.session.close()
+    await dp.storage.close()  # закриває з'єднання з Redis (якщо FSM на RedisStorage)
     await close_postgres()
     logging.info("💤 Всі сервіси безпечно зупинено.")
 

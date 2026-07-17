@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from google import genai
 
 # Єдиний спільний виконавець для фонової відправки логів у Telegram, щоб
@@ -89,6 +90,28 @@ logging.basicConfig(
 #    Telegram API на getUpdates. Тепер app/main.py імпортує bot і dp
 #    звідси, а server.py — це лише сумісний шім навколо app.main:app.
 bot = Bot(token=token)
-storage = MemoryStorage()
+
+# FSM-стан (наприклад, "чекаємо номер станції від користувача") раніше жив
+# лише в MemoryStorage — тобто в оперативній пам'яті самого процесу. Redis
+# уже був піднятий у docker-compose.yml (сервіс `redis`, REDIS_HOST=redis
+# прокинутий у env бота), але жодного разу не використовувався — і кожен
+# `docker compose restart`/деплой миттєво "забував", на якому кроці діалогу
+# перебував користувач (aiogram просто повертав його в початковий стан).
+# REDIS_HOST заданий -> RedisStorage (стан переживає рестарт контейнера).
+# REDIS_HOST не заданий (напр. локальний запуск без Docker) -> MemoryStorage,
+# щоб не вимагати обов'язкового Redis для розробки.
+redis_host = os.getenv("REDIS_HOST")
+if redis_host:
+    redis_port = os.getenv("REDIS_PORT", "6379")
+    storage = RedisStorage.from_url(f"redis://{redis_host}:{redis_port}/0")
+    logging.info(f"🔌 FSM-стан бота зберігається в Redis ({redis_host}:{redis_port}).")
+else:
+    storage = MemoryStorage()
+    logging.warning(
+        "⚠️ REDIS_HOST не заданий — FSM-стан бота живе лише в пам'яті процесу "
+        "і губиться при кожному рестарті контейнера. Задайте REDIS_HOST=redis "
+        "у .env для персистентного стану."
+    )
+
 dp = Dispatcher(storage=storage)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
