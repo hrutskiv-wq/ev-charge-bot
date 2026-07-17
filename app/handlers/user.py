@@ -234,10 +234,33 @@ async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FS
 
 @router.message(StateFilter(BotStates.waiting_for_code))
 async def process_text_voucher(message: types.Message, state: FSMContext):
-    user_code = message.text.strip()
     await state.clear()
+    user_code = (message.text or "").strip()
+    lowered = user_code.lower()
+
+    # Раніше цей хендлер (фільтр — лише StateFilter, без перевірки тексту)
+    # ковтав БУДЬ-яке повідомлення, поки бот "чекав код ваучера" — включно
+    # з натисканням інших кнопок головного меню (Баланс, Зарядка тощо),
+    # показуючи їм помилково "Невірний код ваучера" замість переходу в
+    # потрібний розділ. Тепер спершу перевіряємо, чи це не інша кнопка меню.
+    if "баланс" in lowered:
+        await process_balance_click(message, state)
+        return
+    if "зарядка" in lowered:
+        await process_charge_click(message, state)
+        return
+    if "ваучер" in lowered:
+        await process_voucher_click(message, state)
+        return
+    if "підтримка" in lowered:
+        await process_support_click(message, state)
+        return
+    if "головне" in lowered or "меню" in lowered:
+        await cmd_back_to_menu(message, state)
+        return
+
     user_id = message.from_user.id
-    
+
     if user_code in ["VOLTie100", "VOLT100"]:
         bonus_kwh = 100.0
         async with db_conn.db_pool.acquire() as conn:
