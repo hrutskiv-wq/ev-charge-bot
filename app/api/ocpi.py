@@ -1,10 +1,10 @@
-import json
 import logging
 import secrets
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from app.database import connection
 from app.database.connection import update_user_balance
+from app.schemas.ocpi import CDRRequest
 from app.services.ocpi.config import OCPIConfig
 
 logger = logging.getLogger(__name__)
@@ -33,37 +33,24 @@ async def verify_ocpi_token(authorization: str = Header(default=None)):
 
 
 @router.post("/cdrs", dependencies=[Depends(verify_ocpi_token)])
-async def receive_cdr(cdr: dict):
+async def receive_cdr(cdr: CDRRequest):
     """
     Приймає фінальний CDR від CPO.
     Фіксує його в БД та списує кВт·год з балансу водія.
+
+    Раніше приймав нетипізований `cdr: dict` і валідував поля вручну (окремі
+    перевірки на відсутні поля, від'ємні total_energy/total_cost). Тепер
+    валідація — на рівні Pydantic-моделі `CDRRequest` (app/schemas/ocpi.py):
+    обов'язкові непорожні id/session_id, auth_id > 0, total_energy/total_cost
+    >= 0. FastAPI сам поверне 422 з детальним поясненням, якщо щось не так,
+    ще ДО того, як тіло цієї функції взагалі виконається — і це заразом дає
+    автоматичну схему в Swagger (`/docs`).
     """
-    try:
-        cdr_id = cdr.get("id")
-        session_id = cdr.get("session_id")
-        total_energy = float(cdr.get("total_energy", 0.0))
-        total_cost = float(cdr.get("total_cost", 0.0))
-        user_id = int(cdr.get("auth_id", 0))
-    except (ValueError, TypeError, AttributeError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Некоректний формат даних CDR: {str(e)}"
-        )
-
-    if not cdr_id or not session_id or not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Відсутні обов'язкові поля: id, session_id або auth_id."
-        )
-
-    if total_energy < 0 or total_cost < 0:
-        # CDR з від'ємними значеннями не може бути легітимним і раніше міг
-        # використовуватись для накрутки балансу (withdrawal з від'ємною сумою
-        # ставав поповненням). Відхиляємо одразу.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="total_energy та total_cost не можуть бути від'ємними."
-        )
+    cdr_id = cdr.id
+    session_id = cdr.session_id
+    user_id = cdr.auth_id
+    total_energy = cdr.total_energy
+    total_cost = cdr.total_cost
 
     if not connection.db_pool:
         raise HTTPException(
@@ -86,7 +73,7 @@ async def receive_cdr(cdr: dict):
             await conn.execute("""
                 INSERT INTO ocpi_cdrs (cdr_id, user_id, session_id, total_energy, total_cost, raw_payload)
                 VALUES ($1, $2, $3, $4, $5, $6)
-            """, cdr_id, user_id, session_id, total_energy, total_cost, json.dumps(cdr))
+            """, cdr_id, user_id, session_id, total_energy, total_cost, cdr.model_dump_json())
 
             # 3. Списуємо кВт·год з балансу користувача.
             #    ВАЖЛИВО: баланс користувача (users.balance) ведеться в кВт·год,
@@ -94,7 +81,10 @@ async def receive_cdr(cdr: dict):
             #    (грошова вартість сесії у валюті CPO) — раніше тут помилково
             #    віднімався total_cost, через що users.balance взагалі не
             #    оновлювався (списання йшло лише в журнал kw_transactions) і
-            #    з часом розходився з реальним балансом.
+            #    з часом розходився з реальним балансом. Той самий баг
+            #    повторно зʼявився в осиротілому чернетковому файлі
+            #    ocpi_emsp_cdrs_refactored.py — видалений при інтеграції цієї
+            #    Pydantic-моделі, щоб не лишати два розбіжні джерела правди.
             await update_user_balance(
                 user_id=user_id,
                 amount_kwh=total_energy,
