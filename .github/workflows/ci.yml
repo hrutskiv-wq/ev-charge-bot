@@ -1,0 +1,37 @@
+name: CI
+
+# Ганяє pytest на кожен push і кожен PR, щоб регресії (як-от знак балансу
+# чи авторизація OCPI/Monobank) ловились до мержу, а не на проді.
+# Реальна Postgres/Redis тут не потрібні: усі тести (test_balance.py,
+# test_ocpi_auth.py, test_ocpi_cdr.py, test_monobank_signature.py) мокають
+# з'єднання з БД і зовнішні мережеві виклики — див. PROJECT_CONTEXT.md.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          # Мінімум, потрібний лише для того, щоб app.services.ocpi.config
+          # не впав при імпорті (OCPIConfig навмисно кидає RuntimeError без
+          # цієї змінної) — реальний секрет тут не потрібен, тести його не
+          # використовують для звернення до живого CPO.
+          OCPI_SECRET_TOKEN: ci-placeholder-token
+        run: pytest -v
