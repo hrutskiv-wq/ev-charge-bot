@@ -20,7 +20,14 @@ async def verify_ocpi_token(authorization: str = Header(default=None)):
     довільному користувачу.
     """
     expected = f"Token {OCPIConfig.OCPI_TOKEN}"
-    if not authorization or not secrets.compare_digest(authorization, expected):
+    # secrets.compare_digest вимагає, щоб обидва аргументи були або bytes,
+    # або str з ЛИШЕ ASCII-символів — інакше кидає TypeError (а не повертає
+    # False). Заголовок Authorization повністю контролюється зовнішнім
+    # клієнтом: якщо туди прийде будь-який не-ASCII байт (навіть випадково,
+    # не кажучи вже про навмисну спробу зламати запит), необробний TypeError
+    # перетворював би коректну відмову 401 на 500 Internal Server Error.
+    # Кодуємо в bytes заздалегідь — тоді порівняння приймає будь-який вміст.
+    if not authorization or not secrets.compare_digest(authorization.encode(), expected.encode()):
         logger.warning("⛔ Відхилено OCPI-запит з невалідним або відсутнім заголовком Authorization.")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing OCPI token")
 
