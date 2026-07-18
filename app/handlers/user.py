@@ -70,6 +70,27 @@ async def process_support_click(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("📢 Зв'язок з оператором підтримки eVolt UA: @your_support_username")
 
+# --- Команди зі списку "Menu" в Telegram (bot.set_my_commands у app/main.py) ---
+# Дублюють натискання відповідних кнопок reply-клавіатури (app/keyboards/reply.py),
+# щоб вибір команди зі списку "Menu" біля поля вводу реально працював, а не
+# лише показував пункт у списку.
+
+@router.message(Command("balance"), StateFilter("*"))
+async def cmd_balance_menu(message: types.Message, state: FSMContext):
+    await process_balance_click(message, state)
+
+@router.message(Command("charge"), StateFilter("*"))
+async def cmd_charge_menu(message: types.Message, state: FSMContext):
+    await process_charge_click(message, state)
+
+@router.message(Command("voucher"), StateFilter("*"))
+async def cmd_voucher_menu(message: types.Message, state: FSMContext):
+    await process_voucher_click(message, state)
+
+@router.message(Command("support"), StateFilter("*"))
+async def cmd_support_menu(message: types.Message, state: FSMContext):
+    await process_support_click(message, state)
+
 # --- Логіка зарядки та списання ---
 
 @router.message(lambda m: m.text and "зарядка" in m.text.lower(), StateFilter("*"))

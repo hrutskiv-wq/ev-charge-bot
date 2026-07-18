@@ -6,7 +6,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from aiogram.types import ErrorEvent
+from aiogram.types import ErrorEvent, BotCommand, MenuButtonCommands
 
 # ЄДИНИЙ спільний bot/dp на весь застосунок (див. app/core/loader.py) —
 # раніше тут створювався ще один окремий Bot(token=...)/Dispatcher(),
@@ -32,6 +32,23 @@ async def lifespan(app: FastAPI):
     # --- STARTUP ---
     await init_postgres()
     await init_ocpi_tables()
+
+    # Кнопка "Menu" біля поля вводу в Telegram (як у конкурентних ботів) —
+    # раніше bot.set_my_commands()/set_chat_menu_button() взагалі не
+    # викликались, тому в клієнті був лише стандартний значок клавіатури,
+    # без списку команд. MenuButtonCommands() показує саме цей список при
+    # натисканні "Menu". Команди дублюють уже наявні кнопки reply-клавіатури
+    # (app/keyboards/reply.py) — див. відповідні Command(...) хендлери в
+    # app/handlers/user.py.
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Головне меню"),
+        BotCommand(command="balance", description="💳 Баланс і історія операцій"),
+        BotCommand(command="charge", description="⚡ Почати зарядку"),
+        BotCommand(command="voucher", description="🧾 Поповнити баланс"),
+        BotCommand(command="support", description="📢 Online підтримка"),
+    ])
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
     polling_task = asyncio.create_task(dp.start_polling(bot))
     logging.info("🚀 Telegram bot polling успішно запущено у фоні!")
 
