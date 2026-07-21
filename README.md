@@ -18,7 +18,7 @@ alembic upgrade head
 python -m app.main                    # або: docker compose up -d --build
 ```
 
-Тести: `pytest` — 202 тести, усі мокають БД і мережу, живі сервіси не потрібні.
+Тести: `pytest` — 261 тест, усі мокають БД і мережу, живі сервіси не потрібні.
 
 ## Чек-лист деплою
 
@@ -63,6 +63,26 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 Сторінка оплати водія — `GET /s/{qr_slug}`, чек — `/s/{qr_slug}/receipt/{id}`.
 Водій не реєструється: єдиний ключ доступу це `qr_slug` під QR-кодом.
 
+### Кабінет оператора в Telegram
+
+Вхід — команда `/operator` або кнопка «🏷️ Мій білінг» у головному меню.
+Новий Telegram-акаунт проходить онбординг (назва, телефон) і записується в
+`operators` зі статусом `pending` — автоактивації немає навмисно, сповіщення
+летить у `LOGS_CHAT_ID`, активація вручну: `set_operator_status(id, 'active')`.
+Далі оператор сам, без ручних SQL:
+
+- підключає еквайринг Monobank (токен приймається лише в приватному чаті,
+  шифрується одразу, повідомлення з відкритим токеном видаляється);
+- додає станції покроковим майстром (назва, адреса, конектор, потужність,
+  тариф, опційна плата за старт) і одразу отримує QR-PNG на друк;
+- керує тарифом і статусом (`active`/`disabled`) кожної станції;
+- бачить виручку за сьогодні/тиждень/місяць (`SUM` з `operator_payout_ledger`
+  за типами `session_income`/`platform_commission` — кешованого балансу
+  немає навмисно, як і в решті білінгу) та вивантажує CSV.
+
+Усе це доступне ще під час `pending` — оплати водіїв від цього не залежать,
+їх окремо блокує перевірка статусу оператора в `app/api/driver_qr.py`.
+
 ## Локальна розробка проти моків
 
 Зовнішні системи, без яких флоу не протестувати:
@@ -87,6 +107,8 @@ uvicorn mock_monobank:app --port 8081      # еквайринг Monobank
 | `app/database/connection.py` | пул, базові таблиці, `update_user_balance()` |
 | `app/database/operators_repo.py` | білінг операторів (мультитенантний) |
 | `app/services/monobank_acquiring.py` | клієнт Monobank Acquiring |
+| `app/services/qr_image.py` | генерація QR-PNG станцій (`qrcode[pil]`) |
+| `app/handlers/operator_billing.py` | кабінет оператора в Telegram: онбординг, майстер станцій, виручка |
 | `app/api/driver_qr.py` | сторінка оплати водія `/s/{qr_slug}` + чек |
 | `app/api/` | HTTP-ендпоінти: OCPI, платежі, webhook операторів |
 | `templates/driver/` | Jinja2-шаблони сторінок водія (без зовнішніх ресурсів) |
