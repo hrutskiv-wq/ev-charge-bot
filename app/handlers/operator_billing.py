@@ -50,8 +50,9 @@ from app.core.crypto import encrypt_secret
 from app.core.loader import bot
 from app.database import operators_repo as repo
 from app.keyboards.operator import (
-    get_admin_activation_keyboard, get_cabinet_menu, get_revenue_csv_keyboard,
-    get_revenue_period_keyboard, get_station_detail_keyboard, get_station_list_keyboard,
+    get_admin_activation_keyboard, get_cabinet_menu, get_connector_presets_keyboard,
+    get_revenue_csv_keyboard, get_revenue_period_keyboard, get_station_detail_keyboard,
+    get_station_list_keyboard,
 )
 from app.services.operator_notify import CONFIRM_PREFIX
 from app.services.qr_image import generate_station_qr_png
@@ -391,13 +392,87 @@ async def station_wizard_name(message: Message, state: FSMContext):
 @router.message(StateFilter(StationWizard.waiting_for_address), _is_free_text)
 async def station_wizard_address(message: Message, state: FSMContext):
     await state.update_data(address=_parse_skip(message.text))
+    await state.set_state(StationWizard.waiting_for_location)
+    await message.answer(
+        "Розташування станції: надішліть геопозицію 📍, координати текстом "
+        "«lat, lng» (наприклад 49.8397, 24.0297), або «-», щоб пропустити "
+        "(без координат станція НЕ зʼявиться в пошуку найближчих для водіїв):"
+    )
+
+
+def _parse_coordinates(text: str):
+    """'lat, lng' -> (float, float) або None, якщо формат/діапазон невалідні."""
+    parts = text.split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        lat = float(parts[0].strip())
+        lng = float(parts[1].strip())
+    except ValueError:
+        return None
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return None
+    return lat, lng
+
+
+async def _prompt_connector_step(message: Message, state: FSMContext):
     await state.set_state(StationWizard.waiting_for_connector)
-    await message.answer("Тип конектора, наприклад Type 2 / CCS / GBT / Schuko (або «-»):")
+    await message.answer("Тип конектора:", reply_markup=get_connector_presets_keyboard())
+
+
+@router.message(StateFilter(StationWizard.waiting_for_location), F.location)
+async def station_wizard_location_shared(message: Message, state: FSMContext):
+    await state.update_data(lat=message.location.latitude, lng=message.location.longitude)
+    await _prompt_connector_step(message, state)
+
+
+@router.message(StateFilter(StationWizard.waiting_for_location), _is_free_text)
+async def station_wizard_location_text(message: Message, state: FSMContext):
+    raw = _parse_skip(message.text)
+    if raw is None:
+        await state.update_data(lat=None, lng=None)
+        await message.answer(
+            "⚠️ Без координат станція не зʼявиться в пошуку найближчих для "
+            "водіїв. Додати їх можна пізніше через підтримку."
+        )
+        await _prompt_connector_step(message, state)
+        return
+
+    coords = _parse_coordinates(raw)
+    if coords is None:
+        await message.answer(
+            "Не розпізнав координати. Формат: «lat, lng» (наприклад "
+            "49.8397, 24.0297), або надішліть геопозицію кнопкою 📍, або "
+            "«-», щоб пропустити:"
+        )
+        return
+
+    lat, lng = coords
+    await state.update_data(lat=lat, lng=lng)
+    await _prompt_connector_step(message, state)
+
+
+@router.callback_query(F.data.startswith("opconn:"), StateFilter(StationWizard.waiting_for_connector))
+async def station_wizard_connector_preset(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if value == "__other__":
+        # Лишаємось у тому самому стані — наступний вільний текст прийме
+        # station_wizard_connector_custom() нижче.
+        await callback.message.answer("Введіть тип конектора текстом:")
+        return
+    await state.update_data(connector_type=value)
+    await state.set_state(StationWizard.waiting_for_power)
+    await callback.message.answer("Потужність, кВт, наприклад 22 (або «-»):")
 
 
 @router.message(StateFilter(StationWizard.waiting_for_connector), _is_free_text)
-async def station_wizard_connector(message: Message, state: FSMContext):
-    await state.update_data(connector_type=_parse_skip(message.text))
+async def station_wizard_connector_custom(message: Message, state: FSMContext):
+    connector = message.text.strip()
+    if not connector:
+        await message.answer("Введіть тип конектора текстом:")
+        return
+    await state.update_data(connector_type=connector)
     await state.set_state(StationWizard.waiting_for_power)
     await message.answer("Потужність, кВт, наприклад 22 (або «-»):")
 
@@ -463,7 +538,8 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
 
     station_id, qr_slug = await repo.create_station(
         operator["id"], data["name"], data["tariff_uah_kwh"],
-        address=data.get("address"), connector_type=data.get("connector_type"),
+        address=data.get("address"), lat=data.get("lat"), lng=data.get("lng"),
+        connector_type=data.get("connector_type"),
         power_kw=data.get("power_kw"), tariff_uah_start=tariff_start,
     )
     await _send_new_station_qr(message, data["name"], qr_slug)

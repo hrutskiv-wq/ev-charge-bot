@@ -14,9 +14,15 @@ class MonobankConnect(StatesGroup):
 
 
 class StationWizard(StatesGroup):
-    """Покроковий майстер додавання станції. Адреса/конектор/потужність/старт — опційні (`-` пропускає)."""
+    """
+    Покроковий майстер додавання станції. Адреса/локація/потужність/старт —
+    опційні (`-` пропускає); конектор — кнопками (Промпт 4c), фактично
+    обов'язковий (без "Пропустити"), бо саме він разом із потужністю формує
+    бейдж швидкості станції у водійському пошуку.
+    """
     waiting_for_name = State()
     waiting_for_address = State()
+    waiting_for_location = State()
     waiting_for_connector = State()
     waiting_for_power = State()
     waiting_for_tariff_kwh = State()

@@ -42,10 +42,18 @@ class FakeChat:
         self.id = chat_id
 
 
+class FakeLocation:
+    def __init__(self, latitude, longitude):
+        self.latitude = latitude
+        self.longitude = longitude
+
+
 class FakeMessage:
     def __init__(self, text="", telegram_id=TELEGRAM_A, username=None,
-                 chat_type="private", message_id=42, chat_id=None, html_text=""):
+                 chat_type="private", message_id=42, chat_id=None, html_text="",
+                 location=None):
         self.text = text
+        self.location = location
         self.from_user = FakeUser(telegram_id, username)
         self.chat = FakeChat(chat_type, chat_id=chat_id if chat_id is not None else telegram_id)
         self.message_id = message_id
@@ -621,7 +629,7 @@ async def test_cabinet_connect_token_rejects_group_chat_before_setting_state(rs)
 # Майстер станції
 # ---------------------------------------------------------------------------
 
-async def test_full_station_wizard_creates_manual_station_and_sends_qr(rs, monkeypatch):
+async def test_full_station_wizard_with_shared_location_and_preset_connector(rs, monkeypatch):
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
     captured_urls = []
 
@@ -639,9 +647,14 @@ async def test_full_station_wizard_creates_manual_station_and_sends_qr(rs, monke
     assert state.state == ob.StationWizard.waiting_for_address
 
     await ob.station_wizard_address(FakeMessage("вул. Зубра, 17"), state)
+    assert state.state == ob.StationWizard.waiting_for_location
+
+    location_message = FakeMessage(location=FakeLocation(49.8397, 24.0297))
+    await ob.station_wizard_location_shared(location_message, state)
     assert state.state == ob.StationWizard.waiting_for_connector
 
-    await ob.station_wizard_connector(FakeMessage("Type 2"), state)
+    preset_callback = FakeCallback("opconn:Type 2")
+    await ob.station_wizard_connector_preset(preset_callback, state)
     assert state.state == ob.StationWizard.waiting_for_power
 
     await ob.station_wizard_power(FakeMessage("22"), state)
@@ -659,6 +672,8 @@ async def test_full_station_wizard_creates_manual_station_and_sends_qr(rs, monke
     assert created["operator_id"] == OPERATOR_A
     assert created["name"] == "Готель Едем — паркінг"
     assert created["address"] == "вул. Зубра, 17"
+    assert created["lat"] == 49.8397
+    assert created["lng"] == 24.0297
     assert created["connector_type"] == "Type 2"
     assert created["power_kw"] == 22.0
     assert created["tariff_uah_kwh"] == 12.5
@@ -669,7 +684,37 @@ async def test_full_station_wizard_creates_manual_station_and_sends_qr(rs, monke
     assert captured_urls == [f"{ob.PUBLIC_BASE_URL}/s/{created['qr_slug']}"]
 
 
-async def test_station_wizard_skips_optional_fields_with_dash(rs, monkeypatch):
+async def test_full_station_wizard_with_text_coordinates_and_custom_connector(rs, monkeypatch):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
+    monkeypatch.setattr(ob, "generate_station_qr_png", lambda url: b"\x89PNG\r\n\x1a\n")
+
+    state = FakeFSMContext()
+    await state.set_state(ob.StationWizard.waiting_for_name)
+    await ob.station_wizard_name(FakeMessage("Станція на СТО"), state)
+    await ob.station_wizard_address(FakeMessage("-"), state)
+
+    await ob.station_wizard_location_text(FakeMessage("49.8397, 24.0297"), state)
+    assert state.state == ob.StationWizard.waiting_for_connector
+
+    other_callback = FakeCallback("opconn:__other__")
+    await ob.station_wizard_connector_preset(other_callback, state)
+    assert state.state == ob.StationWizard.waiting_for_connector, "«Інше» лишає той самий стан, чекаючи текст"
+
+    await ob.station_wizard_connector_custom(FakeMessage("Промислова розетка 380В"), state)
+    assert state.state == ob.StationWizard.waiting_for_power
+
+    await ob.station_wizard_power(FakeMessage("-"), state)
+    await ob.station_wizard_tariff_kwh(FakeMessage("10"), state)
+    await ob.station_wizard_tariff_start(FakeMessage("-"), state)
+
+    created = rs.created_stations[0]
+    assert created["lat"] == 49.8397
+    assert created["lng"] == 24.0297
+    assert created["connector_type"] == "Промислова розетка 380В"
+    assert created["power_kw"] is None
+
+
+async def test_station_wizard_skips_location_with_dash_and_warns(rs, monkeypatch):
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
     monkeypatch.setattr(ob, "generate_station_qr_png", lambda url: b"\x89PNG\r\n\x1a\n")
 
@@ -677,16 +722,68 @@ async def test_station_wizard_skips_optional_fields_with_dash(rs, monkeypatch):
     await state.set_state(ob.StationWizard.waiting_for_name)
     await ob.station_wizard_name(FakeMessage("Мінімальна станція"), state)
     await ob.station_wizard_address(FakeMessage("-"), state)
-    await ob.station_wizard_connector(FakeMessage("-"), state)
+
+    location_message = FakeMessage("-")
+    await ob.station_wizard_location_text(location_message, state)
+    assert state.state == ob.StationWizard.waiting_for_connector
+    assert any("не зʼявиться в пошуку" in text for text, _kwargs in location_message.sent)
+
+    preset_callback = FakeCallback("opconn:Schuko")
+    await ob.station_wizard_connector_preset(preset_callback, state)
     await ob.station_wizard_power(FakeMessage("-"), state)
     await ob.station_wizard_tariff_kwh(FakeMessage("10"), state)
     await ob.station_wizard_tariff_start(FakeMessage("-"), state)
 
     created = rs.created_stations[0]
     assert created["address"] is None
-    assert created["connector_type"] is None
+    assert created["lat"] is None
+    assert created["lng"] is None
     assert created["power_kw"] is None
     assert created["tariff_uah_start"] is None
+    assert created["connector_type"] == "Schuko"
+
+
+async def test_station_wizard_location_rejects_invalid_text_and_stays_on_step(rs):
+    state = FakeFSMContext()
+    await state.set_state(ob.StationWizard.waiting_for_location)
+    message = FakeMessage("десь у Львові")
+
+    await ob.station_wizard_location_text(message, state)
+
+    assert state.state == ob.StationWizard.waiting_for_location
+    assert "Не розпізнав координати" in message.sent[0][0]
+
+
+@pytest.mark.parametrize("raw", ["49.84", "49.84, 24.03, 1", "999, 24.03", "49.84, 999"])
+def test_parse_coordinates_rejects_bad_input(raw):
+    assert ob._parse_coordinates(raw) is None
+
+
+def test_parse_coordinates_accepts_valid_pair():
+    assert ob._parse_coordinates("49.8397, 24.0297") == (49.8397, 24.0297)
+
+
+async def test_station_wizard_connector_other_keeps_state_until_text(rs):
+    state = FakeFSMContext()
+    await state.set_state(ob.StationWizard.waiting_for_connector)
+    callback = FakeCallback("opconn:__other__")
+
+    await ob.station_wizard_connector_preset(callback, state)
+
+    assert state.state == ob.StationWizard.waiting_for_connector
+    assert "connector_type" not in state.data
+    assert "Введіть тип конектора" in callback.message.sent[0][0]
+
+
+async def test_station_wizard_connector_preset_stores_value_and_advances(rs):
+    state = FakeFSMContext()
+    await state.set_state(ob.StationWizard.waiting_for_connector)
+    callback = FakeCallback("opconn:GB/T AC")
+
+    await ob.station_wizard_connector_preset(callback, state)
+
+    assert state.state == ob.StationWizard.waiting_for_power
+    assert state.data["connector_type"] == "GB/T AC"
 
 
 async def test_station_wizard_rejects_non_numeric_tariff_and_stays_on_step(rs):

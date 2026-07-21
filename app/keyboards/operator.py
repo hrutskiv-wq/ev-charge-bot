@@ -1,6 +1,11 @@
 """Клавіатури кабінету оператора (Промпт 4)."""
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# Пресети конектора в майстрі станції (Промпт 4c) — оператори переважно
+# повільні AC, тому саме ці типи покривають більшість випадків одним кліком.
+CONNECTOR_PRESETS = ["Type 2", "GB/T AC", "Schuko", "CEE 5-pin (3ф)"]
+CONNECTOR_OTHER_CALLBACK = "opconn:__other__"
+
 
 def get_cabinet_menu(has_token: bool):
     builder = InlineKeyboardBuilder()
@@ -57,5 +62,15 @@ def get_admin_activation_keyboard(operator_id: int):
     """Кнопка під повідомленням про нового оператора в LOGS_CHAT_ID."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Активувати", callback_data=f"opadm:activate:{operator_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_connector_presets_keyboard():
+    """Крок конектора майстра станції: пресети + «Інше» (веде до вільного тексту)."""
+    builder = InlineKeyboardBuilder()
+    for preset in CONNECTOR_PRESETS:
+        builder.button(text=preset, callback_data=f"opconn:{preset}")
+    builder.button(text="Інше", callback_data=CONNECTOR_OTHER_CALLBACK)
     builder.adjust(1)
     return builder.as_markup()
