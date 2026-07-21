@@ -1,0 +1,455 @@
+"""
+Тести ізоляції тенантів для White-Label білінгу
+(app/database/operators_repo.py, міграція 0010).
+
+Головне правило, яке тут перевіряється: оператор А ніколи не бачить і не
+змінює дані оператора Б. Технічно це означає, що КОЖЕН запит до таблиць
+operator_* містить у WHERE `operator_id` і отримує його параметром — забути
+фільтр неможливо непомітно, бо тест пройдеться по всіх тенант-скоупнутих
+функціях модуля і перевірить згенерований SQL.
+
+Тести не піднімають реальну Postgres — підміняють пул фейковим об'єктом,
+що записує, які SQL-запити й з якими параметрами були виконані (той самий
+підхід, що в test_balance.py).
+
+Запуск: pytest test_operator_isolation.py -v
+"""
+import re
+from pathlib import Path
+
+import pytest
+
+from app.database import operators_repo as repo
+
+OPERATOR_A = 1
+OPERATOR_B = 2
+
+
+# ---------------------------------------------------------------------------
+# Заглушки asyncpg
+# ---------------------------------------------------------------------------
+
+class FakeConnection:
+    """Мінімальна заглушка asyncpg.Connection: запам'ятовує всі виклики."""
+
+    def __init__(self, fetchrow_result=None, fetch_result=None,
+                 fetchval_result=None, execute_result="UPDATE 1"):
+        self.calls = []
+        self._fetchrow_result = fetchrow_result
+        self._fetch_result = fetch_result if fetch_result is not None else []
+        self._fetchval_result = fetchval_result
+        self._execute_result = execute_result
+
+    def _record(self, query, args):
+        self.calls.append((" ".join(query.split()), args))
+
+    async def execute(self, query, *args):
+        self._record(query, args)
+        return self._execute_result
+
+    async def fetch(self, query, *args):
+        self._record(query, args)
+        return self._fetch_result
+
+    async def fetchrow(self, query, *args):
+        self._record(query, args)
+        return self._fetchrow_result
+
+    async def fetchval(self, query, *args):
+        self._record(query, args)
+        return self._fetchval_result
+
+    def transaction(self):
+        return _FakeTransaction()
+
+
+class _FakeTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeAcquire:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakePool:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def acquire(self):
+        return _FakeAcquire(self._conn)
+
+
+@pytest.fixture
+def fake_conn(monkeypatch):
+    """Підміняє пул у operators_repo фейковим з'єднанням."""
+    conn = FakeConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+    return conn
+
+
+def _single_call(conn):
+    """Єдиний (або перший) виконаний запит: (нормалізований SQL, args)."""
+    assert conn.calls, "Функція не виконала жодного запиту"
+    return conn.calls[0]
+
+
+# ---------------------------------------------------------------------------
+# 1. Структурна перевірка: кожен тенант-скоупнутий запит фільтрує по operator_id
+# ---------------------------------------------------------------------------
+
+# (назва, як викликати з конкретним operator_id, чим саме запит звужений)
+#
+# Три види звуження — і кожен перевіряється своїм твердженням, а не спільним
+# нестрогим "у тексті десь є operator_id":
+#   "operator_id" — дочірні таблиці: WHERE operator_id = $1
+#   "own_id"      — сама таблиця operators: там тенант-ключ це її ж PK, WHERE id = $1
+#   "insert"      — вставка: operator_id іде першою колонкою зі значенням $1
+TENANT_SCOPED_CALLS = [
+    ("get_operator", lambda op_id: repo.get_operator(op_id), "own_id"),
+    ("set_operator_status", lambda op_id: repo.set_operator_status(op_id, "active"), "own_id"),
+    ("set_operator_monobank_token", lambda op_id: repo.set_operator_monobank_token(op_id, "enc"), "own_id"),
+    ("get_operator_monobank_token_encrypted", lambda op_id: repo.get_operator_monobank_token_encrypted(op_id), "own_id"),
+    ("list_stations", lambda op_id: repo.list_stations(op_id), "operator_id"),
+    ("get_station", lambda op_id: repo.get_station(op_id, 10), "operator_id"),
+    ("update_station_tariff", lambda op_id: repo.update_station_tariff(op_id, 10, 12.5), "operator_id"),
+    ("set_station_status", lambda op_id: repo.set_station_status(op_id, 10, "offline"), "operator_id"),
+    ("create_session", lambda op_id: repo.create_session(op_id, 10), "operator_id"),
+    ("get_session", lambda op_id: repo.get_session(op_id, 77), "operator_id"),
+    ("list_sessions", lambda op_id: repo.list_sessions(op_id), "operator_id"),
+    ("list_sessions_by_station", lambda op_id: repo.list_sessions(op_id, station_id=10), "operator_id"),
+    ("set_session_status", lambda op_id: repo.set_session_status(op_id, 77, "paid"), "operator_id"),
+    ("complete_session", lambda op_id: repo.complete_session(op_id, 77, 12.0), "operator_id"),
+    ("add_ledger_entry", lambda op_id: repo.add_ledger_entry(op_id, "adjustment", 1.0), "insert"),
+    ("get_operator_balance", lambda op_id: repo.get_operator_balance(op_id), "operator_id"),
+    ("list_ledger", lambda op_id: repo.list_ledger(op_id), "operator_id"),
+]
+
+_IDS = [c[0] for c in TENANT_SCOPED_CALLS]
+
+
+@pytest.mark.parametrize("name,call,scope", TENANT_SCOPED_CALLS, ids=_IDS)
+async def test_every_tenant_scoped_query_is_narrowed_to_one_tenant(name, call, scope, fake_conn):
+    """
+    Ключовий тест ізоляції. Якщо хтось додасть функцію або перепише запит
+    без звуження до одного тенанта — тест впаде тут, а не в проді на чужих даних.
+    """
+    await call(OPERATOR_A)
+    query, args = _single_call(fake_conn)
+
+    # operator_id завжди перший параметр — інакше легко переплутати місцями
+    # при додаванні аргументів і тихо зламати фільтр.
+    assert args[0] == OPERATOR_A, f"{name}: operator_id має бути першим параметром, отримано {args}"
+
+    if scope == "operator_id":
+        assert re.search(r"operator_id = \$1", query), (
+            f"{name}: запит не звужений до тенанта (`operator_id = $1` відсутній):\n{query}"
+        )
+    elif scope == "own_id":
+        # таблиця operators: рядок тенанта і є рядком, що шукаємо
+        assert "FROM operators" in query or "UPDATE operators" in query, query
+        assert re.search(r"WHERE id = \$1", query), (
+            f"{name}: запит до operators не звужений по PK (`WHERE id = $1`):\n{query}"
+        )
+    else:  # insert
+        assert re.search(r"INSERT INTO \w+ \(operator_id,", query), (
+            f"{name}: operator_id має бути першою колонкою вставки:\n{query}"
+        )
+        assert "VALUES ($1," in query, (
+            f"{name}: у operator_id має підставлятись саме $1:\n{query}"
+        )
+
+
+@pytest.mark.parametrize("name,call,scope", TENANT_SCOPED_CALLS, ids=_IDS)
+async def test_operator_id_is_passed_through_verbatim(name, call, scope, fake_conn):
+    """Оператор Б отримує в запиті саме свій id — жодного «дефолтного» тенанта."""
+    await call(OPERATOR_B)
+    _query, args = _single_call(fake_conn)
+    assert args[0] == OPERATOR_B
+    assert OPERATOR_A not in args[:1]
+
+
+# ---------------------------------------------------------------------------
+# 2. Поведінкова ізоляція: чужий ресурс = порожній результат, а не чужі дані
+# ---------------------------------------------------------------------------
+
+async def test_get_station_of_another_operator_returns_none(monkeypatch):
+    """
+    Станція оператора Б, запитана від імені А, не повертається. Фейк
+    імітує саме поведінку Postgres: WHERE не зійшовся → жодного рядка.
+    """
+    station_of_b = {"id": 10, "operator_id": OPERATOR_B, "name": "Готель Б"}
+
+    class TenantAwareConnection(FakeConnection):
+        async def fetchrow(self, query, *args):
+            self._record(query, args)
+            # рядок повертається, лише якщо запитаний operator_id збігається
+            if args[0] == station_of_b["operator_id"] and args[1] == station_of_b["id"]:
+                return station_of_b
+            return None
+
+    conn = TenantAwareConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.get_station(OPERATOR_B, 10) == station_of_b
+    assert await repo.get_station(OPERATOR_A, 10) is None
+
+
+async def test_update_station_tariff_of_another_operator_changes_nothing(monkeypatch):
+    """Спроба А змінити тариф станції Б не оновлює жодного рядка → False."""
+    class TenantAwareConnection(FakeConnection):
+        async def execute(self, query, *args):
+            self._record(query, args)
+            return "UPDATE 1" if args[0] == OPERATOR_B else "UPDATE 0"
+
+    conn = TenantAwareConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.update_station_tariff(OPERATOR_B, 10, 15.0) is True
+    assert await repo.update_station_tariff(OPERATOR_A, 10, 999.0) is False
+
+
+async def test_create_session_derives_operator_id_from_the_station_itself(fake_conn):
+    """
+    Сесія не довіряє operator_id з аргументу: він підставляється в підзапит
+    по станції (`INSERT ... SELECT ... WHERE s.operator_id = $1`), тому для
+    чужої станції SELECT порожній і сесія не створюється. Крос-тенантний
+    рядок неможливо записати навіть навмисно.
+    """
+    await repo.create_session(OPERATOR_A, 10)
+    query, args = _single_call(fake_conn)
+
+    assert "INSERT INTO operator_sessions" in query
+    assert "FROM operator_stations s" in query
+    assert "s.operator_id = $1" in query and "s.id = $2" in query
+    # operator_id у вставку йде з таблиці станцій (s.operator_id), а не з аргументу
+    assert "SELECT s.operator_id, s.id" in query
+    assert args[0] == OPERATOR_A and args[1] == 10
+
+
+async def test_create_session_on_foreign_station_returns_none(monkeypatch):
+    """Станція чужа → INSERT ... SELECT не вставив нічого → None."""
+    class TenantAwareConnection(FakeConnection):
+        async def fetchval(self, query, *args):
+            self._record(query, args)
+            return 555 if args[0] == OPERATOR_B else None
+
+    conn = TenantAwareConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.create_session(OPERATOR_B, 10) == 555
+    assert await repo.create_session(OPERATOR_A, 10) is None
+
+
+# ---------------------------------------------------------------------------
+# 3. Секрет оператора не тече у звичайні вибірки
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("call", [
+    lambda: repo.get_operator(OPERATOR_A),
+    lambda: repo.get_operator_by_telegram_id(777),
+    lambda: repo.list_stations(OPERATOR_A),
+])
+async def test_regular_selects_never_return_the_acquiring_token(call, fake_conn):
+    """
+    monobank_token_encrypted має діставатись лише через окрему свідому
+    функцію. Якщо він потрапить у загальний SELECT кабінету — рано чи пізно
+    опиниться в лозі або в дампі для оператора.
+    """
+    await call()
+    query, _args = _single_call(fake_conn)
+    assert "monobank_token_encrypted" not in query
+    assert "SELECT *" not in query
+
+
+async def test_dedicated_token_getter_is_scoped_to_one_operator(fake_conn):
+    await repo.get_operator_monobank_token_encrypted(OPERATOR_A)
+    query, args = _single_call(fake_conn)
+    assert "monobank_token_encrypted" in query
+    assert "operator_id = $1" in query or "WHERE id = $1" in query
+    assert args == (OPERATOR_A,)
+
+
+# ---------------------------------------------------------------------------
+# 4. Публічні винятки задокументовані й не приймають operator_id
+# ---------------------------------------------------------------------------
+
+async def test_public_lookups_are_keyed_by_their_own_secret(fake_conn):
+    """
+    get_station_by_qr_slug і get_station_by_ocpp_charge_point_id — свідомі
+    винятки з правила operator_id (водій і станція не автентифіковані).
+    Обидва мусять повертати operator_id, щоб подальші виклики знову були
+    тенант-скоупнуті, і шукати РІВНО за своїм секретом.
+    """
+    await repo.get_station_by_qr_slug("abc123")
+    query, args = _single_call(fake_conn)
+    assert "WHERE qr_slug = $1" in query
+    assert "operator_id" in query  # присутній у списку полів, що повертаються
+    assert args == ("abc123",)
+
+    fake_conn.calls.clear()
+    await repo.get_station_by_ocpp_charge_point_id("CP-001")
+    query, args = _single_call(fake_conn)
+    assert "WHERE ocpp_charge_point_id = $1" in query
+    assert "operator_id" in query
+    assert args == ("CP-001",)
+
+
+# ---------------------------------------------------------------------------
+# 5. Журнал розрахунків
+# ---------------------------------------------------------------------------
+
+async def test_record_session_income_writes_income_and_commission_in_one_transaction(fake_conn):
+    """
+    Дохід і комісія пишуться двома рядками через ОДНЕ з'єднання (тобто в
+    одній транзакції) — дохід не може існувати без комісії. Комісія завжди
+    від'ємна: журнал знаковий, як kw_transactions.
+    """
+    await repo.record_session_income(OPERATOR_A, session_id=77, amount_uah=300.0,
+                                     commission_pct=4)
+
+    assert len(fake_conn.calls) == 2, "Обидва записи мають іти через один conn"
+
+    (_q1, income_args), (_q2, commission_args) = fake_conn.calls
+    # args: (operator_id, session_id, type, amount_uah, description)
+    assert income_args[0] == OPERATOR_A and commission_args[0] == OPERATOR_A
+    assert income_args[2] == "session_income"
+    assert income_args[3] == 300.0
+    assert commission_args[2] == "platform_commission"
+    assert commission_args[3] == -12.0  # 4% від 300 грн, від'ємним числом
+
+
+async def test_ledger_entry_accepts_caller_transaction():
+    """
+    add_ledger_entry(conn=...) пише в транзакції викликача, не відкриваючи
+    власного з'єднання — та сама механіка, що в update_user_balance().
+    Пул тут навмисно не підмінений: якби функція полізла по нього, тест би впав.
+    """
+    conn = FakeConnection(fetchval_result=42)
+    entry_id = await repo.add_ledger_entry(
+        OPERATOR_A, "payout", -500.0, description="Виплата на рахунок", conn=conn,
+    )
+    assert entry_id == 42
+    query, args = _single_call(conn)
+    assert "INSERT INTO operator_payout_ledger" in query
+    assert args[0] == OPERATOR_A
+
+
+async def test_balance_is_summed_from_the_ledger_not_a_cached_column(fake_conn):
+    """Балансу як колонки не існує — лише SUM журналу по одному оператору."""
+    await repo.get_operator_balance(OPERATOR_A)
+    query, args = _single_call(fake_conn)
+    assert "SUM(amount_uah)" in query
+    assert "FROM operator_payout_ledger" in query
+    assert "operator_id = $1" in query
+    assert args == (OPERATOR_A,)
+
+
+# ---------------------------------------------------------------------------
+# 6. Alembic-міграція і idempotent-бутстрап не розходяться
+# ---------------------------------------------------------------------------
+
+_ROOT = Path(__file__).parent
+_MIGRATION = _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py"
+_REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
+
+_TABLE_RE = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\s*\);", re.DOTALL)
+_INDEX_RE = re.compile(r"CREATE INDEX IF NOT EXISTS (\w+) ON ([\w(), ]+?);")
+_NOT_A_COLUMN = {"unique", "foreign", "primary", "check", "constraint", "references"}
+
+
+def _declared_columns(source: str):
+    """{таблиця: {колонки}} з усіх CREATE TABLE у файлі."""
+    tables = {}
+    for table, body in _TABLE_RE.findall(source):
+        columns = set()
+        for line in body.splitlines():
+            first = line.strip().split(" ")[0].strip(",")
+            if not re.fullmatch(r"[a-z_][a-z0-9_]*", first):
+                continue
+            if first in _NOT_A_COLUMN:
+                continue
+            columns.add(first)
+        tables[table] = columns
+    return tables
+
+
+def test_migration_and_idempotent_bootstrap_declare_same_columns():
+    """
+    Конвенція проєкту: схема живе у двох місцях (Alembic + idempotent-блок),
+    і вони мають збігатися. Саме їх розходження — причина бага з 'refund'
+    (PROJECT_CONTEXT.md, п.8): рядок був у бутстрапі, але не в міграції, тож
+    на проді значення насправді не існувало. Цей тест ловить такий розхід
+    одразу, а не через місяць на живій базі.
+    """
+    migration_tables = _declared_columns(_MIGRATION.read_text(encoding="utf-8"))
+    repo_tables = _declared_columns(_REPO_FILE.read_text(encoding="utf-8"))
+
+    expected = {"operators", "operator_stations", "operator_sessions", "operator_payout_ledger"}
+    assert set(migration_tables) == expected
+    assert set(repo_tables) == expected
+
+    for table in expected:
+        assert migration_tables[table] == repo_tables[table], (
+            f"Схема таблиці {table} розійшлася між міграцією 0010 і "
+            f"init_operator_tables(). Лише в міграції: "
+            f"{migration_tables[table] - repo_tables[table]}; лише в бутстрапі: "
+            f"{repo_tables[table] - migration_tables[table]}"
+        )
+
+
+def test_migration_and_idempotent_bootstrap_declare_same_indexes():
+    migration_indexes = set(_INDEX_RE.findall(_MIGRATION.read_text(encoding="utf-8")))
+    repo_indexes = set(_INDEX_RE.findall(_REPO_FILE.read_text(encoding="utf-8")))
+    assert migration_indexes == repo_indexes
+
+
+def test_every_tenant_table_carries_operator_id():
+    """Правило «кожна таблиця з operator_id» — перевіряємо саме на схемі."""
+    tables = _declared_columns(_MIGRATION.read_text(encoding="utf-8"))
+    for table in ("operator_stations", "operator_sessions", "operator_payout_ledger"):
+        assert "operator_id" in tables[table], f"{table} без operator_id"
+    # у самій таблиці операторів роль operator_id грає її ж первинний ключ
+    assert "id" in tables["operators"]
+
+
+def test_sessions_are_bound_to_stations_by_composite_foreign_key():
+    """
+    Композитний FK (station_id, operator_id) → operator_stations(id, operator_id)
+    робить крос-тенантну сесію неможливою на рівні БД, а не лише в коді.
+    Він працює лише за наявності UNIQUE (id, operator_id) на станціях —
+    перевіряємо обидві половини разом, бо поодинці вони безглузді.
+    """
+    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+        normalized = " ".join(source.split())
+        assert "UNIQUE (id, operator_id)" in normalized
+        assert (
+            "FOREIGN KEY (station_id, operator_id) REFERENCES operator_stations (id, operator_id)"
+            in normalized
+        )

@@ -23,6 +23,7 @@ from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
 from app.api.payments import payments_router
 from app.database.ocpi_repo import init_ocpi_tables
+from app.database.operators_repo import init_operator_tables
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     # --- STARTUP ---
     await init_postgres()
     await init_ocpi_tables()
+    await init_operator_tables()
 
     # Кнопка "Menu" біля поля вводу в Telegram (як у конкурентних ботів) —
     # раніше bot.set_my_commands()/set_chat_menu_button() взагалі не
