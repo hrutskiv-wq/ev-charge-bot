@@ -325,12 +325,21 @@ async def test_public_lookups_are_keyed_by_their_own_secret(fake_conn):
 # 5. Журнал розрахунків
 # ---------------------------------------------------------------------------
 
-async def test_record_session_income_writes_income_and_commission_in_one_transaction(fake_conn):
+async def test_record_session_income_writes_income_and_commission_in_one_transaction(monkeypatch):
     """
     Дохід і комісія пишуться двома рядками через ОДНЕ з'єднання (тобто в
     одній транзакції) — дохід не може існувати без комісії. Комісія завжди
     від'ємна: журнал знаковий, як kw_transactions.
     """
+    # fetchval повертає id (не None) — тобто вставка пройшла без конфлікту
+    # і гілка «сесію вже проводили» не вмикається.
+    fake_conn = FakeConnection(fetchval_result=101)
+
+    async def _get_db_pool():
+        return FakePool(fake_conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
     await repo.record_session_income(OPERATOR_A, session_id=77, amount_uah=300.0,
                                      commission_pct=4)
 
@@ -343,6 +352,118 @@ async def test_record_session_income_writes_income_and_commission_in_one_transac
     assert income_args[3] == 300.0
     assert commission_args[2] == "platform_commission"
     assert commission_args[3] == -12.0  # 4% від 300 грн, від'ємним числом
+
+
+class FakeLedgerConnection(FakeConnection):
+    """
+    З'єднання, що імітує реальну поведінку часткового унікального індексу
+    uq_ledger_session_income: повторна вставка (session_id, type) для
+    доходу/комісії відхиляється, ON CONFLICT DO NOTHING ... RETURNING id
+    не повертає нічого (None).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._next_id = 100
+
+    async def fetchval(self, query, *args):
+        self._record(query, args)
+        assert "INSERT INTO operator_payout_ledger" in query
+        assert "ON CONFLICT DO NOTHING" in query, "Без ON CONFLICT вставка впала б з помилкою"
+        operator_id, session_id, entry_type, amount_uah, description = args
+
+        constrained = session_id is not None and entry_type in (
+            "session_income", "platform_commission",
+        )
+        if constrained and any(
+            r["session_id"] == session_id and r["type"] == entry_type for r in self.rows
+        ):
+            return None  # конфлікт унікального індексу
+
+        self._next_id += 1
+        self.rows.append({
+            "id": self._next_id, "operator_id": operator_id, "session_id": session_id,
+            "type": entry_type, "amount_uah": amount_uah, "description": description,
+        })
+        return self._next_id
+
+    async def fetch(self, query, *args):
+        self._record(query, args)
+        operator_id, session_id = args
+        return [
+            r for r in self.rows
+            if r["operator_id"] == operator_id and r["session_id"] == session_id
+            and r["type"] in ("session_income", "platform_commission")
+        ]
+
+
+async def test_record_session_income_is_idempotent_on_repeated_call(monkeypatch, caplog):
+    """
+    Повторний виклик з тим самим session_id (повторний webhook Monobank,
+    ретрай, подвійний клік) НЕ нараховує дохід удруге: у журналі лишається
+    рівно 2 рядки, а повернені id — ті самі, що з першого разу.
+
+    Це критично саме для цього журналу: він незмінний, тож зайве
+    нарахування довелось би потім гасити ручним рядком 'adjustment'.
+    """
+    conn = FakeLedgerConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    first = await repo.record_session_income(OPERATOR_A, session_id=77,
+                                             amount_uah=300.0, commission_pct=4)
+    with caplog.at_level("WARNING", logger="app.database.operators_repo"):
+        second = await repo.record_session_income(OPERATOR_A, session_id=77,
+                                                  amount_uah=300.0, commission_pct=4)
+
+    assert len(conn.rows) == 2, f"У журналі має бути рівно 2 рядки, а не {len(conn.rows)}"
+    assert first == second, f"Повторний виклик повернув інші id: {first} != {second}"
+    assert all(i is not None for i in second)
+
+    # сума журналу не зросла від повторного проведення
+    assert sum(r["amount_uah"] for r in conn.rows) == 300.0 - 12.0
+    assert "duplicate income ignored" in caplog.text
+
+
+async def test_different_sessions_are_recorded_independently(monkeypatch):
+    """Обмеження стосується однієї сесії, а не оператора: інша сесія проводиться нормально."""
+    conn = FakeLedgerConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    first = await repo.record_session_income(OPERATOR_A, session_id=77,
+                                             amount_uah=300.0, commission_pct=4)
+    second = await repo.record_session_income(OPERATOR_A, session_id=78,
+                                              amount_uah=150.0, commission_pct=4)
+
+    assert len(conn.rows) == 4
+    assert set(first).isdisjoint(set(second))
+
+
+async def test_entries_without_session_id_are_not_constrained(monkeypatch):
+    """
+    Виплати й підписки не мають session_id, тому частковий індекс їх не
+    покриває — оператору можна виплатити двічі, це нормальна операція.
+    """
+    conn = FakeLedgerConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    first = await repo.add_ledger_entry(OPERATOR_A, "payout", -500.0)
+    second = await repo.add_ledger_entry(OPERATOR_A, "payout", -500.0)
+
+    assert first is not None and second is not None and first != second
+    assert len(conn.rows) == 2
 
 
 async def test_ledger_entry_accepts_caller_transaction():
@@ -380,8 +501,15 @@ _MIGRATION = _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py"
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
 _TABLE_RE = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\s*\);", re.DOTALL)
-_INDEX_RE = re.compile(r"CREATE INDEX IF NOT EXISTS (\w+) ON ([\w(), ]+?);")
+# Ловимо і звичайні, і UNIQUE-індекси, і порівнюємо ВЕСЬ текст визначення
+# разом із WHERE — інакше часткові унікальні індекси (uq_ledger_session_income)
+# пройшли б повз звірку, а саме вони й тримають ідемпотентність.
+_INDEX_RE = re.compile(r"CREATE (?:UNIQUE )?INDEX IF NOT EXISTS .+?;")
 _NOT_A_COLUMN = {"unique", "foreign", "primary", "check", "constraint", "references"}
+
+
+def _declared_indexes(source: str):
+    return set(_INDEX_RE.findall(" ".join(source.split())))
 
 
 def _declared_columns(source: str):
@@ -425,9 +553,48 @@ def test_migration_and_idempotent_bootstrap_declare_same_columns():
 
 
 def test_migration_and_idempotent_bootstrap_declare_same_indexes():
-    migration_indexes = set(_INDEX_RE.findall(_MIGRATION.read_text(encoding="utf-8")))
-    repo_indexes = set(_INDEX_RE.findall(_REPO_FILE.read_text(encoding="utf-8")))
+    migration_indexes = _declared_indexes(_MIGRATION.read_text(encoding="utf-8"))
+    repo_indexes = _declared_indexes(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_indexes == repo_indexes
+
+
+def test_idempotency_is_guaranteed_by_partial_unique_indexes():
+    """
+    Ідемпотентність нарахувань тримається на БД, а не лише на коді: навіть
+    якщо викликач обійде record_session_income(), другий дохід по сесії не
+    запишеться. Індекси часткові — рядки без session_id ('payout',
+    'subscription_fee', 'adjustment') під обмеження не підпадають.
+    """
+    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+        indexes = _declared_indexes(source)
+        income = [i for i in indexes if "uq_ledger_session_income" in i]
+        payment = [i for i in indexes if "uq_sessions_payment" in i]
+
+        assert len(income) == 1, "Немає унікального індексу на дохід/комісію сесії"
+        assert "UNIQUE" in income[0]
+        assert "operator_payout_ledger(session_id, type)" in income[0]
+        assert "WHERE session_id IS NOT NULL" in income[0], "Індекс має бути ЧАСТКОВИМ"
+        assert "'session_income', 'platform_commission'" in income[0]
+
+        assert len(payment) == 1, "Немає унікального індексу на payment_id сесії"
+        assert "UNIQUE" in payment[0]
+        assert "operator_sessions(payment_id)" in payment[0]
+        assert "WHERE payment_id IS NOT NULL" in payment[0]
+
+
+def test_operators_has_no_redundant_unique_on_primary_key():
+    """
+    UNIQUE (id) на operators був надлишковим — PRIMARY KEY уже дає і
+    унікальність, і індекс. Прибрано за результатом рев'ю; тест фіксує, щоб
+    не повернулось копіпастом з operator_stations, де UNIQUE (id, operator_id)
+    справді потрібен (мішень композитного FK).
+    """
+    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+        operators_body = re.search(
+            r"CREATE TABLE IF NOT EXISTS operators \((.*?)\n\s*\);", source, re.DOTALL
+        ).group(1)
+        assert "UNIQUE (id)" not in operators_body
+        assert "id SERIAL PRIMARY KEY" in operators_body
 
 
 def test_every_tenant_table_carries_operator_id():

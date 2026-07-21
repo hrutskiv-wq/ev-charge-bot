@@ -55,8 +55,7 @@ def upgrade() -> None:
         commission_pct NUMERIC(5, 2) NOT NULL DEFAULT 4
             CHECK (commission_pct >= 0 AND commission_pct <= 100),
         monobank_token_encrypted TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (id)
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
     """)
 
@@ -137,6 +136,22 @@ def upgrade() -> None:
     op.execute("CREATE INDEX IF NOT EXISTS idx_operator_sessions_station ON operator_sessions(station_id);")
     op.execute("CREATE INDEX IF NOT EXISTS idx_operator_sessions_payment ON operator_sessions(payment_id);")
     op.execute("CREATE INDEX IF NOT EXISTS idx_operator_ledger_operator_created ON operator_payout_ledger(operator_id, created_at DESC);")
+
+    # 6. Ідемпотентність розрахунків — на рівні БД, а не тільки в коді.
+    #
+    # uq_ledger_session_income: одна сесія дає рівно один рядок доходу і
+    # один рядок комісії. Без цього повторний webhook Monobank, ретрай або
+    # подвійний клік оператора нарахували б дохід двічі — а журнал
+    # незмінний, тобто помилку довелось би виправляти рядком 'adjustment'
+    # вручну. Індекс частковий: рядки без session_id ('payout',
+    # 'subscription_fee', 'adjustment') під обмеження не підпадають і
+    # можуть повторюватись скільки завгодно.
+    #
+    # uq_sessions_payment: один інвойс Monobank не може бути привʼязаний до
+    # двох сесій. Це та сама гарантія, що invoice_id UNIQUE у payments, але
+    # для білінгу операторів.
+    op.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_session_income ON operator_payout_ledger(session_id, type) WHERE session_id IS NOT NULL AND type IN ('session_income', 'platform_commission');")
+    op.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_payment ON operator_sessions(payment_id) WHERE payment_id IS NOT NULL;")
 
 
 def downgrade() -> None:

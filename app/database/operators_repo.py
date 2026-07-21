@@ -58,8 +58,7 @@ async def init_operator_tables():
             commission_pct NUMERIC(5, 2) NOT NULL DEFAULT 4
                 CHECK (commission_pct >= 0 AND commission_pct <= 100),
             monobank_token_encrypted TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (id)
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
         """)
 
@@ -128,6 +127,10 @@ async def init_operator_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_sessions_station ON operator_sessions(station_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_sessions_payment ON operator_sessions(payment_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_ledger_operator_created ON operator_payout_ledger(operator_id, created_at DESC);")
+
+        # 6. Ідемпотентність розрахунків (пояснення — в міграції 0010)
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_session_income ON operator_payout_ledger(session_id, type) WHERE session_id IS NOT NULL AND type IN ('session_income', 'platform_commission');")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_payment ON operator_sessions(payment_id) WHERE payment_id IS NOT NULL;")
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
 
@@ -412,10 +415,19 @@ async def add_ledger_entry(operator_id: int, entry_type: str, amount_uah: float,
 
     Якщо передано `conn` — пишемо в транзакції викликача (та сама механіка,
     що й в update_user_balance()).
+
+    ON CONFLICT DO NOTHING разом із частковим унікальним індексом
+    uq_ledger_session_income робить повторне проведення сесії безпечним:
+    другий запис доходу/комісії по тій самій сесії не створюється, і
+    функція повертає None замість id. Викликач мусить цей None обробити —
+    див. record_session_income(). Рядків без session_id ('payout',
+    'subscription_fee', 'adjustment') обмеження не стосується взагалі,
+    тому вони, як і раніше, можуть повторюватись.
     """
     query = """
         INSERT INTO operator_payout_ledger (operator_id, session_id, type, amount_uah, description)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT DO NOTHING
         RETURNING id
     """
     if conn is not None:
@@ -428,12 +440,41 @@ async def add_ledger_entry(operator_id: int, entry_type: str, amount_uah: float,
                                        amount_uah, description)
 
 
+async def get_session_income_entries(operator_id: int, session_id: int, conn=None):
+    """
+    Уже проведені дохід і комісія по сесії: {'session_income': id,
+    'platform_commission': id}. Порожній dict, якщо сесія ще не проводилась.
+    """
+    query = """
+        SELECT type, id FROM operator_payout_ledger
+        WHERE operator_id = $1 AND session_id = $2
+          AND type IN ('session_income', 'platform_commission')
+    """
+    if conn is not None:
+        rows = await conn.fetch(query, operator_id, session_id)
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as new_conn:
+            rows = await new_conn.fetch(query, operator_id, session_id)
+    return {row["type"]: row["id"] for row in rows}
+
+
 async def record_session_income(operator_id: int, session_id: int, amount_uah: float,
                                 commission_pct: float):
     """
     Дохід оператора з оплаченої сесії та наша комісія — двома рядками журналу
     в ОДНІЙ транзакції, щоб дохід ніколи не існував без відповідної комісії.
     Повертає (income_id, commission_id).
+
+    ІДЕМПОТЕНТНО: повторний виклик з тим самим session_id (повторний webhook
+    Monobank, ретрай після таймауту, подвійне натискання оператором) НЕ
+    нараховує дохід удруге — частковий унікальний індекс
+    uq_ledger_session_income відхиляє вставку, і функція повертає id уже
+    існуючих рядків. Це важливо саме тут, бо журнал незмінний: зайве
+    нарахування довелося б потім гасити ручним рядком 'adjustment'.
+
+    Обидві вставки або проходять, або конфліктують разом — індекс покриває
+    обидва типи, а транзакція не дає зупинитись посередині.
     """
     commission = round(amount_uah * commission_pct / 100, 2)
     pool = await get_db_pool()
@@ -448,7 +489,19 @@ async def record_session_income(operator_id: int, session_id: int, amount_uah: f
                 description=f"Комісія платформи {commission_pct}% з сесії #{session_id}",
                 conn=conn,
             )
-            return income_id, commission_id
+
+            if income_id is not None and commission_id is not None:
+                return income_id, commission_id
+
+            # Конфлікт унікального індексу — сесію вже проводили раніше.
+            existing = await get_session_income_entries(operator_id, session_id, conn=conn)
+            logger.warning(
+                "duplicate income ignored: сесія #%s оператора %s уже проведена "
+                "(дохід=%s, комісія=%s) — повторне нарахування пропущено",
+                session_id, operator_id,
+                existing.get("session_income"), existing.get("platform_commission"),
+            )
+            return existing.get("session_income"), existing.get("platform_commission")
 
 
 async def get_operator_balance(operator_id: int):

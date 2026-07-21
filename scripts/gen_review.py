@@ -50,7 +50,8 @@ PROMPTS = {
             (
                 "test_operator_isolation.py",
                 "НОВИЙ",
-                "50 тестів ізоляції тенантів на фейкових з'єднаннях, без живої БД.",
+                "55 тестів ізоляції тенантів та ідемпотентності нарахувань "
+                "на фейкових з'єднаннях, без живої БД.",
             ),
             (
                 "app/main.py",
@@ -83,6 +84,22 @@ PROMPTS = {
 3. **Композитний FK** `(station_id, operator_id) -> operator_stations(id,
    operator_id)` — те саме обмеження вже на рівні БД.
 
+## Ідемпотентність нарахувань (за результатом рев'ю)
+
+Повторний webhook Monobank, ретрай після таймауту чи подвійне натискання
+оператором не мають нарахувати дохід двічі — журнал незмінний, тож зайве
+нарахування довелося б гасити ручним рядком `adjustment`.
+
+- Частковий унікальний індекс `uq_ledger_session_income` на
+  `(session_id, type)` — одна сесія дає рівно один дохід і одну комісію.
+  Рядки без `session_id` (`payout`, `subscription_fee`, `adjustment`) під
+  обмеження не підпадають.
+- `uq_sessions_payment` — один інвойс Monobank не може бути привʼязаний до
+  двох сесій.
+- `add_ledger_entry()` пише з `ON CONFLICT DO NOTHING`;
+  `record_session_income()` при конфлікті повертає id уже існуючих рядків
+  і логує `duplicate income ignored`.
+
 ## Місця, що потребують ручного рев'ю
 
 - **`record_session_income()`** — дохід і комісія двома рядками в одній
@@ -98,8 +115,8 @@ PROMPTS = {
 ## Прогін тестів
 
 ```
-pytest test_operator_isolation.py -q                  -> 50 passed
-pytest -q (з плейсхолдерами CI env)                   -> 103 passed
+pytest test_operator_isolation.py -q                  -> 55 passed
+pytest -q (з плейсхолдерами CI env)                   -> 108 passed
 ```
 
 Локально прогін був на Python 3.14 (єдиний у системі); цільова версія
