@@ -18,11 +18,23 @@ from app.keyboards.reply import (
 )
 
 import app.database.connection as db_conn
-from app.database.connection import ( 
+from app.database.connection import (
     get_user_data, uah_to_kwh, kwh_to_uah,
     get_station_by_id, set_user_discount
 )
+from app.database import operators_repo as op_repo
 from app.services.ocm_service import find_three_nearest_stations
+from app.services.station_speed import classify_station_speed
+
+# Публічний URL сервісу для посилання на оплату QR (та сама логіка, що й
+# app/api/driver_qr.py та app/handlers/operator_billing.py).
+PUBLIC_BASE_URL = (
+    os.getenv("PUBLIC_BASE_URL") or os.getenv("EMSP_BASE_URL") or "https://evolt.ua"
+).rstrip("/")
+
+# Радіус пошуку станцій White-Label операторів навколо водія (Промпт 4c).
+# OCM обмежений через свій API-параметр distance, тут — свій радіус.
+OPERATOR_SEARCH_RADIUS_KM = 30
 
 router = Router()
 
@@ -112,29 +124,93 @@ async def manual_id_entry(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_station_id)
     await message.answer("Введіть ID зарядної станції (наприклад: `OCM-307584`):")
 
+def _merge_search_results(ocm_stations, operator_stations):
+    """
+    Обʼєднує видачу OCM і White-Label операторських станцій (Промпт 4c) в
+    один список, відсортований за відстанню. Чиста функція — без Telegram і
+    без БД, щоб «змішана видача OCM+оператор» тестувалась без моків бота.
+
+    Кожен елемент: {"source": "ocm"|"operator", "distance_km": float, "station": <dict>}.
+    OCM без відстані (малоймовірно, але API цього формально не гарантує)
+    відсувається в кінець, а не ламає сортування.
+    """
+    items = []
+    for st in ocm_stations or []:
+        distance = st.get("distance")
+        items.append({
+            "source": "ocm",
+            "distance_km": float(distance) if distance is not None else float("inf"),
+            "station": st,
+        })
+    for st in operator_stations or []:
+        items.append({"source": "operator", "distance_km": float(st["distance_km"]), "station": st})
+    items.sort(key=lambda item: item["distance_km"])
+    return items
+
+
+def _format_operator_station_card(idx: int, station: dict) -> str:
+    """Картка станції оператора: бейдж, відстань, потужність/конектор, тариф і QR-посилання на оплату."""
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    lines = [
+        f"{prefix}<b>Станція #{idx}: {station['name']}</b>",
+        f"📍 Відстань: <b>{station['distance_km']:.2f} км</b>",
+    ]
+    if station.get("power_kw"):
+        lines.append(f"⚙️ Потужність: {station['power_kw']} кВт")
+    if station.get("connector_type"):
+        lines.append(f"🔌 Конектор: {station['connector_type']}")
+    lines.append(f"💰 Тариф: {station['tariff_uah_kwh']} грн/кВт·год")
+    lines.append("💳 Оплата через QR:")
+    lines.append(f"{PUBLIC_BASE_URL}/s/{station['qr_slug']}")
+    return "\n".join(lines)
+
+
+def _format_ocm_station_card(idx: int, station: dict) -> str:
+    """Картка станції OCM — той самий формат, що й раніше, плюс бейдж швидкості спереду."""
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    return (
+        f"{prefix}⚡ **Станція #{idx}**\n"
+        f"• **Оператор мережі:** ` {station['operator']} `\n"
+        f"• **Назва:** {station['name']}\n"
+        f"• **Адреса:** {station['address']}\n"
+        f"• **Відстань:** **{station['distance']:.2f} км**\n"
+        f"• **Роз'єми:** {station['connectors']}\n"
+        f"👉 Запуск (надішліть ID): `{station['id']}`"
+    )
+
+
 @router.message(F.location, StateFilter("*"))
 async def handle_location(message: types.Message, state: FSMContext):
-    await message.answer("🔍 **Шукаємо 3 найближчих об'єкти в Open Charge Map...**")
-    stations = await find_three_nearest_stations(message.location.latitude, message.location.longitude)
-    
-    if stations:
+    await message.answer("🔍 **Шукаємо станції поруч...**")
+    lat, lon = message.location.latitude, message.location.longitude
+
+    ocm_stations = await find_three_nearest_stations(lat, lon) or []
+    operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
+    combined = _merge_search_results(ocm_stations, operator_stations)
+
+    if not combined:
+        await message.answer("❌ Станцій поблизу не знайдено.")
+        return
+
+    # Ручний запуск за ID (наступний крок FSM) працює лише для OCM-станцій —
+    # операторську станцію водій оплачує через QR/посилання, а не введенням ID.
+    if any(item["source"] == "ocm" for item in combined):
         await state.set_state(BotStates.waiting_for_station_id)
-        await message.answer("🎯 **Знайдено 3 найближчих реальних комплекси:**")
-        
-        for idx, st in enumerate(stations, 1):
-            station_text = (
-                f"⚡ **Станція #{idx}**\n"
-                f"• **Оператор мережі:** ` {st['operator']} `\n"
-                f"• **Назва:** {st['name']}\n"
-                f"• **Адреса:** {st['address']}\n"
-                f"• **Відстань:** **{st['distance']:.2f} км**\n"
-                f"• **Роз'єми:** {st['connectors']}\n"
-                f"👉 Запуск (надішліть ID): `{st['id']}`"
+
+    await message.answer(f"🎯 **Знайдено {len(combined)} станцій поруч:**")
+
+    for idx, item in enumerate(combined, 1):
+        station = item["station"]
+        if item["source"] == "operator":
+            await message.answer(_format_operator_station_card(idx, station), parse_mode="HTML")
+        else:
+            await message.answer(
+                _format_ocm_station_card(idx, station), parse_mode="Markdown",
+                reply_markup=get_single_station_keyboard(station["lat"], station["lon"]),
             )
-            await message.answer(station_text, parse_mode="Markdown", reply_markup=get_single_station_keyboard(st['lat'], st['lon']))
-            await asyncio.sleep(0.2)
-    else:
-        await message.answer("❌ Станцій поблизу не знайдено в базі даних Open Charge Map.")
+        await asyncio.sleep(0.2)
 
 @router.message(StateFilter(BotStates.waiting_for_station_id))
 async def process_station_id(message: types.Message, state: FSMContext):
