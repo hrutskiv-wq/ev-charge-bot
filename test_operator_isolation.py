@@ -15,6 +15,7 @@ operator_* містить у WHERE `operator_id` і отримує його па
 Запуск: pytest test_operator_isolation.py -v
 """
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -424,9 +425,67 @@ async def test_record_session_income_is_idempotent_on_repeated_call(monkeypatch,
     assert first == second, f"Повторний виклик повернув інші id: {first} != {second}"
     assert all(i is not None for i in second)
 
-    # сума журналу не зросла від повторного проведення
-    assert sum(r["amount_uah"] for r in conn.rows) == 300.0 - 12.0
+    # сума журналу не зросла від повторного проведення.
+    # Рахуємо через Decimal: дохід приходить як float від викликача, комісія
+    # вже Decimal — складати їх напряму не можна (TypeError).
+    total = sum(Decimal(str(r["amount_uah"])) for r in conn.rows)
+    assert total == Decimal("288.00")  # 300.00 доходу мінус 12.00 комісії
     assert "duplicate income ignored" in caplog.text
+
+
+@pytest.mark.parametrize("amount_uah,commission_pct,expected", [
+    # межовий випадок: рівно половина копійки, має лишитись як є
+    (250, 4.5, "11.25"),
+    # типовий «некруглий» чек: 13.3332 -> 13.33
+    (333.33, 4, "13.33"),
+    # РЕГРЕСІЯ: саме тут старий round() давав 5.62 замість 5.63 —
+    # банківське округлення до парного зрізало копійку не на нашу користь
+    (112.5, 5, "5.63"),
+    (300, 4, "12.00"),
+])
+async def test_commission_is_rounded_half_up_in_decimal(amount_uah, commission_pct,
+                                                        expected, monkeypatch):
+    """
+    Комісія рахується в Decimal з ROUND_HALF_UP, а не round() по float.
+    Перевіряємо саме записане в журнал значення, а не проміжний результат.
+    """
+    conn = FakeLedgerConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.record_session_income(OPERATOR_A, session_id=77,
+                                     amount_uah=amount_uah, commission_pct=commission_pct)
+
+    commission_row = next(r for r in conn.rows if r["type"] == "platform_commission")
+    written = commission_row["amount_uah"]
+
+    assert isinstance(written, Decimal), (
+        f"У журнал має йти Decimal, а не {type(written).__name__} — "
+        "інакше двійкова похибка float потрапляє в гроші"
+    )
+    # порівнюємо рядком: Decimal('11.25') == Decimal('11.250'), але нам
+    # важливо, що значення заквантоване рівно до копійок
+    assert str(-written) == expected
+    assert -written == Decimal(expected)
+
+
+async def test_commission_sign_and_scale_are_stable(monkeypatch):
+    """Комісія завжди від'ємна і завжди рівно з двома знаками після коми."""
+    conn = FakeLedgerConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.record_session_income(OPERATOR_A, session_id=77, amount_uah=100,
+                                     commission_pct=3)
+    commission_row = next(r for r in conn.rows if r["type"] == "platform_commission")
+    assert commission_row["amount_uah"] < 0
+    assert commission_row["amount_uah"].as_tuple().exponent == -2
 
 
 async def test_different_sessions_are_recorded_independently(monkeypatch):
