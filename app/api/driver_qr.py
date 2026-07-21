@@ -144,11 +144,26 @@ async def start_session(qr_slug: str, request: Request,
     if station["status"] != "active":
         return error_page("Станція зараз недоступна для оплати.")
 
+    operator_id = station["operator_id"]
+
+    # Статус самого оператора, не лише станції. Оператор на паузі
+    # ('suspended' — наприклад, за несплату підписки) або ще не завершений
+    # онбординг ('pending') не має приймати гроші водіїв: інакше ми зберемо
+    # оплати, за які ніхто не відповідає. Водію показуємо той самий текст,
+    # що й для недоступної станції — його це не стосується, а зайві деталі
+    # про стан чужого бізнесу йому ні до чого.
+    operator = await repo.get_operator(operator_id)
+    if operator is None or operator["status"] != "active":
+        logger.warning(
+            "Станція %s: спроба оплати при статусі оператора %s = %s",
+            station["id"], operator_id,
+            operator["status"] if operator else "оператора не існує",
+        )
+        return error_page("Станція зараз недоступна для оплати.")
+
     amount, amount_error = _parse_amount(amount_uah, custom_amount)
     if amount_error:
         return error_page(amount_error)
-
-    operator_id = station["operator_id"]
 
     # Токен еквайрингу оператора. Без нього платити нікуди — і це помилка
     # налаштування оператора, а не водія, тому текст нейтральний.
@@ -189,6 +204,24 @@ async def start_session(qr_slug: str, request: Request,
         await repo.set_session_status(operator_id, session_id, "failed")
         return error_page("Банк тимчасово недоступний. Спробуйте за хвилину.")
 
+    # ВІДОМЕ ВІКНО (свідомий компроміс MVP, не баг): між успішним створенням
+    # інвойсу в банку і цим записом процес може впасти. Тоді водій уже бачить
+    # сторінку оплати Monobank і може заплатити, а в нас немає рядка в
+    # operator_payments — webhook про таку оплату прийде і буде тихо
+    # відкинутий як «інвойс невідомий» (див. app/api/operator_webhook.py).
+    #
+    # Що рятує:
+    #   * сесія вже створена й лишається в 'pending' — тобто слід у системі є,
+    #     втратити оплату «безслідно» неможливо;
+    #   * reference інвойсу — `session-{session_id}`, тож у виписці Monobank
+    #     платіж однозначно звʼязується з нашою сесією і відновлюється руками;
+    #   * системно такі випадки добере звірка `reconcile --operators`
+    #     (Промпт 5): оплачений інвойс банку без відповідного
+    #     operator_payments — саме той клас розбіжності, який вона шукає.
+    #
+    # Закрити вікно повністю можна лише двофазним записом (спершу
+    # payment у 'pending' з нашим id, потім інвойс із цим id у reference) —
+    # робити це варто разом зі звіркою, коли стане видно реальну частоту.
     payment_id = await repo.create_operator_payment(
         operator_id, invoice["invoiceId"], amount,
     )

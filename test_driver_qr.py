@@ -62,6 +62,8 @@ class FakeState:
         self.next_session_id = 77
         self.invoice_error = None
         self.created_invoices = []
+        self.operators = {OPERATOR_A: {"id": OPERATOR_A, "telegram_id": 501,
+                                       "status": "active", "commission_pct": 4}}
 
 
 @pytest.fixture
@@ -76,6 +78,9 @@ def state(monkeypatch, encryption_key):
 
     async def get_operator_monobank_token_encrypted(operator_id):
         return st.tokens.get(operator_id)
+
+    async def get_operator(operator_id):
+        return st.operators.get(operator_id)
 
     async def create_session(operator_id, station_id, amount_uah=None,
                              payment_id=None, driver_contact=None):
@@ -123,6 +128,7 @@ def state(monkeypatch, encryption_key):
     for name, func in [
         ("get_station_by_qr_slug", get_station_by_qr_slug),
         ("get_operator_monobank_token_encrypted", get_operator_monobank_token_encrypted),
+        ("get_operator", get_operator),
         ("create_session", create_session),
         ("create_operator_payment", create_operator_payment),
         ("attach_payment_to_session", attach_payment_to_session),
@@ -507,3 +513,45 @@ async def test_malformed_callback_data_is_rejected(data, confirm_state):
     callback = FakeCallback(data, 555)
     await operator_billing.confirm_station_switched_on(callback)
     assert confirm_state.sessions[77]["status"] == "paid"
+
+
+@pytest.mark.parametrize("operator_status", ["suspended", "pending"])
+def test_inactive_operator_cannot_accept_payments(operator_status, state, client):
+    """
+    Оператор на паузі (несплачена підписка) або з незавершеним онбордингом
+    не має приймати гроші водіїв — інакше ми зберемо оплати, за які ніхто
+    не відповідає. Станція при цьому може бути цілком 'active'.
+    """
+    state.operators[OPERATOR_A]["status"] = operator_status
+
+    response = client.post(f"/s/{SLUG}/start", data={"amount_uah": "200"})
+
+    assert response.status_code == 400
+    assert "Станція зараз недоступна для оплати" in response.text
+    assert state.created_invoices == [], "Банк викликали для неактивного оператора"
+    assert state.sessions == {}, "Сесію створено для неактивного оператора"
+
+
+def test_missing_operator_record_blocks_payment(state, client):
+    """Станція є, а оператора немає — теж не приймаємо оплату."""
+    state.operators.clear()
+
+    response = client.post(f"/s/{SLUG}/start", data={"amount_uah": "200"})
+
+    assert response.status_code == 400
+    assert state.created_invoices == []
+    assert state.sessions == {}
+
+
+def test_operator_status_is_checked_before_touching_the_bank(state, client):
+    """
+    Перевірка статусу оператора має стояти ДО валідації суми й створення
+    сесії: інакше на кожну спробу оплати неактивному оператору ми б плодили
+    сміттєві 'pending'-сесії.
+    """
+    state.operators[OPERATOR_A]["status"] = "suspended"
+
+    client.post(f"/s/{SLUG}/start", data={"custom_amount": "не-число"})
+
+    assert state.sessions == {}
+    assert state.created_invoices == []

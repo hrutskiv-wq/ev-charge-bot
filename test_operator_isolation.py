@@ -531,6 +531,30 @@ async def test_entries_without_session_id_are_not_constrained(monkeypatch):
     assert len(conn.rows) == 2
 
 
+async def test_payment_status_update_touches_updated_at(fake_conn):
+    """
+    updated_at має рухатись при кожній зміні статусу — без цього неможливо
+    відповісти «коли саме цей платіж став success», а це перше питання
+    будь-якого розбору розбіжності зі звіркою.
+    """
+    await repo.set_operator_payment_status(OPERATOR_A, 5, "success")
+    query, _args = _single_call(fake_conn)
+
+    assert "UPDATE operator_payments" in query
+    assert "updated_at = CURRENT_TIMESTAMP" in query
+
+
+async def test_payment_status_update_is_idempotent_by_status_guard(fake_conn):
+    """
+    `status <> $3` — це мʼютекс, на якому тримається захист від подвійного
+    нарахування у webhook: повторний виклик з тим самим статусом не змінює
+    рядок, викликач отримує False і не проводить дохід удруге.
+    """
+    await repo.set_operator_payment_status(OPERATOR_A, 5, "success")
+    query, _args = _single_call(fake_conn)
+    assert "status <> $3" in query
+
+
 async def test_ledger_entry_accepts_caller_transaction():
     """
     add_ledger_entry(conn=...) пише в транзакції викликача, не відкриваючи
