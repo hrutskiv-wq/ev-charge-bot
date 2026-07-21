@@ -73,26 +73,39 @@ async def find_three_nearest_stations(user_lat, user_lon):
                     
                 connections = poi.get("Connections", [])
                 conn_list = []
+                # Найпотужніший конектор станції — окремо від тексту
+                # connectors_text (лишається як є для сумісності), потрібен
+                # для classify_station_speed() у бейджі швидкості (Промпт 4c):
+                # OCM може віддати кілька конекторів з різною потужністю,
+                # тому беремо найшвидший, а не перший-ліпший.
+                best_power_kw = None
+                best_connector_type = None
                 for c in connections:
                     conn_type = c.get("ConnectionType", {})
                     title = conn_type.get("Title", "Невідомий роз'єм")
                     title = title.replace(" (Socket Only)", "").replace(" (Tethered Cable)", "")
                     power = c.get("PowerKW")
                     quantity = c.get("Quantity")
-                    
+
                     info_str = title
-                    if power: 
+                    if power:
                         info_str += f" ({power} кВт)"
-                    if quantity and int(quantity) > 1: 
+                    if quantity and int(quantity) > 1:
                         info_str += f" x{quantity}"
-                    if info_str not in conn_list: 
+                    if info_str not in conn_list:
                         conn_list.append(info_str)
-                
+
+                    if power and (best_power_kw is None or power > best_power_kw):
+                        best_power_kw = power
+                        best_connector_type = title
+                    elif best_connector_type is None:
+                        best_connector_type = title
+
                 connectors_text = "; ".join(conn_list) if conn_list else "Інформація відсутня"
-                
+
                 # --- ВИПРАВЛЕНО: тепер передаємо всі 7 аргументів, включно з operator_name ---
                 await save_station_to_local_db(station_id, name, address, connectors_text, st_lat, st_lon, operator_name)
-                
+
                 stations_list.append({
                     "id": station_id,
                     "name": name,
@@ -101,7 +114,9 @@ async def find_three_nearest_stations(user_lat, user_lon):
                     "operator": operator_name,
                     "connectors": connectors_text.replace("; ", ", "),
                     "lat": st_lat,
-                    "lon": st_lon
+                    "lon": st_lon,
+                    "power_kw": best_power_kw,
+                    "connector_type": best_connector_type,
                 })
             
             return stations_list

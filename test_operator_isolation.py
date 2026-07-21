@@ -332,6 +332,78 @@ async def test_public_lookups_are_keyed_by_their_own_secret(fake_conn):
     assert args == ("CP-001",)
 
 
+async def test_list_public_stations_near_is_a_public_exception_filtered_by_geography(fake_conn):
+    """
+    Третій свідомий виняток з правила ізоляції (Промпт 4c): публічний пошук
+    станцій для водія. Не operator_id, а активність станції/оператора й
+    наявність координат — фільтри в SQL; кожен рядок так само несе
+    operator_id, щоб подальший перехід на /s/{qr_slug} лишався тенант-
+    скоупнутим.
+    """
+    await repo.list_public_stations_near(49.84, 24.03, radius_km=25)
+    query, args = _single_call(fake_conn)
+
+    assert "operator_id" in query
+    assert "JOIN operators" in query
+    assert "s.status = 'active'" in query
+    assert "o.status = 'active'" in query
+    assert "s.lat IS NOT NULL" in query and "s.lng IS NOT NULL" in query
+    assert args == (), "Функція не приймає operator_id — фільтр географічний, не тенантний"
+
+
+async def test_list_public_stations_near_filters_by_radius_and_sorts_by_distance(monkeypatch):
+    rows = [
+        {"id": 1, "operator_id": 10, "name": "Близька", "address": None,
+         "lat": Decimal("49.8400"), "lng": Decimal("24.0300"), "connector_type": "Type 2",
+         "power_kw": Decimal("22"), "mode": "manual", "ocpp_charge_point_id": None,
+         "tariff_uah_kwh": Decimal("12.50"), "tariff_uah_start": None,
+         "qr_slug": "s1", "status": "active", "created_at": None},
+        {"id": 2, "operator_id": 11, "name": "Київ (далеко)", "address": None,
+         "lat": Decimal("50.4501"), "lng": Decimal("30.5234"), "connector_type": "CCS",
+         "power_kw": Decimal("60"), "mode": "manual", "ocpp_charge_point_id": None,
+         "tariff_uah_kwh": Decimal("15.00"), "tariff_uah_start": None,
+         "qr_slug": "s2", "status": "active", "created_at": None},
+        {"id": 3, "operator_id": 10, "name": "Середня", "address": None,
+         "lat": Decimal("49.9035"), "lng": Decimal("24.1097"), "connector_type": "Schuko",
+         "power_kw": None, "mode": "manual", "ocpp_charge_point_id": None,
+         "tariff_uah_kwh": Decimal("8.00"), "tariff_uah_start": None,
+         "qr_slug": "s3", "status": "active", "created_at": None},
+    ]
+    conn = FakeConnection(fetch_result=rows)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    # Пошук від Львова, радіус 20 км — рядок з Києва (id=2) не влазить.
+    result = await repo.list_public_stations_near(49.8397, 24.0297, radius_km=20)
+
+    assert [r["id"] for r in result] == [1, 3]
+    assert result[0]["distance_km"] < result[1]["distance_km"]
+    assert all("operator_id" in r for r in result)
+    assert all("distance_km" in r for r in result)
+
+
+async def test_list_public_stations_near_returns_empty_when_nothing_in_radius(monkeypatch):
+    rows = [
+        {"id": 1, "operator_id": 10, "name": "Дуже далеко", "address": None,
+         "lat": Decimal("50.4501"), "lng": Decimal("30.5234"), "connector_type": None,
+         "power_kw": None, "mode": "manual", "ocpp_charge_point_id": None,
+         "tariff_uah_kwh": Decimal("10.00"), "tariff_uah_start": None,
+         "qr_slug": "s1", "status": "active", "created_at": None},
+    ]
+    conn = FakeConnection(fetch_result=rows)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    result = await repo.list_public_stations_near(49.8397, 24.0297, radius_km=5)
+    assert result == []
+
+
 # ---------------------------------------------------------------------------
 # 5. Журнал розрахунків
 # ---------------------------------------------------------------------------

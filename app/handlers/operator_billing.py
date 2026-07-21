@@ -35,6 +35,7 @@ callback_data (opm:/opst:/oprev:/opcsv:) свідомо НЕ несуть operat
 формат callback_data навмисно не вважається секретом.
 """
 import csv
+import html
 import io
 import logging
 import os
@@ -50,8 +51,9 @@ from app.core.crypto import encrypt_secret
 from app.core.loader import bot
 from app.database import operators_repo as repo
 from app.keyboards.operator import (
-    get_admin_activation_keyboard, get_cabinet_menu, get_revenue_csv_keyboard,
-    get_revenue_period_keyboard, get_station_detail_keyboard, get_station_list_keyboard,
+    get_admin_activation_keyboard, get_cabinet_menu, get_connector_presets_keyboard,
+    get_revenue_csv_keyboard, get_revenue_period_keyboard, get_station_detail_keyboard,
+    get_station_list_keyboard,
 )
 from app.services.operator_notify import CONFIRM_PREFIX
 from app.services.qr_image import generate_station_qr_png
@@ -110,7 +112,10 @@ async def _send_cabinet_home(target, operator, edit: bool = False):
     """target — Message (нове повідомлення) або Message з callback (редагування)."""
     has_token = bool(await repo.get_operator_monobank_token_encrypted(operator["id"]))
     note = _OPERATOR_STATUS_NOTES.get(operator["status"])
-    text = f"🏷️ <b>Кабінет оператора «{operator['name']}»</b>"
+    # Назва оператора — вільний текст із онбордингу (onboarding_name), тому
+    # html.escape() тут обов'язковий: без нього назва з '<'/'&' ламає
+    # парсинг HTML, і кабінет узагалі не відкриється.
+    text = f"🏷️ <b>Кабінет оператора «{html.escape(operator['name'])}»</b>"
     if note:
         text += f"\n{note}"
     kb = get_cabinet_menu(has_token)
@@ -149,13 +154,18 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
     chat_id = os.getenv("LOGS_CHAT_ID")
     if not chat_id:
         return
+    # name/phone — вільний текст із онбордингу, username теоретично теж
+    # контрольований користувачем. Без html.escape() тут найгірший з усіх
+    # випадків: непарсибельний HTML -> bot.send_message падає з винятком ->
+    # заявка оператора "губиться" (адмін ніколи не дізнається про неї, хоча
+    # рядок в operators уже записано).
     username = f"@{from_user.username}" if from_user.username else str(from_user.id)
     text = (
         "🆕 <b>Новий оператор на модерації</b>\n"
         f"ID: <code>{operator_id}</code>\n"
-        f"Назва: {name}\n"
-        f"Телефон: {phone}\n"
-        f"Telegram: {username} (id {from_user.id})\n\n"
+        f"Назва: {html.escape(name)}\n"
+        f"Телефон: {html.escape(phone)}\n"
+        f"Telegram: {html.escape(username)} (id {from_user.id})\n\n"
         "Активуйте кнопкою нижче, або вручну: "
         f"set_operator_status({operator_id}, 'active')"
     )
@@ -391,13 +401,87 @@ async def station_wizard_name(message: Message, state: FSMContext):
 @router.message(StateFilter(StationWizard.waiting_for_address), _is_free_text)
 async def station_wizard_address(message: Message, state: FSMContext):
     await state.update_data(address=_parse_skip(message.text))
+    await state.set_state(StationWizard.waiting_for_location)
+    await message.answer(
+        "Розташування станції: надішліть геопозицію 📍, координати текстом "
+        "«lat, lng» (наприклад 49.8397, 24.0297), або «-», щоб пропустити "
+        "(без координат станція НЕ зʼявиться в пошуку найближчих для водіїв):"
+    )
+
+
+def _parse_coordinates(text: str):
+    """'lat, lng' -> (float, float) або None, якщо формат/діапазон невалідні."""
+    parts = text.split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        lat = float(parts[0].strip())
+        lng = float(parts[1].strip())
+    except ValueError:
+        return None
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return None
+    return lat, lng
+
+
+async def _prompt_connector_step(message: Message, state: FSMContext):
     await state.set_state(StationWizard.waiting_for_connector)
-    await message.answer("Тип конектора, наприклад Type 2 / CCS / GBT / Schuko (або «-»):")
+    await message.answer("Тип конектора:", reply_markup=get_connector_presets_keyboard())
+
+
+@router.message(StateFilter(StationWizard.waiting_for_location), F.location)
+async def station_wizard_location_shared(message: Message, state: FSMContext):
+    await state.update_data(lat=message.location.latitude, lng=message.location.longitude)
+    await _prompt_connector_step(message, state)
+
+
+@router.message(StateFilter(StationWizard.waiting_for_location), _is_free_text)
+async def station_wizard_location_text(message: Message, state: FSMContext):
+    raw = _parse_skip(message.text)
+    if raw is None:
+        await state.update_data(lat=None, lng=None)
+        await message.answer(
+            "⚠️ Без координат станція не зʼявиться в пошуку найближчих для "
+            "водіїв. Додати їх можна пізніше через підтримку."
+        )
+        await _prompt_connector_step(message, state)
+        return
+
+    coords = _parse_coordinates(raw)
+    if coords is None:
+        await message.answer(
+            "Не розпізнав координати. Формат: «lat, lng» (наприклад "
+            "49.8397, 24.0297), або надішліть геопозицію кнопкою 📍, або "
+            "«-», щоб пропустити:"
+        )
+        return
+
+    lat, lng = coords
+    await state.update_data(lat=lat, lng=lng)
+    await _prompt_connector_step(message, state)
+
+
+@router.callback_query(F.data.startswith("opconn:"), StateFilter(StationWizard.waiting_for_connector))
+async def station_wizard_connector_preset(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if value == "__other__":
+        # Лишаємось у тому самому стані — наступний вільний текст прийме
+        # station_wizard_connector_custom() нижче.
+        await callback.message.answer("Введіть тип конектора текстом:")
+        return
+    await state.update_data(connector_type=value)
+    await state.set_state(StationWizard.waiting_for_power)
+    await callback.message.answer("Потужність, кВт, наприклад 22 (або «-»):")
 
 
 @router.message(StateFilter(StationWizard.waiting_for_connector), _is_free_text)
-async def station_wizard_connector(message: Message, state: FSMContext):
-    await state.update_data(connector_type=_parse_skip(message.text))
+async def station_wizard_connector_custom(message: Message, state: FSMContext):
+    connector = message.text.strip()
+    if not connector:
+        await message.answer("Введіть тип конектора текстом:")
+        return
+    await state.update_data(connector_type=connector)
     await state.set_state(StationWizard.waiting_for_power)
     await message.answer("Потужність, кВт, наприклад 22 (або «-»):")
 
@@ -434,7 +518,7 @@ async def _send_new_station_qr(message: Message, station_name: str, qr_slug: str
     await message.answer_photo(
         BufferedInputFile(png, filename=f"qr_{qr_slug}.png"),
         caption=(
-            f"✅ Станцію «{station_name}» додано.\n\n"
+            f"✅ Станцію «{html.escape(station_name)}» додано.\n\n"
             f"QR: <code>{url}</code>\n\n"
             "Роздрукуйте цей код і розмістіть на станції — водій сканує його для оплати."
         ),
@@ -463,7 +547,8 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
 
     station_id, qr_slug = await repo.create_station(
         operator["id"], data["name"], data["tariff_uah_kwh"],
-        address=data.get("address"), connector_type=data.get("connector_type"),
+        address=data.get("address"), lat=data.get("lat"), lng=data.get("lng"),
+        connector_type=data.get("connector_type"),
         power_kw=data.get("power_kw"), tariff_uah_start=tariff_start,
     )
     await _send_new_station_qr(message, data["name"], qr_slug)
@@ -474,17 +559,18 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 
 def _station_detail_text(station) -> str:
+    """name/address/connector_type — вільний текст із майстра станції, тому html.escape()."""
     lines = [
-        f"🔌 <b>{station['name']}</b>",
+        f"🔌 <b>{html.escape(station['name'])}</b>",
         f"Статус: {_STATION_STATUS_LABELS.get(station['status'], station['status'])}",
         f"Тариф: {station['tariff_uah_kwh']} грн/кВт·год",
     ]
     if station.get("tariff_uah_start"):
         lines.append(f"Плата за старт: {station['tariff_uah_start']} грн")
     if station.get("address"):
-        lines.append(f"Адреса: {station['address']}")
+        lines.append(f"Адреса: {html.escape(station['address'])}")
     if station.get("connector_type"):
-        lines.append(f"Конектор: {station['connector_type']}")
+        lines.append(f"Конектор: {html.escape(station['connector_type'])}")
     lines.append(f"QR: <code>{PUBLIC_BASE_URL}/s/{station['qr_slug']}</code>")
     return "\n".join(lines)
 
