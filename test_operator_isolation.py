@@ -15,6 +15,7 @@ operator_* містить у WHERE `operator_id` і отримує його па
 Запуск: pytest test_operator_isolation.py -v
 """
 import re
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from app.database import operators_repo as repo
 
 OPERATOR_A = 1
 OPERATOR_B = 2
+SINCE = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,8 @@ TENANT_SCOPED_CALLS = [
     ("add_ledger_entry", lambda op_id: repo.add_ledger_entry(op_id, "adjustment", 1.0), "insert"),
     ("get_operator_balance", lambda op_id: repo.get_operator_balance(op_id), "operator_id"),
     ("list_ledger", lambda op_id: repo.list_ledger(op_id), "operator_id"),
+    ("list_ledger_since", lambda op_id: repo.list_ledger_since(op_id, SINCE), "operator_id"),
+    ("get_ledger_summary", lambda op_id: repo.get_ledger_summary(op_id, SINCE), "operator_id"),
 ]
 
 _IDS = [c[0] for c in TENANT_SCOPED_CALLS]

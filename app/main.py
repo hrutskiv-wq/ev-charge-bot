@@ -55,6 +55,7 @@ async def lifespan(app: FastAPI):
         BotCommand(command="charge", description="⚡ Почати зарядку"),
         BotCommand(command="voucher", description="🧾 Поповнити баланс"),
         BotCommand(command="support", description="📢 Online підтримка"),
+        BotCommand(command="operator", description="🏷️ Кабінет оператора"),
     ])
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
@@ -105,11 +106,17 @@ app.include_router(payments_router)
 app.include_router(operator_webhook_router)
 app.include_router(driver_router)
 
-# Реєстрація роутерів aiogram (Telegram-апдейти)
+# Реєстрація роутерів aiogram (Telegram-апдейти).
+# operator_billing_router — ПЕРЕД user_router: user_router закінчується
+# хендлером-приймачем "будь-який текст без '/' -> ШІ-чат" (StateFilter("*")),
+# і якби кабінет оператора йшов пізніше, жоден вільнотекстовий крок його
+# майстрів (назва станції, токен еквайрингу тощо) до нього не доходив би —
+# ловився б раніше тим самим ШІ-чатом (див. докладний коментар на початку
+# app/handlers/operator_billing.py).
 dp.include_router(bot_stations_router)
+dp.include_router(operator_billing_router)
 dp.include_router(user_router)
 dp.include_router(charge_router)
-dp.include_router(operator_billing_router)
 
 
 @dp.errors()

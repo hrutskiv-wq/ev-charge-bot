@@ -677,3 +677,37 @@ async def list_ledger(operator_id: int, limit: int = 50):
             ORDER BY created_at DESC
             LIMIT $2
         """, operator_id, limit)
+
+
+async def list_ledger_since(operator_id: int, since, limit: int = 1000):
+    """
+    Записи журналу з моменту `since` у ХРОНОЛОГІЧНОМУ порядку — основа для
+    CSV-вивантаження виручки (Промпт 4). На відміну від list_ledger()
+    (найновіші перші, для перегляду в чаті) експорт читається зверху вниз.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT id, operator_id, session_id, type, amount_uah, description, created_at
+            FROM operator_payout_ledger
+            WHERE operator_id = $1 AND created_at >= $2
+            ORDER BY created_at
+            LIMIT $3
+        """, operator_id, since, limit)
+
+
+async def get_ledger_summary(operator_id: int, since):
+    """
+    SUM(amount_uah) за типом з моменту `since` -> {'session_income': Decimal, ...}.
+    Тип, за яким за період не було жодного запису, у результаті відсутній
+    (не 0) — нуль за замовчуванням рахує викликач, тут COALESCE не потрібен.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT type, SUM(amount_uah) AS total
+            FROM operator_payout_ledger
+            WHERE operator_id = $1 AND created_at >= $2
+            GROUP BY type
+        """, operator_id, since)
+        return {row["type"]: row["total"] for row in rows}
