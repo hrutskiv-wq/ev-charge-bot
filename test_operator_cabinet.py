@@ -44,11 +44,12 @@ class FakeChat:
 
 class FakeMessage:
     def __init__(self, text="", telegram_id=TELEGRAM_A, username=None,
-                 chat_type="private", message_id=42):
+                 chat_type="private", message_id=42, chat_id=None, html_text=""):
         self.text = text
         self.from_user = FakeUser(telegram_id, username)
-        self.chat = FakeChat(chat_type, chat_id=telegram_id)
+        self.chat = FakeChat(chat_type, chat_id=chat_id if chat_id is not None else telegram_id)
         self.message_id = message_id
+        self.html_text = html_text  # потрібен confirm_station_switched_on/admin_activate_operator
         self.sent = []
         self.photos = []
         self.documents = []
@@ -72,10 +73,12 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self, data, telegram_id=TELEGRAM_A, username=None, chat_type="private"):
+    def __init__(self, data, telegram_id=TELEGRAM_A, username=None, chat_type="private",
+                 chat_id=None, html_text=""):
         self.data = data
         self.from_user = FakeUser(telegram_id, username)
-        self.message = FakeMessage(telegram_id=telegram_id, chat_type=chat_type)
+        self.message = FakeMessage(telegram_id=telegram_id, chat_type=chat_type,
+                                   chat_id=chat_id, html_text=html_text)
         self.answers = []
 
     async def answer(self, text=None, show_alert=False):
@@ -111,6 +114,7 @@ class FakeBot:
         self.deleted = []
         self.sent = []
         self.fail_delete = False
+        self.fail_send = False
 
     async def delete_message(self, chat_id, message_id):
         if self.fail_delete:
@@ -118,6 +122,8 @@ class FakeBot:
         self.deleted.append((chat_id, message_id))
 
     async def send_message(self, chat_id, text, **kwargs):
+        if self.fail_send:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
         self.sent.append((chat_id, text, kwargs))
 
 
@@ -171,6 +177,16 @@ def rs(monkeypatch):
 
     async def get_operator_by_telegram_id(telegram_id):
         return st.operators_by_tid.get(telegram_id)
+
+    async def get_operator(operator_id):
+        return st.operators_by_id.get(operator_id)
+
+    async def set_operator_status(operator_id, status):
+        op = st.operators_by_id.get(operator_id)
+        if op is None:
+            return False
+        op["status"] = status
+        return True
 
     async def create_operator(name, telegram_id, phone=None, commission_pct=4):
         if telegram_id in st.operators_by_tid:
@@ -240,6 +256,8 @@ def rs(monkeypatch):
 
     for name, func in [
         ("get_operator_by_telegram_id", get_operator_by_telegram_id),
+        ("get_operator", get_operator),
+        ("set_operator_status", set_operator_status),
         ("create_operator", create_operator),
         ("get_operator_monobank_token_encrypted", get_operator_monobank_token_encrypted),
         ("set_operator_monobank_token", set_operator_monobank_token),
@@ -390,6 +408,12 @@ async def test_onboarding_notifies_logs_chat_when_configured(rs, fake_bot, monke
     assert chat_id == "-100999"
     assert "Готель Едем" in text and "+380501234567" in text and "hotel_eden" in text
 
+    button_texts = [b.text for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert any("Активувати" in t for t in button_texts)
+    created_id = rs.operators_by_tid[TELEGRAM_A]["id"]
+    button_data = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert f"opadm:activate:{created_id}" in button_data
+
 
 async def test_onboarding_skips_notification_silently_without_logs_chat_id(rs, fake_bot):
     state = FakeFSMContext()
@@ -413,6 +437,102 @@ async def test_onboarding_phone_for_already_registered_telegram_id_does_not_dupl
 
     assert "вже зареєстровані" in message.sent[0][0]
     assert fake_bot.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Активація оператора кнопкою з адмін-чату
+# ---------------------------------------------------------------------------
+
+ADMIN_CHAT_ID = -1009988
+
+
+@pytest.fixture
+def admin_env(monkeypatch):
+    monkeypatch.setenv("LOGS_CHAT_ID", str(ADMIN_CHAT_ID))
+
+
+async def test_admin_activate_sets_status_and_notifies_operator(rs, fake_bot, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    callback = FakeCallback(f"opadm:activate:{OPERATOR_A}", telegram_id=999999,
+                            chat_id=ADMIN_CHAT_ID, html_text="🆕 Новий оператор на модерації")
+
+    await ob.admin_activate_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    assert len(fake_bot.sent) == 1
+    chat_id, text, _kwargs = fake_bot.sent[0]
+    assert chat_id == TELEGRAM_A
+    assert "активовано" in text.lower()
+    assert callback.answers[-1] == ("Готово", False)
+    assert "Активовано" in callback.message.edited[0][0]
+
+
+async def test_admin_activate_rejected_from_non_admin_chat(rs, fake_bot, admin_env, caplog):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    callback = FakeCallback(f"opadm:activate:{OPERATOR_A}", chat_id=555555)  # не адмін-чат
+
+    with caplog.at_level("WARNING"):
+        await ob.admin_activate_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "pending"
+    assert fake_bot.sent == []
+    assert callback.answers == [("Недоступно", True)]
+    assert "поза адмін-чатом" in caplog.text
+
+
+async def test_admin_activate_rejected_without_logs_chat_id_configured(rs, fake_bot):
+    """LOGS_CHAT_ID не задано (автофікстура _no_admin_chat) -> жоден чат не адмінський."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    callback = FakeCallback(f"opadm:activate:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_activate_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "pending"
+    assert callback.answers == [("Недоступно", True)]
+
+
+async def test_admin_activate_survives_operator_blocking_the_bot(rs, fake_bot, admin_env):
+    """Збій сповіщення (заблокований бот тощо) не має скасовувати вже проведену активацію."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    fake_bot.fail_send = True
+    callback = FakeCallback(f"opadm:activate:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_activate_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    assert callback.answers[-1] == ("Готово", False)
+
+
+async def test_admin_activate_second_click_is_idempotent(rs, fake_bot, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    first = FakeCallback(f"opadm:activate:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+    await ob.admin_activate_operator(first)
+    assert len(fake_bot.sent) == 1
+
+    second = FakeCallback(f"opadm:activate:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+    await ob.admin_activate_operator(second)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    assert len(fake_bot.sent) == 1, "Повторне натискання не має слати друге сповіщення"
+    assert second.answers == [("Уже активовано", False)]
+
+
+async def test_admin_activate_rejects_malformed_callback_data(rs, fake_bot, admin_env):
+    callback = FakeCallback("opadm:activate:not-a-number", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_activate_operator(callback)
+
+    assert fake_bot.sent == []
+    assert callback.answers == [("Некоректна кнопка", True)]
+
+
+async def test_admin_activate_unknown_operator_shows_alert(rs, fake_bot, admin_env):
+    callback = FakeCallback("opadm:activate:999999", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_activate_operator(callback)
+
+    assert fake_bot.sent == []
+    assert callback.answers == [("Оператора не знайдено", True)]
 
 
 # ---------------------------------------------------------------------------

@@ -3,11 +3,13 @@
 
 Вхід: команда /operator або кнопка «🏷️ Мій білінг» головного меню. Новий
 Telegram-акаунт -> онбординг (назва, телефон) -> запис у operators зі
-статусом 'pending' і сповіщення LOGS_CHAT_ID; автоактивації немає навмисно —
-активує адмін вручну через set_operator_status(). Далі — підключення
-еквайрингу, майстер станцій, перелік/тарифи/статус станцій, виручка й
-CSV-експорт. Підтвердження «увімкнув станцію» з пуша про оплату (Промпт 2b)
-лишається нижче без змін.
+статусом 'pending' і сповіщення LOGS_CHAT_ID з кнопкою «✅ Активувати»
+(admin_activate_operator нижче); пряма ручна активація через
+set_operator_status() у БД так само лишається робочою — кнопка її не
+замінює, а лише додає сповіщення оператору й слід у чаті. Далі —
+підключення еквайрингу, майстер станцій, перелік/тарифи/статус станцій,
+виручка й CSV-експорт. Підтвердження «увімкнув станцію» з пуша про оплату
+(Промпт 2b) лишається нижче без змін.
 
 ПОРЯДОК РОУТЕРІВ (важливо, app/main.py): цей router зареєстрований ПЕРЕД
 user_router, бо той закінчується хендлером-приймачем "будь-який текст без
@@ -25,6 +27,12 @@ callback_data (opm:/opst:/oprev:/opcsv:) свідомо НЕ несуть operat
 всередині — лише station_id чи період, тож підмінити чужого оператора
 підбором callback_data неможливо: сам operator_id для запиту в repo
 береться виключно з поточного telegram-акаунта.
+
+Єдиний свідомий виняток — opadm:activate:<operator_id> (кнопка активації):
+це адмінська дія без "свого" оператора, якому можна довіряти. Замість
+звірки з telegram-акаунтом захист тут — перевірка, що callback прийшов
+САМЕ з чату LOGS_CHAT_ID (порівняння int(chat_id) == int(LOGS_CHAT_ID));
+формат callback_data навмисно не вважається секретом.
 """
 import csv
 import io
@@ -42,8 +50,8 @@ from app.core.crypto import encrypt_secret
 from app.core.loader import bot
 from app.database import operators_repo as repo
 from app.keyboards.operator import (
-    get_cabinet_menu, get_revenue_csv_keyboard, get_revenue_period_keyboard,
-    get_station_detail_keyboard, get_station_list_keyboard,
+    get_admin_activation_keyboard, get_cabinet_menu, get_revenue_csv_keyboard,
+    get_revenue_period_keyboard, get_station_detail_keyboard, get_station_list_keyboard,
 )
 from app.services.operator_notify import CONFIRM_PREFIX
 from app.services.qr_image import generate_station_qr_png
@@ -148,10 +156,14 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
         f"Назва: {name}\n"
         f"Телефон: {phone}\n"
         f"Telegram: {username} (id {from_user.id})\n\n"
-        f"Активація вручну: set_operator_status({operator_id}, 'active')"
+        "Активуйте кнопкою нижче, або вручну: "
+        f"set_operator_status({operator_id}, 'active')"
     )
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML",
+            reply_markup=get_admin_activation_keyboard(operator_id),
+        )
     except Exception as e:
         # Сповіщення адміну не має ламати сам онбординг — заявка вже
         # записана в operators, адмін просто дізнається про неї пізніше
@@ -200,6 +212,81 @@ async def onboarding_phone(message: Message, state: FSMContext):
         "активації."
     )
     await _notify_admins_new_operator(operator_id, name, phone, message.from_user)
+
+
+def _is_from_admin_chat(chat_id) -> bool:
+    """
+    Порівнюємо як int: LOGS_CHAT_ID для груп — від'ємне число, і збіг
+    "-100123" == "-100123" рядком спрацював би, але зайва обережність
+    коштує тут нічого, а рядкове порівняння крихкіше при випадкових
+    пробілах чи іншому форматуванні в .env.
+    """
+    logs_chat_id = os.getenv("LOGS_CHAT_ID")
+    if not logs_chat_id:
+        return False
+    try:
+        return int(chat_id) == int(logs_chat_id)
+    except (TypeError, ValueError):
+        return False
+
+
+@router.callback_query(F.data.startswith("opadm:activate:"), StateFilter("*"))
+async def admin_activate_operator(callback: CallbackQuery):
+    """
+    Кнопка «✅ Активувати» під повідомленням про нового оператора в
+    LOGS_CHAT_ID. Це адмінська дія — на відміну від кабінету оператора,
+    де operator_id ніколи не їде в callback_data, тут формат callback_data
+    не секрет (id оператора вгадується тривіально), тому єдиний захист —
+    перевірка, що натискання прийшло САМЕ з адмін-чату.
+    """
+    if not _is_from_admin_chat(callback.message.chat.id):
+        logger.warning(
+            "Telegram-користувач %s (чат %s) спробував активувати оператора "
+            "поза адмін-чатом: %r", callback.from_user.id, callback.message.chat.id,
+            callback.data,
+        )
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    try:
+        operator_id = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некоректна кнопка", show_alert=True)
+        return
+
+    operator = await repo.get_operator(operator_id)
+    if operator is None:
+        await callback.answer("Оператора не знайдено", show_alert=True)
+        return
+
+    if operator["status"] == "active":
+        await callback.answer("Уже активовано")
+        return
+
+    await repo.set_operator_status(operator_id, "active")
+    logger.info("✅ Оператора %s активовано через адмін-чат %s",
+                operator_id, callback.message.chat.id)
+
+    try:
+        await bot.send_message(
+            chat_id=operator["telegram_id"],
+            text="🎉 Ваш кабінет активовано! Станції тепер приймають оплати. /operator",
+        )
+    except Exception as e:
+        # Оператор заблокував бота чи ще не тиснув /start — активація вже
+        # відбулась і не має відкочуватись через це.
+        logger.error("Не вдалося сповістити оператора %s (telegram_id=%s) про активацію: %s",
+                     operator_id, operator["telegram_id"], e)
+
+    await callback.answer("Готово")
+    try:
+        # Прибираємо кнопку, щоб не натиснули вдруге, і лишаємо слід у чаті.
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n✅ <b>Активовано</b>", parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.info("Не вдалося оновити повідомлення про активацію оператора %s: %s",
+                    operator_id, e)
 
 
 # ---------------------------------------------------------------------------

@@ -51,3 +51,11 @@ def get_revenue_csv_keyboard(period: str):
     builder.button(text="⬅️ Кабінет", callback_data="opm:home")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def get_admin_activation_keyboard(operator_id: int):
+    """Кнопка під повідомленням про нового оператора в LOGS_CHAT_ID."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Активувати", callback_data=f"opadm:activate:{operator_id}")
+    builder.adjust(1)
+    return builder.as_markup()
