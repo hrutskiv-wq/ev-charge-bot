@@ -21,7 +21,11 @@ from app.handlers.ocpi_stations import router as bot_stations_router
 from app.api.ocpi import router as api_cdr_router
 from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
+from app.handlers.operator_billing import router as operator_billing_router
 from app.api.payments import payments_router
+from app.api.operator_webhook import operator_webhook_router
+from app.api.driver_qr import driver_router
+from app.core.crypto import warn_if_key_missing
 from app.database.ocpi_repo import init_ocpi_tables
 from app.database.operators_repo import init_operator_tables
 
@@ -34,6 +38,9 @@ async def lifespan(app: FastAPI):
     await init_postgres()
     await init_ocpi_tables()
     await init_operator_tables()
+    # Гучне попередження, якщо ключа шифрування немає: білінг операторів без
+    # нього не працює, але решта застосунку — цілком, тому не падаємо.
+    warn_if_key_missing()
 
     # Кнопка "Menu" біля поля вводу в Telegram (як у конкурентних ботів) —
     # раніше bot.set_my_commands()/set_chat_menu_button() взагалі не
@@ -95,11 +102,14 @@ app.add_middleware(
 # Реєстрація роутерів FastAPI (HTTP API)
 app.include_router(api_cdr_router)
 app.include_router(payments_router)
+app.include_router(operator_webhook_router)
+app.include_router(driver_router)
 
 # Реєстрація роутерів aiogram (Telegram-апдейти)
 dp.include_router(bot_stations_router)
 dp.include_router(user_router)
 dp.include_router(charge_router)
+dp.include_router(operator_billing_router)
 
 
 @dp.errors()

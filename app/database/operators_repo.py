@@ -87,6 +87,24 @@ async def init_operator_tables():
         );
         """)
 
+        # 2b. Платежі водіїв через еквайринг оператора (міграція 0011).
+        # Створюється ДО operator_sessions, бо sessions.payment_id на неї
+        # посилається.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS operator_payments (
+            id SERIAL PRIMARY KEY,
+            operator_id INTEGER NOT NULL REFERENCES operators(id) ON DELETE CASCADE,
+            invoice_id VARCHAR(100) NOT NULL,
+            amount_uah NUMERIC(12, 2) NOT NULL CHECK (amount_uah >= 0),
+            status VARCHAR(20) NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'success', 'failed', 'expired', 'reversed')),
+            payload JSONB,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (operator_id, invoice_id)
+        );
+        """)
+
         # 3. Сесії зарядки (operator_id денормалізовано + композитний FK)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS operator_sessions (
@@ -97,7 +115,7 @@ async def init_operator_tables():
             ended_at TIMESTAMP WITH TIME ZONE,
             kwh NUMERIC(10, 3) CHECK (kwh >= 0),
             amount_uah NUMERIC(12, 2) CHECK (amount_uah >= 0),
-            payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+            payment_id INTEGER REFERENCES operator_payments(id) ON DELETE SET NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'paid', 'charging', 'completed', 'failed', 'refunded')),
             driver_contact VARCHAR(64),
@@ -132,6 +150,19 @@ async def init_operator_tables():
         # 6. Ідемпотентність розрахунків (пояснення — в міграції 0010)
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_session_income ON operator_payout_ledger(session_id, type) WHERE session_id IS NOT NULL AND type IN ('session_income', 'platform_commission');")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_payment ON operator_sessions(payment_id) WHERE payment_id IS NOT NULL;")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_payments_operator_created ON operator_payments(operator_id, created_at DESC);")
+
+        # 7. Перенаправлення operator_sessions.payment_id з payments на
+        # operator_payments (міграція 0011). CREATE TABLE IF NOT EXISTS вище
+        # не чіпає вже створену таблицю, тому на базі, піднятій до 0011,
+        # обмеження треба перевісити явно — інакше запис платежу водія
+        # впаде на FK, який дивиться в чужу таблицю.
+        await conn.execute("ALTER TABLE operator_sessions DROP CONSTRAINT IF EXISTS operator_sessions_payment_id_fkey;")
+        await conn.execute("""
+        ALTER TABLE operator_sessions
+            ADD CONSTRAINT operator_sessions_payment_id_fkey
+            FOREIGN KEY (payment_id) REFERENCES operator_payments(id) ON DELETE SET NULL;
+        """)
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
 
@@ -398,6 +429,113 @@ async def complete_session(operator_id: int, session_id: int, kwh: float,
             WHERE id = $2 AND operator_id = $1
         """, operator_id, session_id, kwh, amount_uah)
         return result.endswith("1")
+
+
+# ---------------------------------------------------------------------------
+# Платежі водіїв (еквайринг оператора)
+# ---------------------------------------------------------------------------
+
+_PAYMENT_FIELDS = (
+    "id, operator_id, invoice_id, amount_uah, status, created_at, updated_at"
+)
+
+
+async def create_operator_payment(operator_id: int, invoice_id: str, amount_uah,
+                                  status: str = "pending"):
+    """
+    Реєструє платіж водія. Повертає id, або id вже наявного рядка, якщо
+    цей invoice_id для цього оператора вже записаний (повторна спроба
+    створення інвойсу не має плодити дублікати).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        payment_id = await conn.fetchval("""
+            INSERT INTO operator_payments (operator_id, invoice_id, amount_uah, status)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (operator_id, invoice_id) DO NOTHING
+            RETURNING id
+        """, operator_id, invoice_id, amount_uah, status)
+        if payment_id is not None:
+            return payment_id
+        return await conn.fetchval("""
+            SELECT id FROM operator_payments
+            WHERE operator_id = $1 AND invoice_id = $2
+        """, operator_id, invoice_id)
+
+
+async def get_operator_payment_by_invoice(operator_id: int, invoice_id: str):
+    """
+    Платіж за invoice_id У МЕЖАХ оператора.
+
+    Саме ця функція не дає webhook'ові оператора А підтвердити інвойс
+    оператора Б: operator_id береться з URL webhook, і чужий invoice_id
+    просто не знаходиться.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_PAYMENT_FIELDS} FROM operator_payments
+            WHERE operator_id = $1 AND invoice_id = $2
+        """, operator_id, invoice_id)
+
+
+async def get_operator_payment(operator_id: int, payment_id: int):
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_PAYMENT_FIELDS} FROM operator_payments
+            WHERE operator_id = $1 AND id = $2
+        """, operator_id, payment_id)
+
+
+async def set_operator_payment_status(operator_id: int, payment_id: int, status: str,
+                                      payload: str = None, conn=None):
+    """
+    Оновлює статус платежу. payload — сирий JSON відповіді банку (рядок),
+    зберігаємо для розборів і звірки.
+
+    Умова `status <> $3` робить оновлення ідемпотентним: повторний webhook
+    з тим самим статусом не чіпає рядок і повертає False, тож викликач
+    бачить «нічого нового не сталось» і не проводить нарахування вдруге.
+    """
+    query = """
+        UPDATE operator_payments
+        SET status = $3,
+            payload = COALESCE($4::jsonb, payload),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE operator_id = $1 AND id = $2 AND status <> $3
+    """
+    if conn is not None:
+        result = await conn.execute(query, operator_id, payment_id, status, payload)
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as new_conn:
+            result = await new_conn.execute(query, operator_id, payment_id, status, payload)
+    return result.endswith("1")
+
+
+async def attach_payment_to_session(operator_id: int, session_id: int, payment_id: int):
+    """Привʼязує створений інвойс до сесії (обидва — цього ж оператора)."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE operator_sessions SET payment_id = $3
+            WHERE operator_id = $1 AND id = $2
+        """, operator_id, session_id, payment_id)
+        return result.endswith("1")
+
+
+async def get_session_by_payment(operator_id: int, payment_id: int, conn=None):
+    """Сесія, до якої привʼязаний платіж (uq_sessions_payment гарантує одну)."""
+    query = f"""
+        SELECT {_SESSION_FIELDS} FROM operator_sessions
+        WHERE operator_id = $1 AND payment_id = $2
+    """
+    if conn is not None:
+        return await conn.fetchrow(query, operator_id, payment_id)
+    pool = await get_db_pool()
+    async with pool.acquire() as new_conn:
+        return await new_conn.fetchrow(query, operator_id, payment_id)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,81 @@
+{% extends "driver/base.html" %}
+{% block title %}{{ station.name }} — оплата зарядки{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h1>{{ station.name }}</h1>
+  {% if station.address %}<p class="addr">{{ station.address }}</p>{% endif %}
+
+  <div class="row">
+    <span>Статус</span>
+    {% if available %}
+      <span><span class="badge ok">Вільна</span></span>
+    {% else %}
+      <span><span class="badge off">{{ status_label }}</span></span>
+    {% endif %}
+  </div>
+  <div class="row">
+    <span>Тариф</span>
+    <span>{{ tariff_kwh }} грн / кВт·год</span>
+  </div>
+  {% if station.tariff_uah_start %}
+  <div class="row">
+    <span>Плата за старт</span>
+    <span>{{ tariff_start }} грн</span>
+  </div>
+  {% endif %}
+  {% if station.connector_type %}
+  <div class="row">
+    <span>Конектор</span>
+    <span>{{ station.connector_type }}{% if station.power_kw %} · {{ power_kw }} кВт{% endif %}</span>
+  </div>
+  {% endif %}
+</div>
+
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+{% if available %}
+<div class="card">
+  {# Водій не знає наперед, скільки кВт·год візьме, тому платить обрану суму
+     авансом. Незужита частина повертається оператором вручну — автоматичний
+     часткововий рефанд буде, коли зʼявиться реальний облік kWh (OCPP). #}
+  <form method="post" action="/s/{{ station.qr_slug }}/start">
+    <p style="margin:0 0 4px;font-weight:600">Сума до оплати</p>
+    <p class="center" style="text-align:left;margin:0 0 10px">
+      Орієнтовно {{ preset_kwh }} кВт·год за {{ presets[1] }} грн
+    </p>
+
+    <div class="amounts">
+      {% for preset in presets %}
+      <label>
+        <input type="radio" name="amount_uah" value="{{ preset }}"
+               {% if loop.index0 == 1 %}checked{% endif %}>
+        <span>{{ preset }} ₴</span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <div class="custom">
+      <input type="number" name="custom_amount" inputmode="decimal"
+             min="{{ min_amount }}" max="{{ max_amount }}" step="1"
+             placeholder="Інша сума, ₴">
+    </div>
+
+    <button type="submit">Розпочати зарядку</button>
+  </form>
+</div>
+
+<p class="center">
+  Оплата йде напряму оператору станції через Monobank.
+  {% if manual %}
+  Після оплати оператор увімкне станцію — зазвичай за 1–2 хвилини.
+  {% endif %}
+  Реєстрація не потрібна.
+</p>
+{% else %}
+<div class="msg warn">
+  Станція зараз недоступна для оплати. Спробуйте пізніше або зверніться до
+  оператора.
+</div>
+{% endif %}
+{% endblock %}

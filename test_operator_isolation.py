@@ -135,6 +135,12 @@ TENANT_SCOPED_CALLS = [
     ("list_sessions_by_station", lambda op_id: repo.list_sessions(op_id, station_id=10), "operator_id"),
     ("set_session_status", lambda op_id: repo.set_session_status(op_id, 77, "paid"), "operator_id"),
     ("complete_session", lambda op_id: repo.complete_session(op_id, 77, 12.0), "operator_id"),
+    ("create_operator_payment", lambda op_id: repo.create_operator_payment(op_id, "inv-1", 100), "insert"),
+    ("get_operator_payment_by_invoice", lambda op_id: repo.get_operator_payment_by_invoice(op_id, "inv-1"), "operator_id"),
+    ("get_operator_payment", lambda op_id: repo.get_operator_payment(op_id, 5), "operator_id"),
+    ("set_operator_payment_status", lambda op_id: repo.set_operator_payment_status(op_id, 5, "success"), "operator_id"),
+    ("attach_payment_to_session", lambda op_id: repo.attach_payment_to_session(op_id, 77, 5), "operator_id"),
+    ("get_session_by_payment", lambda op_id: repo.get_session_by_payment(op_id, 5), "operator_id"),
     ("add_ledger_entry", lambda op_id: repo.add_ledger_entry(op_id, "adjustment", 1.0), "insert"),
     ("get_operator_balance", lambda op_id: repo.get_operator_balance(op_id), "operator_id"),
     ("list_ledger", lambda op_id: repo.list_ledger(op_id), "operator_id"),
@@ -525,6 +531,30 @@ async def test_entries_without_session_id_are_not_constrained(monkeypatch):
     assert len(conn.rows) == 2
 
 
+async def test_payment_status_update_touches_updated_at(fake_conn):
+    """
+    updated_at має рухатись при кожній зміні статусу — без цього неможливо
+    відповісти «коли саме цей платіж став success», а це перше питання
+    будь-якого розбору розбіжності зі звіркою.
+    """
+    await repo.set_operator_payment_status(OPERATOR_A, 5, "success")
+    query, _args = _single_call(fake_conn)
+
+    assert "UPDATE operator_payments" in query
+    assert "updated_at = CURRENT_TIMESTAMP" in query
+
+
+async def test_payment_status_update_is_idempotent_by_status_guard(fake_conn):
+    """
+    `status <> $3` — це мʼютекс, на якому тримається захист від подвійного
+    нарахування у webhook: повторний виклик з тим самим статусом не змінює
+    рядок, викликач отримує False і не проводить дохід удруге.
+    """
+    await repo.set_operator_payment_status(OPERATOR_A, 5, "success")
+    query, _args = _single_call(fake_conn)
+    assert "status <> $3" in query
+
+
 async def test_ledger_entry_accepts_caller_transaction():
     """
     add_ledger_entry(conn=...) пише в транзакції викликача, не відкриваючи
@@ -556,8 +586,19 @@ async def test_balance_is_summed_from_the_ledger_not_a_cached_column(fake_conn):
 # ---------------------------------------------------------------------------
 
 _ROOT = Path(__file__).parent
-_MIGRATION = _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py"
+# Схема білінгу розкладена по кількох ревізіях (0010 — тенанти й сесії,
+# 0011 — платежі водіїв), а дзеркало init_operator_tables() одне. Тому
+# порівнюємо ОБ'ЄДНАННЯ міграцій із дзеркалом: інакше кожна нова ревізія
+# «ламала» б звірку, і її б швидко вимкнули.
+_MIGRATION_FILES = [
+    _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py",
+    _ROOT / "migrations" / "versions" / "0011_operator_payments.py",
+]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
+
+
+def _migrations_source() -> str:
+    return "\n".join(f.read_text(encoding="utf-8") for f in _MIGRATION_FILES)
 
 _TABLE_RE = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\s*\);", re.DOTALL)
 # Ловимо і звичайні, і UNIQUE-індекси, і порівнюємо ВЕСЬ текст визначення
@@ -595,10 +636,11 @@ def test_migration_and_idempotent_bootstrap_declare_same_columns():
     на проді значення насправді не існувало. Цей тест ловить такий розхід
     одразу, а не через місяць на живій базі.
     """
-    migration_tables = _declared_columns(_MIGRATION.read_text(encoding="utf-8"))
+    migration_tables = _declared_columns(_migrations_source())
     repo_tables = _declared_columns(_REPO_FILE.read_text(encoding="utf-8"))
 
-    expected = {"operators", "operator_stations", "operator_sessions", "operator_payout_ledger"}
+    expected = {"operators", "operator_stations", "operator_sessions",
+                "operator_payout_ledger", "operator_payments"}
     assert set(migration_tables) == expected
     assert set(repo_tables) == expected
 
@@ -612,7 +654,7 @@ def test_migration_and_idempotent_bootstrap_declare_same_columns():
 
 
 def test_migration_and_idempotent_bootstrap_declare_same_indexes():
-    migration_indexes = _declared_indexes(_MIGRATION.read_text(encoding="utf-8"))
+    migration_indexes = _declared_indexes(_migrations_source())
     repo_indexes = _declared_indexes(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_indexes == repo_indexes
 
@@ -624,7 +666,7 @@ def test_idempotency_is_guaranteed_by_partial_unique_indexes():
     запишеться. Індекси часткові — рядки без session_id ('payout',
     'subscription_fee', 'adjustment') під обмеження не підпадають.
     """
-    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+    for source in (_migrations_source(), _REPO_FILE.read_text(encoding="utf-8")):
         indexes = _declared_indexes(source)
         income = [i for i in indexes if "uq_ledger_session_income" in i]
         payment = [i for i in indexes if "uq_sessions_payment" in i]
@@ -648,7 +690,7 @@ def test_operators_has_no_redundant_unique_on_primary_key():
     не повернулось копіпастом з operator_stations, де UNIQUE (id, operator_id)
     справді потрібен (мішень композитного FK).
     """
-    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+    for source in (_migrations_source(), _REPO_FILE.read_text(encoding="utf-8")):
         operators_body = re.search(
             r"CREATE TABLE IF NOT EXISTS operators \((.*?)\n\s*\);", source, re.DOTALL
         ).group(1)
@@ -658,8 +700,9 @@ def test_operators_has_no_redundant_unique_on_primary_key():
 
 def test_every_tenant_table_carries_operator_id():
     """Правило «кожна таблиця з operator_id» — перевіряємо саме на схемі."""
-    tables = _declared_columns(_MIGRATION.read_text(encoding="utf-8"))
-    for table in ("operator_stations", "operator_sessions", "operator_payout_ledger"):
+    tables = _declared_columns(_migrations_source())
+    for table in ("operator_stations", "operator_sessions", "operator_payout_ledger",
+                  "operator_payments"):
         assert "operator_id" in tables[table], f"{table} без operator_id"
     # у самій таблиці операторів роль operator_id грає її ж первинний ключ
     assert "id" in tables["operators"]
@@ -672,7 +715,7 @@ def test_sessions_are_bound_to_stations_by_composite_foreign_key():
     Він працює лише за наявності UNIQUE (id, operator_id) на станціях —
     перевіряємо обидві половини разом, бо поодинці вони безглузді.
     """
-    for source in (_MIGRATION.read_text(encoding="utf-8"), _REPO_FILE.read_text(encoding="utf-8")):
+    for source in (_migrations_source(), _REPO_FILE.read_text(encoding="utf-8")):
         normalized = " ".join(source.split())
         assert "UNIQUE (id, operator_id)" in normalized
         assert (

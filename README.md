@@ -1,0 +1,103 @@
+# eVolt UA — ev-charge-bot
+
+Telegram-бот + HTTP API для зарядних станцій (Україна). Один процес:
+FastAPI (webhooks, OCPI, PWA) і aiogram-бот у спільному asyncio-loop —
+точка входу `app/main.py`.
+
+Стек: Python 3.11 · FastAPI · aiogram 3.x · asyncpg (сирий SQL, без ORM) ·
+PostgreSQL 16 · Alembic · Redis (FSM).
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt   # тести; НЕ в прод-образ
+
+cp .env.example .env                  # заповнити значення
+alembic upgrade head
+python -m app.main                    # або: docker compose up -d --build
+```
+
+Тести: `pytest` — 202 тести, усі мокають БД і мережу, живі сервіси не потрібні.
+
+## Чек-лист деплою
+
+1. `git pull`
+2. **Перевірити нові змінні в `.env.example`** і додати відсутні у свій `.env`.
+   Перед дописуванням переконатись, що файл закінчується переносом рядка:
+   `tail -c1 .env | xxd` — інакше нова змінна злипнеться з останнім рядком
+   (одного разу це вже поклало `docker compose`).
+3. `alembic upgrade head`
+4. `docker compose up -d --build`
+5. `curl -s localhost:8000/health` — має бути 200 з усіма компонентами `ok`
+6. Перевірити логи на старті: `docker compose logs bot --tail=50`
+
+### Додатково для White-Label білінгу операторів
+
+Білінг вимагає **`ENCRYPTION_KEY`** — ним шифруються еквайринг-токени
+операторів (`operators.monobank_token_encrypted`). Це чужі гроші: з таким
+токеном можна створювати інвойси в мерчанті оператора, тому у базі він
+лежить лише зашифрованим.
+
+Згенерувати ключ:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+і додати в `.env` як `ENCRYPTION_KEY=...`.
+
+- Без ключа застосунок **стартує нормально**, але в логах буде
+  `⚠️ ENCRYPTION_KEY не задано — білінг операторів непрацездатний до
+  додавання ключа`, а підключення еквайрингу оператору впаде з помилкою.
+  Решта функціоналу (бот, OCPI, поповнення балансу водіїв) від ключа не
+  залежить — тому старт і не переривається.
+- **Ротація ключа = перешифрування всіх збережених токенів.** Просто
+  підмінити значення в `.env` не можна: старі записи стануть нечитаними, і
+  жоден оператор не зможе приймати оплати.
+
+Також потрібен **`PUBLIC_BASE_URL`** — публічна адреса сервісу, з якої банк
+будує посилання повернення водія після оплати і адресу webhook. Має бути
+доступна ззовні (не `localhost`); якщо не задано, береться `EMSP_BASE_URL`.
+
+Сторінка оплати водія — `GET /s/{qr_slug}`, чек — `/s/{qr_slug}/receipt/{id}`.
+Водій не реєструється: єдиний ключ доступу це `qr_slug` під QR-кодом.
+
+## Локальна розробка проти моків
+
+Зовнішні системи, без яких флоу не протестувати:
+
+```bash
+uvicorn mock_cpo.py:app --port 8080        # CPO для OCPI
+uvicorn mock_monobank:app --port 8081      # еквайринг Monobank
+```
+
+Для мока банку в `.env`: `MONOBANK_ACQUIRING_BASE_URL=http://127.0.0.1:8081`.
+Мок потрібен тому, що інвойси створюються токеном мерчанта-**оператора** —
+без реального оператора з реальним рахунком живий банк не підходить.
+«Оплатити» інвойс вручну: `curl -X POST http://127.0.0.1:8081/mock/pay/<invoiceId>`.
+
+## Де що лежить
+
+| Шлях | Що |
+|---|---|
+| `app/main.py` | єдина точка входу, lifespan, реєстрація роутерів |
+| `app/core/loader.py` | єдині `bot`/`dp`/`ai_client` — нових не створювати |
+| `app/core/crypto.py` | шифрування секретів операторів (Fernet) |
+| `app/database/connection.py` | пул, базові таблиці, `update_user_balance()` |
+| `app/database/operators_repo.py` | білінг операторів (мультитенантний) |
+| `app/services/monobank_acquiring.py` | клієнт Monobank Acquiring |
+| `app/api/driver_qr.py` | сторінка оплати водія `/s/{qr_slug}` + чек |
+| `app/api/` | HTTP-ендпоінти: OCPI, платежі, webhook операторів |
+| `templates/driver/` | Jinja2-шаблони сторінок водія (без зовнішніх ресурсів) |
+| `migrations/versions/` | Alembic — **джерело правди** для схеми |
+
+**Схема БД живе у двох місцях:** Alembic-міграції та idempotent-блоки
+(`create_tables()`, `init_ocpi_tables()`, `init_operator_tables()`), щоб
+застосунок піднімався на чистій базі без ручного `alembic upgrade head`.
+При зміні схеми оновлюйте **обидва** — інакше вони розійдуться (це вже
+ставалось; для таблиць білінгу за синхронністю стежить
+`test_operator_isolation.py`).
+
+**Баланс водія змінюється тільки через `update_user_balance()`** — ніколи
+прямим записом у `users.balance` чи `kw_transactions`.
