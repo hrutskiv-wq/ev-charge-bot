@@ -34,6 +34,7 @@ from app.services.monobank_acquiring import (
     get_invoice_status,
     uah_to_kopecks,
 )
+from app.services.operator_notify import notify_operator_paid
 
 logger = logging.getLogger(__name__)
 
@@ -173,5 +174,27 @@ async def operator_invoice_webhook(operator_id: int, request: Request):
         "💳 Оператор %s: інвойс %s оплачено на %s грн, сесія #%s -> paid, дохід проведено",
         operator_id, invoice_id, payment["amount_uah"], session["id"],
     )
-    # Пуш оператору «Оплачено, увімкніть станцію» — Промпт 2b.
+
+    # Пуш оператору «Оплачено, увімкніть станцію». Свідомо ОСТАННІМ кроком і
+    # без права зламати відповідь: гроші вже прийшли, сесія позначена
+    # оплаченою, дохід проведено. Недоступний Telegram не привід повертати
+    # банку помилку і провокувати ретрай уже обробленого платежу.
+    if operator and operator["telegram_id"]:
+        try:
+            station = await repo.get_station(operator_id, session["station_id"])
+            await notify_operator_paid(
+                telegram_id=operator["telegram_id"],
+                operator_id=operator_id,
+                session_id=session["id"],
+                station_name=station["name"] if station else "станція",
+                amount_uah=payment["amount_uah"],
+                driver_contact=session["driver_contact"],
+            )
+        except Exception as e:
+            # notify_operator_paid і сам ковтає винятки, але страхуємось і
+            # тут: якщо звідси вилетить помилка, FastAPI віддасть 500, і
+            # Monobank почне ретраїти ВЖЕ ОБРОБЛЕНИЙ платіж.
+            logger.error("Оператор %s: збій сповіщення про сесію #%s: %s",
+                         operator_id, session["id"], e)
+
     return _QUIET_OK

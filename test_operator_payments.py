@@ -143,6 +143,7 @@ class FakeBilling:
         self.tokens = {}     # operator_id -> encrypted token
         self.operators = {}  # operator_id -> dict
         self.status_calls = 0
+        self.notifications = []
 
     def add_payment(self, operator_id, invoice_id, amount_uah, status="pending",
                     payment_id=None, session_id=None):
@@ -154,6 +155,7 @@ class FakeBilling:
         if session_id is not None:
             self.sessions[(operator_id, payment_id)] = {
                 "id": session_id, "operator_id": operator_id, "status": "pending",
+                "station_id": 10, "driver_contact": None,
             }
         return payment_id
 
@@ -182,7 +184,10 @@ def billing(monkeypatch):
         return state.sessions.get((operator_id, payment_id))
 
     async def get_operator(operator_id):
-        return state.operators.get(operator_id, {"id": operator_id, "commission_pct": 4})
+        return state.operators.get(
+            operator_id,
+            {"id": operator_id, "telegram_id": 500 + operator_id, "commission_pct": 4},
+        )
 
     async def set_session_status(operator_id, session_id, status, payment_id=None):
         for session in state.sessions.values():
@@ -205,7 +210,17 @@ def billing(monkeypatch):
                              "amount_uah": -amount_uah * commission_pct / 100})
         return base, base + 1
 
+    async def get_station(operator_id, station_id):
+        return {"id": station_id, "operator_id": operator_id, "name": "Готель Едем"}
+
+    async def fake_notify(**kwargs):
+        state.notifications.append(kwargs)
+        return True
+
+    monkeypatch.setattr(operator_webhook, "notify_operator_paid", fake_notify)
+
     for name, func in [
+        ("get_station", get_station),
         ("get_operator_payment_by_invoice", get_operator_payment_by_invoice),
         ("get_operator_monobank_token_encrypted", get_operator_monobank_token_encrypted),
         ("set_operator_payment_status", set_operator_payment_status),
@@ -428,3 +443,41 @@ async def test_paid_invoice_without_session_does_not_record_income(billing, bank
     assert response.status_code == 200
     assert billing.payments[(OPERATOR_A, INVOICE)]["status"] == "success"
     assert billing.ledger == []
+
+
+async def test_operator_is_notified_after_successful_payment(paid_setup, bank):
+    """
+    Пуш «Оплачено, увімкніть станцію» — останній крок після проведення
+    оплати, з усім, що потрібно оператору, щоб діяти.
+    """
+    bank.reply = {"status": "success", "amount": 20000}
+
+    await _post(OPERATOR_A, {"invoiceId": INVOICE})
+
+    assert len(paid_setup.notifications) == 1
+    push = paid_setup.notifications[0]
+    assert push["telegram_id"] == 501          # telegram_id оператора A
+    assert push["session_id"] == 77
+    assert push["amount_uah"] == Decimal("200.00")
+    assert push["station_name"] == "Готель Едем"
+
+
+async def test_failed_notification_does_not_undo_the_payment(paid_setup, bank,
+                                                             monkeypatch):
+    """
+    Гроші вже прийшли й дохід проведено. Якщо Telegram недоступний, webhook
+    усе одно має відповісти 200 — інакше банк повторить уже оброблений платіж.
+    """
+    async def broken_notify(**kwargs):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(operator_webhook, "notify_operator_paid", broken_notify)
+    bank.reply = {"status": "success", "amount": 20000}
+
+    response = await _post(OPERATOR_A, {"invoiceId": INVOICE})
+
+    assert response.status_code == 200, (
+        "Збій сповіщення дав не-2xx — банк ретраїтиме вже оброблений платіж"
+    )
+    assert paid_setup.payments[(OPERATOR_A, INVOICE)]["status"] == "success"
+    assert len(paid_setup.ledger) == 2

@@ -56,6 +56,13 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
   підмінити значення в `.env` не можна: старі записи стануть нечитаними, і
   жоден оператор не зможе приймати оплати.
 
+Також потрібен **`PUBLIC_BASE_URL`** — публічна адреса сервісу, з якої банк
+будує посилання повернення водія після оплати і адресу webhook. Має бути
+доступна ззовні (не `localhost`); якщо не задано, береться `EMSP_BASE_URL`.
+
+Сторінка оплати водія — `GET /s/{qr_slug}`, чек — `/s/{qr_slug}/receipt/{id}`.
+Водій не реєструється: єдиний ключ доступу це `qr_slug` під QR-кодом.
+
 ## Локальна розробка проти моків
 
 Зовнішні системи, без яких флоу не протестувати:
@@ -80,7 +87,9 @@ uvicorn mock_monobank:app --port 8081      # еквайринг Monobank
 | `app/database/connection.py` | пул, базові таблиці, `update_user_balance()` |
 | `app/database/operators_repo.py` | білінг операторів (мультитенантний) |
 | `app/services/monobank_acquiring.py` | клієнт Monobank Acquiring |
+| `app/api/driver_qr.py` | сторінка оплати водія `/s/{qr_slug}` + чек |
 | `app/api/` | HTTP-ендпоінти: OCPI, платежі, webhook операторів |
+| `templates/driver/` | Jinja2-шаблони сторінок водія (без зовнішніх ресурсів) |
 | `migrations/versions/` | Alembic — **джерело правди** для схеми |
 
 **Схема БД живе у двох місцях:** Alembic-міграції та idempotent-блоки

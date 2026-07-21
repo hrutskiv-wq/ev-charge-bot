@@ -1,0 +1,62 @@
+{% extends "driver/base.html" %}
+{% block title %}Чек · {{ station.name }}{% endblock %}
+
+{% block content %}
+<div class="card">
+  {% if state == 'paid' %}
+    <div class="msg ok" style="margin:0 0 14px">
+      Оплату отримано.
+      {% if manual %}Оператор отримав сповіщення й зараз увімкне станцію.{% endif %}
+    </div>
+  {% elif state == 'charging' %}
+    <div class="msg ok" style="margin:0 0 14px">Станція увімкнена — зарядка триває.</div>
+  {% elif state == 'completed' %}
+    <div class="msg ok" style="margin:0 0 14px">Сесію завершено. Дякуємо!</div>
+  {% elif state == 'pending' %}
+    <div class="msg warn" style="margin:0 0 14px">
+      Оплата ще не підтверджена банком. Сторінка оновиться сама.
+    </div>
+  {% else %}
+    <div class="msg err" style="margin:0 0 14px">
+      Оплата не пройшла. Кошти, якщо були списані, повернуться автоматично.
+    </div>
+  {% endif %}
+
+  <p class="big">{{ amount }} ₴</p>
+  <p class="center">{{ station.name }}</p>
+</div>
+
+<div class="card">
+  <div class="row" style="border-top:0">
+    <span>Сесія</span>
+    <span>#{{ session.id }}</span>
+  </div>
+  <div class="row">
+    <span>Початок</span>
+    <span>{{ started_at }}</span>
+  </div>
+  {% if session.kwh %}
+  <div class="row">
+    <span>Спожито</span>
+    <span>{{ kwh }} кВт·год</span>
+  </div>
+  {% endif %}
+  {% if ended_at %}
+  <div class="row">
+    <span>Завершено</span>
+    <span>{{ ended_at }}</span>
+  </div>
+  {% endif %}
+</div>
+
+<p class="center">
+  Збережіть це посилання — це ваш чек.
+  {% if state in ('pending', 'paid') %}Сторінка оновлюється автоматично.{% endif %}
+</p>
+
+{% if state in ('pending', 'paid') %}
+{# Проміжні стани оновлюємо перезавантаженням сторінки, а не JS-полінгом:
+   сторінка має працювати навіть якщо скрипти вимкнені або мережа ледве жива. #}
+<meta http-equiv="refresh" content="15">
+{% endif %}
+{% endblock %}

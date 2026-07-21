@@ -1,0 +1,97 @@
+{# Базовий шаблон сторінок водія. Мобільний-перший і НАВМИСНО без зовнішніх
+   ресурсів: водій стоїть біля станції, часто на слабкому мобільному
+   інтернеті, іноді в підземному паркінгу. Кожен зовнішній шрифт чи CDN —
+   це ще один спосіб не побачити кнопку «Оплатити». Стилі інлайном з тієї ж
+   причини: сторінка має бути одним запитом. #}
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{% block title %}eVolt UA{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --text: #10151c;
+    --muted: #5b6672;
+    --line: #dfe4ea;
+    --accent: #14864f;
+    --accent-press: #0f6b3f;
+    --warn: #b3541e;
+    --err: #b32020;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11161c; --card: #1a212a; --text: #eef2f6; --muted: #9aa7b4;
+      --line: #2b3641; --accent: #2ea86a; --accent-press: #268a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    /* безпечні зони iPhone: кнопка не має ховатись під домашню смугу */
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px; margin-bottom: 14px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .addr { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+  .row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 9px 0; border-top: 1px solid var(--line);
+  }
+  .row span:first-child { color: var(--muted); font-size: 14px; }
+  .row span:last-child { font-weight: 600; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 13px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(20,134,79,.13); color: var(--accent); }
+  .badge.off { background: rgba(179,84,30,.13); color: var(--warn); }
+  .amounts { display: flex; gap: 8px; margin: 14px 0; }
+  .amounts label { flex: 1; }
+  .amounts input { position: absolute; opacity: 0; pointer-events: none; }
+  .amounts span {
+    display: block; text-align: center; padding: 13px 0;
+    border: 1px solid var(--line); border-radius: 11px; font-weight: 600;
+    cursor: pointer; background: var(--card);
+  }
+  .amounts input:checked + span {
+    border-color: var(--accent); color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .custom { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .custom input[type=number] {
+    flex: 1; padding: 13px; font-size: 16px; /* 16px — щоб iOS не зумив форму */
+    border: 1px solid var(--line); border-radius: 11px;
+    background: var(--card); color: var(--text);
+  }
+  button {
+    width: 100%; padding: 16px; font-size: 17px; font-weight: 700;
+    color: #fff; background: var(--accent); border: 0; border-radius: 12px;
+    cursor: pointer;
+  }
+  button:active { background: var(--accent-press); }
+  button[disabled] { opacity: .5; cursor: not-allowed; }
+  .msg { padding: 13px; border-radius: 11px; margin-bottom: 14px; font-size: 15px; }
+  .msg.err { background: rgba(179,32,32,.12); color: var(--err); }
+  .msg.warn { background: rgba(179,84,30,.12); color: var(--warn); }
+  .msg.ok { background: rgba(20,134,79,.13); color: var(--accent); }
+  .foot { text-align: center; color: var(--muted); font-size: 13px; margin-top: 18px; }
+  .big { font-size: 30px; font-weight: 700; text-align: center; margin: 6px 0 2px; }
+  .center { text-align: center; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  {% block content %}{% endblock %}
+  <p class="foot">eVolt UA · білінг для зарядних станцій</p>
+</div>
+</body>
+</html>
