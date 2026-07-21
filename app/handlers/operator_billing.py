@@ -224,12 +224,27 @@ async def cabinet_connect_token(callback: CallbackQuery, state: FSMContext):
     )
 
 
+async def _try_delete_token_message(message: Message, operator_id: int = None):
+    """
+    Прибирає повідомлення з відкритим токеном з історії чату. Викликається
+    з обох гілок save_monobank_token() — і успішної, і аномальної (не
+    приватний чат) — токен не можна лишати видимим в жодному разі.
+    """
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception as e:
+        logger.info("Не вдалося видалити повідомлення з токеном оператора %s: %s",
+                    operator_id, e)
+
+
 @router.message(StateFilter(MonobankConnect.waiting_for_token), _is_free_text)
 async def save_monobank_token(message: Message, state: FSMContext):
     await state.clear()
     if message.chat.type != "private":
-        # Захисний дубль поверх перевірки при вході в стан — токен саме той
-        # секрет, де варто не покладатись лише на неї одну.
+        # Захисний дубль поверх перевірки при вході в стан — кнопка вже мала
+        # відсіяти групові чати, це аномальний шлях. Але якщо сюди все ж
+        # дійшли, повідомлення з токеном так само не можна лишати в групі.
+        await _try_delete_token_message(message)
         await message.answer("Токен приймається лише в приватному чаті з ботом.")
         return
 
@@ -240,13 +255,8 @@ async def save_monobank_token(message: Message, state: FSMContext):
         encrypted = encrypt_secret(token)
         await repo.set_operator_monobank_token(operator["id"], encrypted)
 
-    try:
-        # Прибираємо повідомлення з відкритим токеном з історії чату
-        # незалежно від того, чи вдалось його зберегти вище.
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except Exception as e:
-        logger.info("Не вдалося видалити повідомлення з токеном оператора %s: %s",
-                    operator["id"] if operator else None, e)
+    # Незалежно від того, чи вдалось зберегти токен вище.
+    await _try_delete_token_message(message, operator["id"] if operator else None)
 
     if operator is None:
         await message.answer("Спершу зареєструйтесь: /operator")

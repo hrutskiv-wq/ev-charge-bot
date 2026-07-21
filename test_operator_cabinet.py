@@ -33,6 +33,7 @@ class FakeUser:
     def __init__(self, id, username=None):
         self.id = id
         self.username = username
+        self.first_name = "Тест"  # потрібен cmd_start() з app/handlers/user.py
 
 
 class FakeChat:
@@ -467,7 +468,9 @@ async def test_save_monobank_token_rejected_outside_private_chat(rs, fake_bot, e
     await ob.save_monobank_token(message, state)
 
     assert OPERATOR_A not in rs.tokens
-    assert fake_bot.deleted == []
+    # Аномальний шлях (кнопка мала відсіяти групу раніше), але якщо токен
+    # усе ж прийшов у групу — повідомлення так само мусить бути видалене.
+    assert fake_bot.deleted == [(message.chat.id, message.message_id)]
     assert "приватному чаті" in message.sent[0][0]
 
 
@@ -718,7 +721,37 @@ async def test_operator_b_cannot_edit_tariff_of_operator_a_station(rs):
     assert rs.stations[10]["tariff_uah_kwh"] == 12.5
 
 
+async def test_start_command_clears_station_wizard_state(rs, monkeypatch):
+    """
+    Регресія на вибір порядку роутерів (app/main.py): /start посеред майстра
+    станції має вивести користувача з FSM. Якби cmd_start не чистив стан,
+    наступне вільне повідомлення користувача (напр. звернення до ШІ-чату)
+    після /start і надалі ловилось би хендлером цього кроку майстра як
+    "адреса станції", а не дійшло б до свого справжнього хендлера.
+    """
+    from app.handlers import user as user_handlers
+
+    async def fake_get_user_data(user_id):
+        return 0.0, 0.0
+
+    monkeypatch.setattr(user_handlers, "get_user_data", fake_get_user_data)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.StationWizard.waiting_for_name)
+    message = FakeMessage("/start")
+
+    await user_handlers.cmd_start(message, state)
+
+    assert state.state is None
+
+
 async def test_operator_b_stations_list_excludes_operator_a(rs):
+    """
+    Список станцій показує назви в кнопках reply_markup, а не в тексті
+    повідомлення — тому перевіряти треба саме клавіатуру, інакше assert
+    "Станція Б" not in text проходить завжди незалежно від того, що
+    насправді потрапило в список.
+    """
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
     rs.add_operator(id=OPERATOR_B, telegram_id=TELEGRAM_B)
     rs.add_station(id=10, operator_id=OPERATOR_A, name="Станція А")
@@ -727,8 +760,11 @@ async def test_operator_b_stations_list_excludes_operator_a(rs):
 
     await ob.cabinet_station_list(callback)
 
-    text = callback.message.edited[0][0]
-    assert "Станція Б" not in text  # список показує кнопки, не текст із назвами — перевіряємо іншим шляхом
+    _text, kwargs = callback.message.edited[0]
+    button_texts = [button.text for row in kwargs["reply_markup"].inline_keyboard for button in row]
+
+    assert any("Станція Б" in t for t in button_texts)
+    assert not any("Станція А" in t for t in button_texts)
 
 
 # ---------------------------------------------------------------------------
