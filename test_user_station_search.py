@@ -108,6 +108,42 @@ def test_ocm_station_card_keeps_legacy_fields_and_adds_badge_prefix():
     assert "OCM-999" in text
 
 
+# ---------------------------------------------------------------------------
+# Екранування HTML у полях, які ввів оператор (рев'ю Промпту 4c)
+# ---------------------------------------------------------------------------
+
+def test_operator_station_card_escapes_html_in_name_and_connector():
+    """
+    Назву й конектор станції вводить оператор вільним текстом у майстрі.
+    Без html.escape() '<'/'>' ламають парсинг HTML (Telegram узагалі не
+    надсилає повідомлення), а довільний тег міг би потрапити в публічну
+    видачу водіям сирим.
+    """
+    malicious = {
+        **OPERATOR_STATION,
+        "name": "Готель <script>&Едем",
+        "connector_type": "Type 2 <b>hack</b>",
+    }
+
+    text = user_handlers._format_operator_station_card(1, malicious)
+
+    assert "<script>" not in text
+    assert "<b>hack</b>" not in text
+    assert "&lt;script&gt;" in text
+    assert "&amp;Едем" in text
+    assert "Type 2 &lt;b&gt;hack&lt;/b&gt;" in text
+
+
+def test_operator_station_card_neutralizes_link_injection_in_name():
+    """Тег <a href=...> у назві не повинен потрапити в HTML сирим — водій не має бачити чужого посилання."""
+    malicious = {**OPERATOR_STATION, "name": '<a href="https://evil.example">Клікни тут</a>'}
+
+    text = user_handlers._format_operator_station_card(1, malicious)
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;https://evil.example&quot;&gt;" in text
+
+
 def test_ocm_station_card_without_badge_when_nothing_to_classify_from():
     unknown = {**OCM_STATION, "power_kw": None, "connector_type": None}
     text = user_handlers._format_ocm_station_card(1, unknown)

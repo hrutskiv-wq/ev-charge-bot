@@ -35,6 +35,7 @@ callback_data (opm:/opst:/oprev:/opcsv:) свідомо НЕ несуть operat
 формат callback_data навмисно не вважається секретом.
 """
 import csv
+import html
 import io
 import logging
 import os
@@ -111,7 +112,10 @@ async def _send_cabinet_home(target, operator, edit: bool = False):
     """target — Message (нове повідомлення) або Message з callback (редагування)."""
     has_token = bool(await repo.get_operator_monobank_token_encrypted(operator["id"]))
     note = _OPERATOR_STATUS_NOTES.get(operator["status"])
-    text = f"🏷️ <b>Кабінет оператора «{operator['name']}»</b>"
+    # Назва оператора — вільний текст із онбордингу (onboarding_name), тому
+    # html.escape() тут обов'язковий: без нього назва з '<'/'&' ламає
+    # парсинг HTML, і кабінет узагалі не відкриється.
+    text = f"🏷️ <b>Кабінет оператора «{html.escape(operator['name'])}»</b>"
     if note:
         text += f"\n{note}"
     kb = get_cabinet_menu(has_token)
@@ -150,13 +154,18 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
     chat_id = os.getenv("LOGS_CHAT_ID")
     if not chat_id:
         return
+    # name/phone — вільний текст із онбордингу, username теоретично теж
+    # контрольований користувачем. Без html.escape() тут найгірший з усіх
+    # випадків: непарсибельний HTML -> bot.send_message падає з винятком ->
+    # заявка оператора "губиться" (адмін ніколи не дізнається про неї, хоча
+    # рядок в operators уже записано).
     username = f"@{from_user.username}" if from_user.username else str(from_user.id)
     text = (
         "🆕 <b>Новий оператор на модерації</b>\n"
         f"ID: <code>{operator_id}</code>\n"
-        f"Назва: {name}\n"
-        f"Телефон: {phone}\n"
-        f"Telegram: {username} (id {from_user.id})\n\n"
+        f"Назва: {html.escape(name)}\n"
+        f"Телефон: {html.escape(phone)}\n"
+        f"Telegram: {html.escape(username)} (id {from_user.id})\n\n"
         "Активуйте кнопкою нижче, або вручну: "
         f"set_operator_status({operator_id}, 'active')"
     )
@@ -509,7 +518,7 @@ async def _send_new_station_qr(message: Message, station_name: str, qr_slug: str
     await message.answer_photo(
         BufferedInputFile(png, filename=f"qr_{qr_slug}.png"),
         caption=(
-            f"✅ Станцію «{station_name}» додано.\n\n"
+            f"✅ Станцію «{html.escape(station_name)}» додано.\n\n"
             f"QR: <code>{url}</code>\n\n"
             "Роздрукуйте цей код і розмістіть на станції — водій сканує його для оплати."
         ),
@@ -550,17 +559,18 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 
 def _station_detail_text(station) -> str:
+    """name/address/connector_type — вільний текст із майстра станції, тому html.escape()."""
     lines = [
-        f"🔌 <b>{station['name']}</b>",
+        f"🔌 <b>{html.escape(station['name'])}</b>",
         f"Статус: {_STATION_STATUS_LABELS.get(station['status'], station['status'])}",
         f"Тариф: {station['tariff_uah_kwh']} грн/кВт·год",
     ]
     if station.get("tariff_uah_start"):
         lines.append(f"Плата за старт: {station['tariff_uah_start']} грн")
     if station.get("address"):
-        lines.append(f"Адреса: {station['address']}")
+        lines.append(f"Адреса: {html.escape(station['address'])}")
     if station.get("connector_type"):
-        lines.append(f"Конектор: {station['connector_type']}")
+        lines.append(f"Конектор: {html.escape(station['connector_type'])}")
     lines.append(f"QR: <code>{PUBLIC_BASE_URL}/s/{station['qr_slug']}</code>")
     return "\n".join(lines)
 

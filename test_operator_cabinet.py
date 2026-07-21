@@ -331,6 +331,26 @@ async def test_registered_operator_sees_cabinet_home_instead_of_onboarding(rs):
     assert "Кабінет оператора" in message.sent[0][0]
 
 
+async def test_cabinet_home_escapes_link_injection_in_operator_name(rs):
+    """
+    Рев'ю Промпту 4c: назву оператора вводить сам оператор в онбордингу
+    (вільний текст). Тег <a href=...> не має потрапити в HTML сирим — інакше
+    кабінет узагалі не відкриється (Telegram відхилить непарсибельний HTML)
+    або, якщо парсер якимось чином це проковтне, показав би довільне
+    посилання під виглядом системного тексту.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active",
+                    name='<a href="https://evil.example">Готель Едем</a>')
+    message = FakeMessage("/operator")
+    state = FakeFSMContext()
+
+    await ob.cmd_operator_cabinet(message, state)
+
+    text = message.sent[0][0]
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;https://evil.example&quot;&gt;" in text
+
+
 async def test_pending_operator_sees_status_note(rs):
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
     message = FakeMessage("/operator")
@@ -421,6 +441,27 @@ async def test_onboarding_notifies_logs_chat_when_configured(rs, fake_bot, monke
     created_id = rs.operators_by_tid[TELEGRAM_A]["id"]
     button_data = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
     assert f"opadm:activate:{created_id}" in button_data
+
+
+async def test_onboarding_notification_escapes_html_in_name_so_the_push_is_not_lost(rs, fake_bot, monkeypatch):
+    """
+    Рев'ю Промпту 4c: без html.escape() назва з '<'/'&' ламає парсинг HTML,
+    і bot.send_message падає з винятком — заявка оператора "губиться", бо
+    рядок в operators уже записано, а адмін про нього ніколи не дізнається.
+    Тут FakeBot не імітує реальний Telegram-парсер, тому перевіряємо, що
+    сирий тег просто не потрапляє в текст (а не що send_message не впаде).
+    """
+    monkeypatch.setenv("LOGS_CHAT_ID", "-100999")
+    state = FakeFSMContext()
+    state.data["name"] = "Готель <b>Едем</b> & Ко"
+    await state.set_state(ob.OperatorOnboarding.waiting_for_phone)
+    message = FakeMessage("+380501234567")
+
+    await ob.onboarding_phone(message, state)
+
+    _chat_id, text, _kwargs = fake_bot.sent[0]
+    assert "<b>Едем</b>" not in text
+    assert "&lt;b&gt;Едем&lt;/b&gt; &amp; Ко" in text
 
 
 async def test_onboarding_skips_notification_silently_without_logs_chat_id(rs, fake_bot):
@@ -629,6 +670,22 @@ async def test_cabinet_connect_token_rejects_group_chat_before_setting_state(rs)
 # Майстер станції
 # ---------------------------------------------------------------------------
 
+async def test_new_station_qr_caption_escapes_html_in_station_name(rs, monkeypatch):
+    """
+    Рев'ю Промпту 4c: підпис під QR-фото рендериться з parse_mode="HTML",
+    а назву станції щойно ввів сам оператор — без екранування '<'/'&' ламає
+    парсинг, і Telegram узагалі не надішле фото з підписом.
+    """
+    monkeypatch.setattr(ob, "generate_station_qr_png", lambda url: b"\x89PNG\r\n\x1a\n")
+    message = FakeMessage()
+
+    await ob._send_new_station_qr(message, 'Станція <a href="https://evil.example">клік</a> & Ко', "slug1")
+
+    _photo, kwargs = message.photos[0]
+    caption = kwargs["caption"]
+    assert "<a href" not in caption
+    assert "&lt;a href=&quot;https://evil.example&quot;&gt;клік&lt;/a&gt; &amp; Ко" in caption
+
 async def test_full_station_wizard_with_shared_location_and_preset_connector(rs, monkeypatch):
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
     captured_urls = []
@@ -831,6 +888,29 @@ async def test_station_action_view_shows_detail(rs):
     await ob.station_action(callback, FakeFSMContext())
 
     assert "Станція А" in callback.message.edited[0][0]
+
+
+async def test_station_detail_escapes_html_in_name_address_and_connector(rs):
+    """
+    Рев'ю Промпту 4c: назва/адреса/конектор станції — вільний текст із
+    майстра. Символ '<' без екранування ламає парсинг HTML (картка взагалі
+    не відкриється), а сирий тег міг би зіпсувати вигляд кабінету.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A)
+    rs.add_station(
+        id=10, operator_id=OPERATOR_A,
+        name="Станція <script>alert(1)</script> & Ко",
+        address="вул. <b>Франка</b>, 1", connector_type="Type 2 <i>fast</i>",
+    )
+    callback = FakeCallback("opst:10:view")
+
+    await ob.station_action(callback, FakeFSMContext())
+
+    text = callback.message.edited[0][0]
+    assert "<script>" not in text and "<b>Франка</b>" not in text and "<i>fast</i>" not in text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; Ко" in text
+    assert "вул. &lt;b&gt;Франка&lt;/b&gt;, 1" in text
+    assert "Type 2 &lt;i&gt;fast&lt;/i&gt;" in text
 
 
 async def test_station_action_toggle_flips_status(rs):

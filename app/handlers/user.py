@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import html
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -149,17 +150,28 @@ def _merge_search_results(ocm_stations, operator_stations):
 
 
 def _format_operator_station_card(idx: int, station: dict) -> str:
-    """Картка станції оператора: бейдж, відстань, потужність/конектор, тариф і QR-посилання на оплату."""
+    """
+    Картка станції оператора: бейдж, відстань, потужність/конектор, тариф і
+    QR-посилання на оплату.
+
+    Назва станції й тип конектора — вільний текст, який оператор увів сам у
+    майстрі станції (app/handlers/operator_billing.py). Без html.escape()
+    символ '<' у назві ламає парсинг HTML і Telegram взагалі не надсилає
+    повідомлення (send message: can't parse entities), а водій замість
+    картки не бачить нічого. Гірше — сюди можна вставити довільний тег
+    (напр. <a href=...>) і показати його водіям, які нічого не підозрюють.
+    """
     badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
     prefix = f"{badge} " if badge else ""
+    name = html.escape(station["name"])
     lines = [
-        f"{prefix}<b>Станція #{idx}: {station['name']}</b>",
+        f"{prefix}<b>Станція #{idx}: {name}</b>",
         f"📍 Відстань: <b>{station['distance_km']:.2f} км</b>",
     ]
     if station.get("power_kw"):
         lines.append(f"⚙️ Потужність: {station['power_kw']} кВт")
     if station.get("connector_type"):
-        lines.append(f"🔌 Конектор: {station['connector_type']}")
+        lines.append(f"🔌 Конектор: {html.escape(station['connector_type'])}")
     lines.append(f"💰 Тариф: {station['tariff_uah_kwh']} грн/кВт·год")
     lines.append("💳 Оплата через QR:")
     lines.append(f"{PUBLIC_BASE_URL}/s/{station['qr_slug']}")
