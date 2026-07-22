@@ -148,6 +148,10 @@ TENANT_SCOPED_CALLS = [
     ("list_ledger", lambda op_id: repo.list_ledger(op_id), "operator_id"),
     ("list_ledger_since", lambda op_id: repo.list_ledger_since(op_id, SINCE), "operator_id"),
     ("get_ledger_summary", lambda op_id: repo.get_ledger_summary(op_id, SINCE), "operator_id"),
+    ("list_pending_payments_older_than", lambda op_id: repo.list_pending_payments_older_than(op_id, SINCE), "operator_id"),
+    ("list_success_payments_without_income", lambda op_id: repo.list_success_payments_without_income(op_id), "operator_id"),
+    ("list_success_payments_without_session", lambda op_id: repo.list_success_payments_without_session(op_id), "operator_id"),
+    ("list_stale_pending_sessions_without_payment", lambda op_id: repo.list_stale_pending_sessions_without_payment(op_id, SINCE), "operator_id"),
 ]
 
 _IDS = [c[0] for c in TENANT_SCOPED_CALLS]
