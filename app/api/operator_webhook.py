@@ -55,6 +55,120 @@ _FINAL_STATUS_MAP = {
 _QUIET_OK = Response(status_code=status.HTTP_200_OK)
 
 
+async def complete_paid_session(operator_id: int, payment: dict) -> str:
+    """
+    "Хвіст" платіжного ланцюга, коли payment['status'] уже 'success' у нашій
+    БД (байдуже, підтвердив webhook щойно чи звірка reconcile_operators.py
+    — Промпт 5): сесія -> paid, дохід через record_session_income (сам
+    ідемпотентний), пуш оператору. Винесено окремою функцією, щоб один і той
+    самий код відпрацьовував в обох місцях, а не дублювався.
+
+    Повертає 'credited' або 'no_session' (сесія до платежу не привʼязана —
+    нараховувати дохід нікуди, потрібен ручний розбір).
+    """
+    session = await repo.get_session_by_payment(operator_id, payment["id"])
+    if session is None:
+        logger.error(
+            "Оператор %s: платіж %s успішний, але до нього не привʼязана "
+            "сесія — дохід не проведено, потрібен ручний розбір",
+            operator_id, payment["id"],
+        )
+        return "no_session"
+
+    operator = await repo.get_operator(operator_id)
+    commission_pct = operator["commission_pct"] if operator else 0
+
+    await repo.set_session_status(operator_id, session["id"], "paid")
+    # record_session_income сам ідемпотентний (uq_ledger_session_income),
+    # тож навіть за гонки нарахування не задвоїться.
+    await repo.record_session_income(
+        operator_id, session["id"], payment["amount_uah"], commission_pct,
+    )
+
+    logger.info(
+        "💳 Оператор %s: платіж %s, сесія #%s -> paid, дохід проведено",
+        operator_id, payment["id"], session["id"],
+    )
+
+    # Пуш оператору «Оплачено, увімкніть станцію». Свідомо ОСТАННІМ кроком і
+    # без права зламати відповідь: гроші вже прийшли, сесія позначена
+    # оплаченою, дохід проведено. Недоступний Telegram не привід повертати
+    # помилку викликачу (webhook чи звірці) і провокувати повторну обробку
+    # вже проведеного платежу.
+    if operator and operator["telegram_id"]:
+        try:
+            station = await repo.get_station(operator_id, session["station_id"])
+            await notify_operator_paid(
+                telegram_id=operator["telegram_id"],
+                operator_id=operator_id,
+                session_id=session["id"],
+                station_name=station["name"] if station else "станція",
+                amount_uah=payment["amount_uah"],
+                driver_contact=session["driver_contact"],
+            )
+        except Exception as e:
+            logger.error("Оператор %s: збій сповіщення про сесію #%s: %s",
+                         operator_id, session["id"], e)
+
+    return "credited"
+
+
+async def apply_bank_status(operator_id: int, payment: dict, invoice: dict) -> str:
+    """
+    Єдина точка інтерпретації відповіді банку на конкретний платіж —
+    використовується і webhook'ом (нижче), і звіркою
+    (reconcile_operators.py, Промпт 5), щоб тіло банку трактувалось
+    ОДНАКОВО в обох місцях, а не двома трохи різними копіпастами.
+
+    Повертає один з: 'unknown_status' (проміжний стан банку — created/
+    processing/hold, нічого не робимо), 'status_updated' (фінальний
+    негативний статус записано), 'amount_mismatch' (банк каже "оплачено",
+    але не на ту суму — нарахування НЕ проведено), 'already_processed'
+    (платіж уже 'success' — гонка з іншим викликом), 'credited' /
+    'no_session' (див. complete_paid_session).
+    """
+    bank_status = (invoice.get("status") or "").strip()
+    mapped = _FINAL_STATUS_MAP.get(bank_status)
+    if mapped is None:
+        logger.info("Оператор %s: платіж %s ще в проміжному стані банку '%s'",
+                    operator_id, payment["id"], bank_status)
+        return "unknown_status"
+
+    payload_json = json.dumps(invoice, ensure_ascii=False)
+
+    if mapped != "success":
+        await repo.set_operator_payment_status(operator_id, payment["id"], mapped,
+                                               payload=payload_json)
+        logger.info("Оператор %s: платіж %s -> %s", operator_id, payment["id"], mapped)
+        return "status_updated"
+
+    # Сума з банку має збігатися з тією, на яку ми виставляли інвойс.
+    # Розбіжність означає, що щось пішло не так на боці банку або в наших
+    # даних — краще не нарахувати, ніж нарахувати не те.
+    expected_kopecks = uah_to_kopecks(payment["amount_uah"])
+    actual_kopecks = invoice.get("amount")
+    if actual_kopecks is not None and int(actual_kopecks) != expected_kopecks:
+        logger.error(
+            "Оператор %s: платіж %s оплачений на %s коп., а очікувалось %s коп. "
+            "— нарахування НЕ проведено, потрібен ручний розбір",
+            operator_id, payment["id"], actual_kopecks, expected_kopecks,
+        )
+        return "amount_mismatch"
+
+    # Умова `status <> 'success'` усередині UPDATE працює як мʼютекс: рівно
+    # один паралельний виклик (webhook або звірка) отримає True і проведе
+    # нарахування, решта побачать False і вийдуть.
+    became_success = await repo.set_operator_payment_status(
+        operator_id, payment["id"], "success", payload=payload_json,
+    )
+    if not became_success:
+        logger.info("Оператор %s: платіж %s уже проведений паралельно",
+                    operator_id, payment["id"])
+        return "already_processed"
+
+    return await complete_paid_session(operator_id, payment)
+
+
 @operator_webhook_router.post("/webhook/operator/{operator_id}")
 async def operator_invoice_webhook(operator_id: int, request: Request):
     try:
@@ -112,110 +226,14 @@ async def operator_invoice_webhook(operator_id: int, request: Request):
                      operator_id, invoice_id, e)
         return Response(status_code=status.HTTP_502_BAD_GATEWAY)
 
-    bank_status = (invoice.get("status") or "").strip()
-    mapped = _FINAL_STATUS_MAP.get(bank_status)
-    if mapped is None:
-        logger.info("Webhook оператора %s: інвойс %s ще в проміжному стані '%s'",
-                    operator_id, invoice_id, bank_status)
-        return _QUIET_OK
-
-    payload_json = json.dumps(invoice, ensure_ascii=False)
-
-    if mapped != "success":
-        await repo.set_operator_payment_status(operator_id, payment["id"], mapped,
-                                               payload=payload_json)
-        logger.info("Webhook оператора %s: інвойс %s -> %s", operator_id, invoice_id, mapped)
-        return _QUIET_OK
-
-    # 5. Сума з банку має збігатися з тією, на яку ми виставляли інвойс.
-    # Розбіжність означає, що щось пішло не так на боці банку або в наших
-    # даних — краще не нарахувати, ніж нарахувати не те.
-    expected_kopecks = uah_to_kopecks(payment["amount_uah"])
-    actual_kopecks = invoice.get("amount")
-    if actual_kopecks is not None and int(actual_kopecks) != expected_kopecks:
-        logger.error(
-            "Webhook оператора %s: інвойс %s оплачений на %s коп., а очікувалось "
-            "%s коп. — нарахування НЕ проведено, потрібен ручний розбір",
-            operator_id, invoice_id, actual_kopecks, expected_kopecks,
-        )
-        return _QUIET_OK
-
-    # 6. Позначаємо платіж успішним. Умова `status <> 'success'` усередині
-    # UPDATE працює як мʼютекс: рівно один паралельний webhook отримає True
-    # і проведе нарахування, решта побачать False і вийдуть.
-    #
-    # ВІДОМИЙ КОМПРОМІС MVP (свідомий, не баг): три наступні кроки —
-    # платіж -> 'success', сесія -> 'paid', проведення доходу — виконуються
-    # ПОСЛІДОВНО, кожен своїм зʼєднанням, а не в одній транзакції. Падіння
-    # процесу між ними лишає частковий стан: наприклад, платіж уже
-    # 'success', а дохід ще не проведений.
-    #
-    # Чому це прийнятно зараз:
-    #   * стан відновлюваний — кожен крок ідемпотентний (мʼютекс тут,
-    #     uq_ledger_session_income у журналі), тож повторний webhook від
-    #     Monobank доведе справу до кінця без задвоєння;
-    #   * гроші при цьому не губляться і не нараховуються двічі — у гіршому
-    #     разі дохід зʼявиться із затримкою;
-    #   * розбіжності, які webhook не добере (наприклад, банк більше не
-    #     ретраїть), знайде звірка `reconcile --operators` — Промпт 5.
-    #
-    # Чому не зробили одразу: record_session_income() відкриває власне
-    # зʼєднання, тож обгортання всіх трьох кроків однією транзакцією
-    # потребує протягування conn через увесь ланцюг репозиторію. Це варто
-    # зробити разом із Промптом 5, коли зʼявиться звірка і стане видно,
-    # які саме розбіжності реально трапляються.
-    became_success = await repo.set_operator_payment_status(
-        operator_id, payment["id"], "success", payload=payload_json,
-    )
-    if not became_success:
-        logger.info("Webhook оператора %s: інвойс %s уже проведений паралельно",
-                    operator_id, invoice_id)
-        return _QUIET_OK
-
-    session = await repo.get_session_by_payment(operator_id, payment["id"])
-    if session is None:
-        logger.error(
-            "Webhook оператора %s: платіж %s успішний, але до нього не привʼязана "
-            "сесія — дохід не проведено, потрібен ручний розбір",
-            operator_id, payment["id"],
-        )
-        return _QUIET_OK
-
-    operator = await repo.get_operator(operator_id)
-    commission_pct = operator["commission_pct"] if operator else 0
-
-    await repo.set_session_status(operator_id, session["id"], "paid")
-    # record_session_income сам ідемпотентний (uq_ledger_session_income),
-    # тож навіть за гонки нарахування не задвоїться.
-    await repo.record_session_income(
-        operator_id, session["id"], payment["amount_uah"], commission_pct,
-    )
-
-    logger.info(
-        "💳 Оператор %s: інвойс %s оплачено на %s грн, сесія #%s -> paid, дохід проведено",
-        operator_id, invoice_id, payment["amount_uah"], session["id"],
-    )
-
-    # Пуш оператору «Оплачено, увімкніть станцію». Свідомо ОСТАННІМ кроком і
-    # без права зламати відповідь: гроші вже прийшли, сесія позначена
-    # оплаченою, дохід проведено. Недоступний Telegram не привід повертати
-    # банку помилку і провокувати ретрай уже обробленого платежу.
-    if operator and operator["telegram_id"]:
-        try:
-            station = await repo.get_station(operator_id, session["station_id"])
-            await notify_operator_paid(
-                telegram_id=operator["telegram_id"],
-                operator_id=operator_id,
-                session_id=session["id"],
-                station_name=station["name"] if station else "станція",
-                amount_uah=payment["amount_uah"],
-                driver_contact=session["driver_contact"],
-            )
-        except Exception as e:
-            # notify_operator_paid і сам ковтає винятки, але страхуємось і
-            # тут: якщо звідси вилетить помилка, FastAPI віддасть 500, і
-            # Monobank почне ретраїти ВЖЕ ОБРОБЛЕНИЙ платіж.
-            logger.error("Оператор %s: збій сповіщення про сесію #%s: %s",
-                         operator_id, session["id"], e)
+    # 5. Уся інтерпретація відповіді банку (проміжний/фінальний статус, звірка
+    # суми, мʼютекс на 'success', сесія -> paid, дохід, пуш) — в одній
+    # спільній функції apply_bank_status(), яку викликає і звірка
+    # reconcile_operators.py (Промпт 5). Значення, яке вона повертає, тут не
+    # впливає на відповідь: webhook завжди тихо підтверджує (200), щоб
+    # Monobank не ретраїв уже оброблений або свідомо відкладений випадок —
+    # розбіжності, які webhook не добере (банк більше не ретраїть, процес
+    # впав між кроками), знайде звірка `reconcile_operators.py` (Промпт 5).
+    await apply_bank_status(operator_id, payment, invoice)
 
     return _QUIET_OK
