@@ -178,6 +178,31 @@ async def init_operator_tables():
             ADD CONSTRAINT operator_sessions_payment_id_fkey
             FOREIGN KEY (payment_id) REFERENCES operator_payments(id) ON DELETE SET NULL;
         """)
+
+        # 8. Поповнення kWh-гаманця водія через Monobank-еквайринг оператора
+        # (міграція 0012). Навмисно ОКРЕМА таблиця від operator_payments —
+        # причина в докстрінгу міграції 0012: звірка (reconcile_operators.py,
+        # Промпт 5) трактує будь-який 'success' operator_payments без сесії
+        # як розбіжність, а wallet topup сесії ніколи не має.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_topups (
+            id SERIAL PRIMARY KEY,
+            operator_id INTEGER NOT NULL REFERENCES operators(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            invoice_id VARCHAR(100) NOT NULL,
+            package VARCHAR(20) NOT NULL CHECK (package IN ('pack_50', 'pack_100')),
+            kwh NUMERIC(10, 2) NOT NULL CHECK (kwh > 0),
+            amount_uah NUMERIC(12, 2) NOT NULL CHECK (amount_uah >= 0),
+            status VARCHAR(20) NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'success', 'failed', 'expired', 'reversed')),
+            payload JSONB,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (operator_id, invoice_id)
+        );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_operator_created ON wallet_topups(operator_id, created_at DESC);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_user ON wallet_topups(user_id);")
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
 
@@ -594,6 +619,73 @@ async def get_session_by_payment(operator_id: int, payment_id: int, conn=None):
     pool = await get_db_pool()
     async with pool.acquire() as new_conn:
         return await new_conn.fetchrow(query, operator_id, payment_id)
+
+
+# ---------------------------------------------------------------------------
+# Поповнення kWh-гаманця водія (Monobank-еквайринг оператора №0)
+# ---------------------------------------------------------------------------
+
+_WALLET_TOPUP_FIELDS = (
+    "id, operator_id, user_id, invoice_id, package, kwh, amount_uah, status, "
+    "created_at, updated_at"
+)
+
+
+async def create_wallet_topup(operator_id: int, user_id: int, invoice_id: str,
+                              package: str, kwh, amount_uah, status: str = "pending"):
+    """
+    Реєструє поповнення гаманця водія, вже ПІСЛЯ того, як банк повернув
+    invoiceId (той самий порядок, що й create_operator_payment у
+    станційному флоу). Повертає id, або id вже наявного рядка, якщо цей
+    invoice_id для цього оператора вже записаний.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        topup_id = await conn.fetchval("""
+            INSERT INTO wallet_topups (operator_id, user_id, invoice_id, package, kwh, amount_uah, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (operator_id, invoice_id) DO NOTHING
+            RETURNING id
+        """, operator_id, user_id, invoice_id, package, kwh, amount_uah, status)
+        if topup_id is not None:
+            return topup_id
+        return await conn.fetchval("""
+            SELECT id FROM wallet_topups
+            WHERE operator_id = $1 AND invoice_id = $2
+        """, operator_id, invoice_id)
+
+
+async def get_wallet_topup_by_invoice(operator_id: int, invoice_id: str):
+    """Поповнення за invoice_id У МЕЖАХ оператора — той самий принцип, що й у платежів станцій."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_WALLET_TOPUP_FIELDS} FROM wallet_topups
+            WHERE operator_id = $1 AND invoice_id = $2
+        """, operator_id, invoice_id)
+
+
+async def set_wallet_topup_status(operator_id: int, topup_id: int, status: str,
+                                  payload: str = None, conn=None):
+    """
+    Оновлює статус поповнення. Умова `status <> $3` — той самий мʼютекс, що
+    в set_operator_payment_status: повторний webhook з тим самим статусом
+    не чіпає рядок і повертає False, викликач нараховує кВт·год лише один раз.
+    """
+    query = """
+        UPDATE wallet_topups
+        SET status = $3,
+            payload = COALESCE($4::jsonb, payload),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE operator_id = $1 AND id = $2 AND status <> $3
+    """
+    if conn is not None:
+        result = await conn.execute(query, operator_id, topup_id, status, payload)
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as new_conn:
+            result = await new_conn.execute(query, operator_id, topup_id, status, payload)
+    return result.endswith("1")
 
 
 # ---------------------------------------------------------------------------

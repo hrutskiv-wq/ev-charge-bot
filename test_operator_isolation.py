@@ -143,6 +143,9 @@ TENANT_SCOPED_CALLS = [
     ("set_operator_payment_status", lambda op_id: repo.set_operator_payment_status(op_id, 5, "success"), "operator_id"),
     ("attach_payment_to_session", lambda op_id: repo.attach_payment_to_session(op_id, 77, 5), "operator_id"),
     ("get_session_by_payment", lambda op_id: repo.get_session_by_payment(op_id, 5), "operator_id"),
+    ("create_wallet_topup", lambda op_id: repo.create_wallet_topup(op_id, 555, "inv-w1", "pack_50", 50.0, Decimal("750.00")), "insert"),
+    ("get_wallet_topup_by_invoice", lambda op_id: repo.get_wallet_topup_by_invoice(op_id, "inv-w1"), "operator_id"),
+    ("set_wallet_topup_status", lambda op_id: repo.set_wallet_topup_status(op_id, 5, "success"), "operator_id"),
     ("add_ledger_entry", lambda op_id: repo.add_ledger_entry(op_id, "adjustment", 1.0), "insert"),
     ("get_operator_balance", lambda op_id: repo.get_operator_balance(op_id), "operator_id"),
     ("list_ledger", lambda op_id: repo.list_ledger(op_id), "operator_id"),
@@ -673,6 +676,7 @@ _ROOT = Path(__file__).parent
 _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py",
     _ROOT / "migrations" / "versions" / "0011_operator_payments.py",
+    _ROOT / "migrations" / "versions" / "0012_wallet_topups.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -720,7 +724,7 @@ def test_migration_and_idempotent_bootstrap_declare_same_columns():
     repo_tables = _declared_columns(_REPO_FILE.read_text(encoding="utf-8"))
 
     expected = {"operators", "operator_stations", "operator_sessions",
-                "operator_payout_ledger", "operator_payments"}
+                "operator_payout_ledger", "operator_payments", "wallet_topups"}
     assert set(migration_tables) == expected
     assert set(repo_tables) == expected
 
@@ -782,7 +786,7 @@ def test_every_tenant_table_carries_operator_id():
     """Правило «кожна таблиця з operator_id» — перевіряємо саме на схемі."""
     tables = _declared_columns(_migrations_source())
     for table in ("operator_stations", "operator_sessions", "operator_payout_ledger",
-                  "operator_payments"):
+                  "operator_payments", "wallet_topups"):
         assert "operator_id" in tables[table], f"{table} без operator_id"
     # у самій таблиці операторів роль operator_id грає її ж первинний ключ
     assert "id" in tables["operators"]
