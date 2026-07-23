@@ -203,6 +203,15 @@ async def init_operator_tables():
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_operator_created ON wallet_topups(operator_id, created_at DESC);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_user ON wallet_topups(user_id);")
+
+        # 9. OCPP Central System (Промпт 3a, міграція 0013) — три нові поля
+        # на operator_stations. ocpp_auth_key_encrypted — секрет (Fernet,
+        # той самий ENCRYPTION_KEY), СВІДОМО не входить у _STATION_FIELDS
+        # нижче; ocpp_status/ocpp_last_seen_at — не секрети, входять.
+        await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_auth_key_encrypted TEXT;")
+        await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_status VARCHAR(20);")
+        await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_last_seen_at TIMESTAMP WITH TIME ZONE;")
+
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
 
@@ -301,7 +310,8 @@ async def list_operators():
 
 _STATION_FIELDS = (
     "id, operator_id, name, address, lat, lng, connector_type, power_kw, mode, "
-    "ocpp_charge_point_id, tariff_uah_kwh, tariff_uah_start, qr_slug, status, created_at"
+    "ocpp_charge_point_id, tariff_uah_kwh, tariff_uah_start, qr_slug, status, created_at, "
+    "ocpp_status, ocpp_last_seen_at"
 )
 
 
@@ -421,6 +431,61 @@ async def set_station_status(operator_id: int, station_id: int, status: str):
     async with pool.acquire() as conn:
         result = await conn.execute("""
             UPDATE operator_stations SET status = $3
+            WHERE id = $2 AND operator_id = $1
+        """, operator_id, station_id, status)
+        return result.endswith("1")
+
+
+# ---------------------------------------------------------------------------
+# OCPP Central System (Промпт 3a, app/api/ocpp_ws.py)
+# ---------------------------------------------------------------------------
+
+async def get_station_ocpp_auth_key_encrypted(operator_id: int, station_id: int):
+    """
+    Окрема функція саме тому, що це секрет (той самий принцип, що й
+    get_operator_monobank_token_encrypted) — щоб дістати спільний ключ
+    Basic Auth OCPP-станції, треба свідомо викликати цю функцію, а не
+    отримати його «безкоштовно» разом із загальним SELECT станції
+    (_STATION_FIELDS цю колонку навмисно не містить). Результат НЕ логувати.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT ocpp_auth_key_encrypted FROM operator_stations WHERE id = $2 AND operator_id = $1",
+            operator_id, station_id,
+        )
+
+
+async def set_station_ocpp_auth_key(operator_id: int, station_id: int, auth_key_encrypted: str):
+    """
+    Зберігає ВЖЕ зашифрований (Fernet) спільний ключ Basic Auth станції.
+    Шифрування робиться шаром вище (app/core/crypto.py) — репозиторій
+    навмисно не бачить відкритого ключа, той самий патерн, що й
+    set_operator_monobank_token().
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE operator_stations SET ocpp_auth_key_encrypted = $3
+            WHERE id = $2 AND operator_id = $1
+        """, operator_id, station_id, auth_key_encrypted)
+        return result.endswith("1")
+
+
+async def update_station_ocpp_state(operator_id: int, station_id: int, status: str = None):
+    """
+    Фіксує "станція жива": ocpp_last_seen_at оновлюється на КОЖНЕ прийняте
+    OCPP-повідомлення (BootNotification/Heartbeat/StatusNotification),
+    ocpp_status — лише коли він відомий (тільки StatusNotification передає
+    status; Boot/Heartbeat викликають цю ж функцію без status=None і
+    COALESCE лишає попереднє значення недоторканим).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE operator_stations
+            SET ocpp_last_seen_at = CURRENT_TIMESTAMP,
+                ocpp_status = COALESCE($3, ocpp_status)
             WHERE id = $2 AND operator_id = $1
         """, operator_id, station_id, status)
         return result.endswith("1")
