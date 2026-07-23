@@ -131,6 +131,9 @@ TENANT_SCOPED_CALLS = [
     ("get_station", lambda op_id: repo.get_station(op_id, 10), "operator_id"),
     ("update_station_tariff", lambda op_id: repo.update_station_tariff(op_id, 10, 12.5), "operator_id"),
     ("set_station_status", lambda op_id: repo.set_station_status(op_id, 10, "offline"), "operator_id"),
+    ("get_station_ocpp_auth_key_encrypted", lambda op_id: repo.get_station_ocpp_auth_key_encrypted(op_id, 10), "operator_id"),
+    ("set_station_ocpp_auth_key", lambda op_id: repo.set_station_ocpp_auth_key(op_id, 10, "enc"), "operator_id"),
+    ("update_station_ocpp_state", lambda op_id: repo.update_station_ocpp_state(op_id, 10, "Available"), "operator_id"),
     ("create_session", lambda op_id: repo.create_session(op_id, 10), "operator_id"),
     ("get_session", lambda op_id: repo.get_session(op_id, 77), "operator_id"),
     ("list_sessions", lambda op_id: repo.list_sessions(op_id), "operator_id"),
@@ -312,6 +315,35 @@ async def test_dedicated_token_getter_is_scoped_to_one_operator(fake_conn):
     assert "monobank_token_encrypted" in query
     assert "operator_id = $1" in query or "WHERE id = $1" in query
     assert args == (OPERATOR_A,)
+
+
+@pytest.mark.parametrize("call", [
+    lambda: repo.get_station(OPERATOR_A, 10),
+    lambda: repo.list_stations(OPERATOR_A),
+    lambda: repo.get_station_by_qr_slug("abc123"),
+    lambda: repo.get_station_by_ocpp_charge_point_id("CP-001"),
+    lambda: repo.list_public_stations_near(49.84, 24.03, radius_km=25),
+])
+async def test_regular_station_selects_never_return_the_ocpp_auth_key(call, fake_conn):
+    """
+    Той самий принцип, що вище для monobank_token_encrypted, тепер для
+    ocpp_auth_key_encrypted (Промпт 3a): _STATION_FIELDS свідомо не містить
+    цю колонку. list_public_stations_near і get_station_by_ocpp_charge_
+    point_id особливо критичні — обидва публічні винятки, водій/станція тут
+    не автентифіковані взагалі.
+    """
+    await call()
+    query, _args = _single_call(fake_conn)
+    assert "ocpp_auth_key_encrypted" not in query
+    assert "SELECT *" not in query
+
+
+async def test_dedicated_ocpp_auth_key_getter_is_scoped_to_one_operator(fake_conn):
+    await repo.get_station_ocpp_auth_key_encrypted(OPERATOR_A, 10)
+    query, args = _single_call(fake_conn)
+    assert "ocpp_auth_key_encrypted" in query
+    assert "operator_id = $1" in query
+    assert args == (OPERATOR_A, 10)
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +709,7 @@ _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0010_white_label_tenants.py",
     _ROOT / "migrations" / "versions" / "0011_operator_payments.py",
     _ROOT / "migrations" / "versions" / "0012_wallet_topups.py",
+    _ROOT / "migrations" / "versions" / "0013_ocpp_station_fields.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -689,11 +722,23 @@ _TABLE_RE = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\s*\);", re.D
 # разом із WHERE — інакше часткові унікальні індекси (uq_ledger_session_income)
 # пройшли б повз звірку, а саме вони й тримають ідемпотентність.
 _INDEX_RE = re.compile(r"CREATE (?:UNIQUE )?INDEX IF NOT EXISTS .+?;")
+# Колонки, додані вже ПІСЛЯ початкового CREATE TABLE (0010), через
+# ALTER TABLE ADD COLUMN IF NOT EXISTS — 0013 (OCPP, Промпт 3a) саме такий
+# випадок: operator_stations уже існує, тому нові поля йдуть ALTER-ом, а не
+# переписуванням CREATE TABLE 0010. _TABLE_RE вище такі рядки не бачить
+# взагалі, тому для НИХ потрібна окрема звірка — інакше та сама розбіжність
+# "є в бутстрапі, немає в міграції" (урок 'refund', PROJECT_CONTEXT.md)
+# могла б повторитись і лишитись непоміченою.
+_ALTER_COLUMN_RE = re.compile(r"ALTER TABLE \w+ ADD COLUMN IF NOT EXISTS .+?;")
 _NOT_A_COLUMN = {"unique", "foreign", "primary", "check", "constraint", "references"}
 
 
 def _declared_indexes(source: str):
     return set(_INDEX_RE.findall(" ".join(source.split())))
+
+
+def _declared_alter_columns(source: str):
+    return set(_ALTER_COLUMN_RE.findall(" ".join(source.split())))
 
 
 def _declared_columns(source: str):
@@ -741,6 +786,19 @@ def test_migration_and_idempotent_bootstrap_declare_same_indexes():
     migration_indexes = _declared_indexes(_migrations_source())
     repo_indexes = _declared_indexes(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_indexes == repo_indexes
+
+
+def test_migration_and_idempotent_bootstrap_declare_same_altered_columns():
+    """
+    Той самий контроль, що й test_migration_and_idempotent_bootstrap_
+    declare_same_columns(), але для колонок, доданих через ALTER TABLE
+    ADD COLUMN IF NOT EXISTS (0013 — три нові поля OCPP на operator_
+    stations), а не переписуванням CREATE TABLE.
+    """
+    migration_altered = _declared_alter_columns(_migrations_source())
+    repo_altered = _declared_alter_columns(_REPO_FILE.read_text(encoding="utf-8"))
+    assert migration_altered == repo_altered
+    assert len(migration_altered) == 3, "Очікувались рівно 3 нові поля OCPP (Промпт 3a)"
 
 
 def test_idempotency_is_guaranteed_by_partial_unique_indexes():
