@@ -24,6 +24,7 @@ from app.handlers.charge import router as charge_router
 from app.handlers.operator_billing import router as operator_billing_router
 from app.api.payments import payments_router
 from app.api.operator_webhook import operator_webhook_router
+from app.api.wallet_webhook import wallet_webhook_router
 from app.api.driver_qr import driver_router
 from app.core.crypto import warn_if_key_missing
 from app.database.ocpi_repo import init_ocpi_tables
@@ -104,6 +105,7 @@ app.add_middleware(
 app.include_router(api_cdr_router)
 app.include_router(payments_router)
 app.include_router(operator_webhook_router)
+app.include_router(wallet_webhook_router)
 app.include_router(driver_router)
 
 # Реєстрація роутерів aiogram (Telegram-апдейти).

@@ -3,6 +3,7 @@ import json
 import asyncio
 import html
 import logging
+from decimal import Decimal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Router, types, F
@@ -11,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from google.genai import types as genai_types
 
-from app.core.loader import bot, ai_client 
+from app.core.loader import bot, ai_client
 
 from app.keyboards.reply import (
     get_main_menu, get_charge_menu, get_tariffs_keyboard,
@@ -24,6 +25,8 @@ from app.database.connection import (
     get_station_by_id, set_user_discount
 )
 from app.database import operators_repo as op_repo
+from app.core.crypto import EncryptionKeyMissing, decrypt_secret
+from app.services.monobank_acquiring import MonobankError, create_invoice
 from app.services.ocm_service import find_three_nearest_stations
 from app.services.station_speed import classify_station_speed
 
@@ -36,6 +39,33 @@ PUBLIC_BASE_URL = (
 # Радіус пошуку станцій White-Label операторів навколо водія (Промпт 4c).
 # OCM обмежений через свій API-параметр distance, тут — свій радіус.
 OPERATOR_SEARCH_RADIUS_KM = 30
+
+# --- Купівля kWh-пакетів (buy-side гаманця) через Monobank-еквайринг ---
+#
+# Оператор, чиїм мерчант-токеном виставляється інвойс за пакет — той самий
+# механізм, що й у станційному QR-флоу (app/api/driver_qr.py), лише гроші
+# йдуть не на станцію, а прямо на поповнення kWh-гаманця водія. id береться
+# з env, а не хардкодиться: конкретний рядок operators, що є "оператором №0"
+# (пілот eVolt на собі), відомий лише на розгорнутій базі.
+WALLET_OPERATOR_ID = int(os.getenv("WALLET_OPERATOR_ID") or 0)
+
+# Тестовий Telegram Payments флоу (send_invoice/successful_payment) лишається
+# в коді, але вимкнений за замовчуванням — тепер купівля пакетів іде через
+# живий Monobank-еквайринг. Вмикається лише явно, якщо колись знадобиться
+# повернутись до нього.
+TELEGRAM_PAYMENTS_ENABLED = os.getenv("TELEGRAM_PAYMENTS_ENABLED", "0") == "1"
+
+# Ключі словника — це callback_data кнопок (app/keyboards/reply.py::
+# get_tariffs_keyboard). "code" — канонічне ім'я пакета для БД/банку
+# (wallet_topups.package має CHECK IN ('pack_50', 'pack_100') — навмисно
+# НЕ прив'язане до конкретного рядка callback_data, щоб зміна тексту чи
+# callback_data кнопки в майбутньому не вимагала міграції схеми).
+WALLET_PACKAGES = {
+    "buy_pack_50": {"code": "pack_50", "kwh": 50.0, "amount_uah": Decimal("750.00"),
+                    "title": "Пакет 50 кВт·год"},
+    "buy_pack_100": {"code": "pack_100", "kwh": 100.0, "amount_uah": Decimal("1350.00"),
+                     "title": "Пакет 100 кВт·год (знижка 10%)"},
+}
 
 router = Router()
 
@@ -309,15 +339,15 @@ async def process_voucher_click(message: types.Message, state: FSMContext):
     )
     await state.set_state(BotStates.waiting_for_code)
 
-@router.callback_query(lambda c: c.data.startswith('buy_pack_') or c.data == 'activate_night', StateFilter("*"))
-async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
-    await state.clear()
-    action = callback_query.data
-    chat_id = callback_query.message.chat.id
+async def _send_telegram_invoice(chat_id: int, package: str):
+    """
+    Старий тестовий флоу купівлі пакета через Telegram Payments — лишається
+    лише за TELEGRAM_PAYMENTS_ENABLED (за замовчуванням вимкнено, див.
+    process_successful_payment нижче). Поведінка не змінена.
+    """
     payment_token = os.getenv("PAYMENT_PROVIDER_TOKEN")
-
-    if action == "buy_pack_50":
+    pkg = WALLET_PACKAGES[package]
+    if package == "buy_pack_50":
         await bot.send_invoice(
             chat_id=chat_id,
             title="🔋 Пакет 50 кВт·год",
@@ -327,7 +357,7 @@ async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FS
             currency="UAH",
             prices=[types.LabeledPrice(label="Пакет 50 кВт·год", amount=75000)]
         )
-    elif action == "buy_pack_100":
+    else:
         await bot.send_invoice(
             chat_id=chat_id,
             title="🔥 Пакет 100 кВт·год",
@@ -337,6 +367,95 @@ async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FS
             currency="UAH",
             prices=[types.LabeledPrice(label="Пакет 100 кВт·год", amount=135000)]
         )
+
+
+async def _start_wallet_topup(chat_id: int, user_id: int, package: str):
+    """
+    Реальна купівля пакета: інвойс Monobank токеном оператора №0
+    (WALLET_OPERATOR_ID), той самий еквайринг, що вже живий у станційному
+    QR-флої (app/api/driver_qr.py). Нарахування kWh відбудеться пізніше,
+    у webhook (app/api/wallet_webhook.py) — після того, як банк підтвердить
+    оплату, а не з цього хендлера.
+    """
+    pkg = WALLET_PACKAGES[package]
+
+    if WALLET_OPERATOR_ID <= 0:
+        logging.error("Поповнення гаманця: WALLET_OPERATOR_ID не налаштований")
+        await bot.send_message(chat_id, "⚠️ Поповнення тимчасово недоступне. Спробуйте пізніше.")
+        return
+
+    operator = await op_repo.get_operator(WALLET_OPERATOR_ID)
+    if operator is None or operator["status"] != "active":
+        logging.error(
+            "Поповнення гаманця: оператор %s недоступний (status=%s)",
+            WALLET_OPERATOR_ID, operator["status"] if operator else "не існує",
+        )
+        await bot.send_message(chat_id, "⚠️ Поповнення тимчасово недоступне. Спробуйте пізніше.")
+        return
+
+    token_encrypted = await op_repo.get_operator_monobank_token_encrypted(WALLET_OPERATOR_ID)
+    if not token_encrypted:
+        logging.error("Поповнення гаманця: немає збереженого еквайринг-токена оператора %s",
+                      WALLET_OPERATOR_ID)
+        await bot.send_message(chat_id, "⚠️ Поповнення тимчасово недоступне. Спробуйте пізніше.")
+        return
+
+    try:
+        operator_token = decrypt_secret(token_encrypted)
+    except (EncryptionKeyMissing, ValueError) as e:
+        logging.error("Поповнення гаманця: не вдалося розшифрувати токен оператора %s: %s",
+                      WALLET_OPERATOR_ID, e)
+        await bot.send_message(chat_id, "⚠️ Тимчасова технічна проблема. Спробуйте за хвилину.")
+        return
+
+    bot_username = os.getenv("BOT_USERNAME")
+    redirect_url = f"https://t.me/{bot_username}" if bot_username else PUBLIC_BASE_URL
+
+    try:
+        invoice = await create_invoice(
+            operator_token,
+            amount_uah=pkg["amount_uah"],
+            reference=f"wallet-{pkg['code']}-{user_id}",
+            redirect_url=redirect_url,
+            webhook_url=f"{PUBLIC_BASE_URL}/webhook/wallet/{WALLET_OPERATOR_ID}",
+            destination=f"Поповнення балансу eVolt: {pkg['title']}",
+        )
+    except MonobankError as e:
+        logging.error("Поповнення гаманця: банк не створив інвойс для %s: %s", user_id, e)
+        await bot.send_message(chat_id, "⚠️ Банк тимчасово недоступний. Спробуйте за хвилину.")
+        return
+
+    await op_repo.create_wallet_topup(
+        WALLET_OPERATOR_ID, user_id, invoice["invoiceId"], pkg["code"], pkg["kwh"], pkg["amount_uah"],
+    )
+
+    logging.info("🧾 Поповнення гаманця: користувач %s, %s, інвойс %s на %s грн",
+                user_id, package, invoice["invoiceId"], pkg["amount_uah"])
+
+    await bot.send_message(
+        chat_id,
+        f"💳 <b>{html.escape(pkg['title'])}</b>\n\n"
+        f"Сума: <b>{pkg['amount_uah']:.2f} грн</b>\n\n"
+        f"Оплатіть за посиланням нижче — баланс поповниться автоматично одразу після оплати.",
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="💳 Оплатити", url=invoice["pageUrl"])
+        ]]),
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith('buy_pack_') or c.data == 'activate_night', StateFilter("*"))
+async def process_tariff_purchase(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await state.clear()
+    action = callback_query.data
+    chat_id = callback_query.message.chat.id
+
+    if action in WALLET_PACKAGES:
+        if TELEGRAM_PAYMENTS_ENABLED:
+            await _send_telegram_invoice(chat_id, action)
+        else:
+            await _start_wallet_topup(chat_id, callback_query.from_user.id, action)
     elif action == "activate_night":
         await set_user_discount(callback_query.from_user.id, 0.85)
         await callback_query.message.answer("🌙 Нічний безліміт підключено")
