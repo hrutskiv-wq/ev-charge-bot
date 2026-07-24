@@ -887,16 +887,20 @@ class _FakeOcppTxn:
 class FakeOcppSessionConn:
     """
     Заглушка для start_ocpp_transaction(): перший fetchrow — перевірка "чи
-    вже є 'charging'-сесія", другий (лише якщо перший None) — атомарний
-    CTE INSERT+UPDATE. raise_unique_violation_once симулює справжню гонку:
-    CTE кидає UniqueViolationError, функція має перечитати переможця гонки
+    вже є 'charging'-сесія". Якщо немає — fetchval (INSERT ... RETURNING
+    id) + execute (UPDATE ... SET ocpp_transaction_id), обидва в
+    conn.transaction() (хотфікс: два кроки в одній транзакції замість
+    одного writable-CTE запиту, що на реальному Postgres мовчки не бачив
+    щойно вставлений рядок — див. докстрінг start_ocpp_transaction).
+    raise_unique_violation_once симулює справжню гонку: fetchval (INSERT)
+    кидає UniqueViolationError, функція має перечитати переможця гонки
     ТИМ САМИМ SELECT-ом, що й на вході.
     """
 
-    def __init__(self, existing=None, insert_result=None, raise_unique_violation_once=False):
+    def __init__(self, existing=None, new_session_id=None, raise_unique_violation_once=False):
         self.calls = []
         self.existing = existing
-        self.insert_result = insert_result
+        self.new_session_id = new_session_id
         self.raise_unique_violation_once = raise_unique_violation_once
         self._raised = False
         self._select_calls = 0
@@ -906,24 +910,30 @@ class FakeOcppSessionConn:
 
     async def fetchrow(self, query, *args):
         self._record(query, args)
-        if "WITH new_row AS" in query:
-            if self.raise_unique_violation_once and not self._raised:
-                self._raised = True
-                raise asyncpg.exceptions.UniqueViolationError("duplicate key")
-            return self.insert_result
         self._select_calls += 1
         if self._select_calls == 1:
             return self.existing
-        # Другий SELECT (лише після пійманого UniqueViolationError) — те,
-        # що "виграло" гонку.
-        return self.insert_result
+        # Другий fetchrow (лише після пійманого UniqueViolationError) —
+        # переможець гонки.
+        return {"id": self.new_session_id, "ocpp_transaction_id": self.new_session_id}
+
+    async def fetchval(self, query, *args):
+        self._record(query, args)
+        if self.raise_unique_violation_once and not self._raised:
+            self._raised = True
+            raise asyncpg.exceptions.UniqueViolationError("duplicate key")
+        return self.new_session_id
+
+    async def execute(self, query, *args):
+        self._record(query, args)
+        return "UPDATE 1"
 
     def transaction(self):
         return _FakeOcppTxn()
 
 
 async def test_start_ocpp_transaction_creates_a_new_session_when_none_active(monkeypatch):
-    conn = FakeOcppSessionConn(existing=None, insert_result={"id": 42, "ocpp_transaction_id": 42})
+    conn = FakeOcppSessionConn(existing=None, new_session_id=42)
 
     async def _get_db_pool():
         return FakePool(conn)
@@ -935,8 +945,10 @@ async def test_start_ocpp_transaction_creates_a_new_session_when_none_active(mon
     )
 
     assert (session_id, transaction_id, is_new) == (42, 42, True)
-    assert len(conn.calls) == 2, "Мало бути: перевірка наявної сесії + INSERT"
-    assert "WITH new_row AS" in conn.calls[1][0]
+    assert len(conn.calls) == 3, "Мало бути: перевірка наявної сесії + INSERT + UPDATE"
+    assert "INSERT INTO operator_sessions" in conn.calls[1][0]
+    assert "UPDATE operator_sessions" in conn.calls[2][0]
+    assert conn.calls[2][1] == (42,), "UPDATE має виставити ocpp_transaction_id саме на id щойно вставленої сесії"
 
 
 async def test_start_ocpp_transaction_is_idempotent_when_already_charging(monkeypatch):
@@ -964,13 +976,14 @@ async def test_start_ocpp_transaction_resolves_genuine_race_via_unique_violation
     """
     Справжня гонка (не ретрай CP, а два конкурентних виклики майже
     одночасно): перший SELECT нічого не бачить (обидва стартували до того,
-    як хтось встиг закомітити), наш INSERT/CTE ловить UniqueViolationError
-    від часткового унікального індексу — і функція перечитує переможця
-    гонки замість того, щоб впасти або створити другу сесію.
+    як хтось встиг закомітити), наш INSERT ловить UniqueViolationError
+    від часткового унікального індексу (conn.transaction() відкочує
+    незавершений INSERT) — і функція перечитує переможця гонки замість
+    того, щоб впасти або створити другу сесію.
     """
     conn = FakeOcppSessionConn(
         existing=None,
-        insert_result={"id": 99, "ocpp_transaction_id": 99},
+        new_session_id=99,
         raise_unique_violation_once=True,
     )
 
@@ -984,12 +997,13 @@ async def test_start_ocpp_transaction_resolves_genuine_race_via_unique_violation
     )
 
     assert (session_id, transaction_id, is_new) == (99, 99, False)
-    assert conn.calls[1][0].startswith("WITH new_row AS") or "WITH new_row AS" in conn.calls[1][0]
+    assert "INSERT INTO operator_sessions" in conn.calls[1][0]
+    assert len(conn.calls) == 3, "Перевірка наявної сесії + невдалий INSERT + перечитування переможця гонки"
 
 
 async def test_start_ocpp_transaction_on_foreign_station_returns_none(monkeypatch):
     """Станція не належить operator_id -> INSERT ... SELECT нічого не вставив (як create_session)."""
-    conn = FakeOcppSessionConn(existing=None, insert_result=None)
+    conn = FakeOcppSessionConn(existing=None, new_session_id=None)
 
     async def _get_db_pool():
         return FakePool(conn)
@@ -998,6 +1012,7 @@ async def test_start_ocpp_transaction_on_foreign_station_returns_none(monkeypatc
 
     result = await repo.start_ocpp_transaction(OPERATOR_A, 10, 1000, SINCE)
     assert result == (None, None, False)
+    assert len(conn.calls) == 2, "Перевірка наявної сесії + INSERT (UPDATE не мав виконатись)"
 
 
 async def test_complete_ocpp_transaction_is_idempotent_by_status_guard(fake_conn):
