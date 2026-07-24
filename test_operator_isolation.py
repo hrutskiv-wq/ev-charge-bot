@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from app.database import operators_repo as repo
@@ -140,6 +141,9 @@ TENANT_SCOPED_CALLS = [
     ("list_sessions_by_station", lambda op_id: repo.list_sessions(op_id, station_id=10), "operator_id"),
     ("set_session_status", lambda op_id: repo.set_session_status(op_id, 77, "paid"), "operator_id"),
     ("complete_session", lambda op_id: repo.complete_session(op_id, 77, 12.0), "operator_id"),
+    ("start_ocpp_transaction", lambda op_id: repo.start_ocpp_transaction(op_id, 10, 1000, SINCE), "operator_id"),
+    ("complete_ocpp_transaction", lambda op_id: repo.complete_ocpp_transaction(op_id, 555, Decimal("10.500"), 20000, SINCE), "operator_id"),
+    ("get_session_by_ocpp_transaction_id", lambda op_id: repo.get_session_by_ocpp_transaction_id(op_id, 555), "operator_id"),
     ("create_operator_payment", lambda op_id: repo.create_operator_payment(op_id, "inv-1", 100), "insert"),
     ("get_operator_payment_by_invoice", lambda op_id: repo.get_operator_payment_by_invoice(op_id, "inv-1"), "operator_id"),
     ("get_operator_payment", lambda op_id: repo.get_operator_payment(op_id, 5), "operator_id"),
@@ -710,6 +714,7 @@ _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0011_operator_payments.py",
     _ROOT / "migrations" / "versions" / "0012_wallet_topups.py",
     _ROOT / "migrations" / "versions" / "0013_ocpp_station_fields.py",
+    _ROOT / "migrations" / "versions" / "0014_ocpp_transactions.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -792,13 +797,14 @@ def test_migration_and_idempotent_bootstrap_declare_same_altered_columns():
     """
     Той самий контроль, що й test_migration_and_idempotent_bootstrap_
     declare_same_columns(), але для колонок, доданих через ALTER TABLE
-    ADD COLUMN IF NOT EXISTS (0013 — три нові поля OCPP на operator_
-    stations), а не переписуванням CREATE TABLE.
+    ADD COLUMN IF NOT EXISTS: 0013 (три поля OCPP на operator_stations,
+    Промпт 3a) + 0014 (три поля OCPP-транзакцій на operator_sessions,
+    Промпт 3b), а не переписуванням CREATE TABLE.
     """
     migration_altered = _declared_alter_columns(_migrations_source())
     repo_altered = _declared_alter_columns(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_altered == repo_altered
-    assert len(migration_altered) == 3, "Очікувались рівно 3 нові поля OCPP (Промпт 3a)"
+    assert len(migration_altered) == 6, "Очікувались рівно 6 нових полів OCPP (Промпти 3a+3b)"
 
 
 def test_idempotency_is_guaranteed_by_partial_unique_indexes():
@@ -864,3 +870,140 @@ def test_sessions_are_bound_to_stations_by_composite_foreign_key():
             "FOREIGN KEY (station_id, operator_id) REFERENCES operator_stations (id, operator_id)"
             in normalized
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. OCPP-транзакції (Промпт 3b) — ідемпотентність start_ocpp_transaction
+# ---------------------------------------------------------------------------
+
+class _FakeOcppTxn:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeOcppSessionConn:
+    """
+    Заглушка для start_ocpp_transaction(): перший fetchrow — перевірка "чи
+    вже є 'charging'-сесія", другий (лише якщо перший None) — атомарний
+    CTE INSERT+UPDATE. raise_unique_violation_once симулює справжню гонку:
+    CTE кидає UniqueViolationError, функція має перечитати переможця гонки
+    ТИМ САМИМ SELECT-ом, що й на вході.
+    """
+
+    def __init__(self, existing=None, insert_result=None, raise_unique_violation_once=False):
+        self.calls = []
+        self.existing = existing
+        self.insert_result = insert_result
+        self.raise_unique_violation_once = raise_unique_violation_once
+        self._raised = False
+        self._select_calls = 0
+
+    def _record(self, query, args):
+        self.calls.append((" ".join(query.split()), args))
+
+    async def fetchrow(self, query, *args):
+        self._record(query, args)
+        if "WITH new_row AS" in query:
+            if self.raise_unique_violation_once and not self._raised:
+                self._raised = True
+                raise asyncpg.exceptions.UniqueViolationError("duplicate key")
+            return self.insert_result
+        self._select_calls += 1
+        if self._select_calls == 1:
+            return self.existing
+        # Другий SELECT (лише після пійманого UniqueViolationError) — те,
+        # що "виграло" гонку.
+        return self.insert_result
+
+    def transaction(self):
+        return _FakeOcppTxn()
+
+
+async def test_start_ocpp_transaction_creates_a_new_session_when_none_active(monkeypatch):
+    conn = FakeOcppSessionConn(existing=None, insert_result={"id": 42, "ocpp_transaction_id": 42})
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    session_id, transaction_id, is_new = await repo.start_ocpp_transaction(
+        OPERATOR_A, 10, 1000, SINCE,
+    )
+
+    assert (session_id, transaction_id, is_new) == (42, 42, True)
+    assert len(conn.calls) == 2, "Мало бути: перевірка наявної сесії + INSERT"
+    assert "WITH new_row AS" in conn.calls[1][0]
+
+
+async def test_start_ocpp_transaction_is_idempotent_when_already_charging(monkeypatch):
+    """
+    Ретрай StartTransaction (станція не отримала ack і повторила запит):
+    уже є 'charging'-сесія з призначеним transactionId — функція повертає
+    ЇЇ, не чіпаючи БД другим запитом (INSERT взагалі не виконується).
+    """
+    conn = FakeOcppSessionConn(existing={"id": 7, "ocpp_transaction_id": 7})
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    session_id, transaction_id, is_new = await repo.start_ocpp_transaction(
+        OPERATOR_A, 10, 1000, SINCE,
+    )
+
+    assert (session_id, transaction_id, is_new) == (7, 7, False)
+    assert len(conn.calls) == 1, "Повторний старт не мав чіпати БД другим запитом (INSERT)"
+
+
+async def test_start_ocpp_transaction_resolves_genuine_race_via_unique_violation(monkeypatch):
+    """
+    Справжня гонка (не ретрай CP, а два конкурентних виклики майже
+    одночасно): перший SELECT нічого не бачить (обидва стартували до того,
+    як хтось встиг закомітити), наш INSERT/CTE ловить UniqueViolationError
+    від часткового унікального індексу — і функція перечитує переможця
+    гонки замість того, щоб впасти або створити другу сесію.
+    """
+    conn = FakeOcppSessionConn(
+        existing=None,
+        insert_result={"id": 99, "ocpp_transaction_id": 99},
+        raise_unique_violation_once=True,
+    )
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    session_id, transaction_id, is_new = await repo.start_ocpp_transaction(
+        OPERATOR_A, 10, 1000, SINCE,
+    )
+
+    assert (session_id, transaction_id, is_new) == (99, 99, False)
+    assert conn.calls[1][0].startswith("WITH new_row AS") or "WITH new_row AS" in conn.calls[1][0]
+
+
+async def test_start_ocpp_transaction_on_foreign_station_returns_none(monkeypatch):
+    """Станція не належить operator_id -> INSERT ... SELECT нічого не вставив (як create_session)."""
+    conn = FakeOcppSessionConn(existing=None, insert_result=None)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    result = await repo.start_ocpp_transaction(OPERATOR_A, 10, 1000, SINCE)
+    assert result == (None, None, False)
+
+
+async def test_complete_ocpp_transaction_is_idempotent_by_status_guard(fake_conn):
+    """`status <> 'completed'` — та сама мʼютекс-умова, що set_wallet_topup_status."""
+    await repo.complete_ocpp_transaction(OPERATOR_A, 555, Decimal("10.500"), 20000, SINCE)
+    query, args = _single_call(fake_conn)
+    assert "status <> 'completed'" in query
+    assert "ocpp_transaction_id = $2" in query
+    assert args[0] == OPERATOR_A and args[1] == 555

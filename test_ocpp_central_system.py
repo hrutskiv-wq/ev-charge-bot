@@ -286,17 +286,24 @@ def test_valid_connection_handles_all_three_messages_and_persists_state(client, 
 
 
 # ---------------------------------------------------------------------------
-# 5. Поза обсягом 3a (Authorize тощо) і криві повідомлення не валять з'єднання
+# 5. Поза обсягом 3a/3b (Reset тощо) і криві повідомлення не валять з'єднання
 # ---------------------------------------------------------------------------
 
 def test_unimplemented_action_returns_call_error_without_breaking_connection(client, provisioned):
     """
-    Authorize/StartTransaction/... — Промпт 3b, тут немає @on-хендлера.
+    Reset — жоден із Промптів 3a/3b/3c-плану тут @on-хендлера не заводить.
     Бібліотека сама повертає CallError 'NotImplemented' — з'єднання й далі
     живе, наступне повідомлення обробляється нормально.
+
+    РЕГРЕСІЯ: до Промпту 3b тут стояв приклад 'Authorize' — коректний приклад
+    ДО 3b, але 3b саме його й реалізував (test_ocpp_transactions.py тепер
+    перевіряє Authorize окремо, як реалізовану дію). Тест про "дії поза
+    обсягом" має лишатись про дію, що ДІЙСНО не реалізована, тож приклад
+    замінено на 'Reset', щоб знову не зламатись, коли 3c реалізує наступний
+    шматок OCPP.
     """
     with _connect(client, CP_ID, auth=_auth_header(CP_ID, PASSWORD)) as ws:
-        ws.send_text(json.dumps([2, "1", "Authorize", {"idTag": "abc123"}]))
+        ws.send_text(json.dumps([2, "1", "Reset", {"type": "Soft"}]))
         resp = json.loads(ws.receive_text())
         assert resp[0] == 4, f"очікувався CallError, отримано {resp}"
         assert resp[2] == "NotImplemented"
