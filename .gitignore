@@ -20,6 +20,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# Claude Code — локальні налаштування/дозволи сесії, машинно-специфічні
+.claude/
+
 # ai_agent (окремий crewai-scaffolding, не входить у прод-образ)
 ai_agent/venv/
 ai_agent/__pycache__/
