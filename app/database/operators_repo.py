@@ -614,12 +614,21 @@ async def start_ocpp_transaction(operator_id: int, station_id: int, meter_start_
     гонка (перепідключення станції, 3a review), і в обох випадках просто
     повертаємо ЇЇ transactionId, нову сесію не створюємо.
 
-    transactionId = id тієї ж сесії, призначається АТОМАРНО в одному SQL-
-    виразі (writable CTE: INSERT ... RETURNING id -> UPDATE ... FROM
-    new_row) — без вікна між "вставили" і "призначили id", тому частковий
-    унікальний індекс uq_operator_sessions_one_active_ocpp_per_station
-    справді ловить конкурентний INSERT (UniqueViolationError), а не
-    пропускає його через проміжний стан NULL.
+    transactionId = id тієї ж сесії, призначається у ДВА кроки (INSERT
+    ... RETURNING id, потім UPDATE ... SET ocpp_transaction_id = id) в
+    ОДНІЙ conn.transaction() — не одним writable-CTE запитом
+    (WITH new_row AS (INSERT ... RETURNING id) UPDATE ... FROM new_row):
+    той варіант (Промпт 3b) виявився БАГОМ на реальному Postgres — головний
+    UPDATE працює зі знімком, знятим ДО виконання всього запиту, тому
+    щойно вставлений сусідньою CTE рядок йому не видно, UPDATE ловить 0
+    рядків, і RETURNING повертає порожньо, хоча INSERT уже реально вставив
+    'charging'-рядок з ocpp_transaction_id=NULL (осиротіла сесія). Мокнутий
+    репозиторій (fake_repo у test_ocpp_transactions.py) підміняє цю
+    функцію повністю, тому реальний SQL-текст під pytest ніколи не
+    виконувався — баг виявлено лише живим прогоном проти справжньої БД
+    (2026-07-24, Промпт 3c-i) і закрито окремим хотфіксом.
+    conn.transaction() гарантує, що крах МІЖ двома кроками не лишить
+    сесію 'charging' без transactionId назавжди.
 
     Повертає (session_id, transaction_id, is_new: bool). (None, None, False),
     якщо station_id не належить operator_id (як create_session).
@@ -641,26 +650,27 @@ async def start_ocpp_transaction(operator_id: int, station_id: int, meter_start_
         if existing is not None:
             return existing["id"], existing["ocpp_transaction_id"], False
 
-        insert_query = """
-            WITH new_row AS (
-                INSERT INTO operator_sessions (operator_id, station_id, status, started_at, meter_start_wh)
-                SELECT s.operator_id, s.id, 'charging', $3, $4
-                FROM operator_stations s
-                WHERE s.id = $2 AND s.operator_id = $1
-                RETURNING id
-            )
-            UPDATE operator_sessions
-            SET ocpp_transaction_id = new_row.id
-            FROM new_row
-            WHERE operator_sessions.id = new_row.id
-            RETURNING operator_sessions.id, operator_sessions.ocpp_transaction_id
-        """
         try:
-            row = await conn.fetchrow(insert_query, operator_id, station_id, started_at, meter_start_wh)
+            async with conn.transaction():
+                session_id = await conn.fetchval("""
+                    INSERT INTO operator_sessions (operator_id, station_id, status, started_at, meter_start_wh)
+                    SELECT s.operator_id, s.id, 'charging', $3, $4
+                    FROM operator_stations s
+                    WHERE s.id = $2 AND s.operator_id = $1
+                    RETURNING id
+                """, operator_id, station_id, started_at, meter_start_wh)
+                if session_id is None:
+                    return None, None, False
+                await conn.execute(
+                    "UPDATE operator_sessions SET ocpp_transaction_id = $1 WHERE id = $1",
+                    session_id,
+                )
         except asyncpg.exceptions.UniqueViolationError:
             # Справжня гонка: інший виклик встиг вставити 'charging'-сесію
-            # між нашим SELECT вище і цим INSERT. Читаємо переможця гонки —
-            # той самий результат, що й у гілці "already" вище.
+            # між нашим SELECT вище і цим INSERT — conn.transaction() уже
+            # відкотив наш незавершений INSERT, з'єднання знову чисте.
+            # Читаємо переможця гонки — той самий результат, що й у гілці
+            # "already" вище.
             row = await conn.fetchrow("""
                 SELECT id, ocpp_transaction_id FROM operator_sessions
                 WHERE operator_id = $1 AND station_id = $2
@@ -670,9 +680,7 @@ async def start_ocpp_transaction(operator_id: int, station_id: int, meter_start_
                 raise
             return row["id"], row["ocpp_transaction_id"], False
 
-        if row is None:
-            return None, None, False
-        return row["id"], row["ocpp_transaction_id"], True
+        return session_id, session_id, True
 
 
 async def complete_ocpp_transaction(operator_id: int, transaction_id: int, kwh,
