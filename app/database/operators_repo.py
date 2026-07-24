@@ -38,6 +38,8 @@ import logging
 import secrets
 from decimal import Decimal, ROUND_HALF_UP
 
+import asyncpg
+
 from app.database.connection import get_db_pool
 from app.services.geo import haversine_km
 
@@ -211,6 +213,23 @@ async def init_operator_tables():
         await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_auth_key_encrypted TEXT;")
         await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_status VARCHAR(20);")
         await conn.execute("ALTER TABLE operator_stations ADD COLUMN IF NOT EXISTS ocpp_last_seen_at TIMESTAMP WITH TIME ZONE;")
+
+        # 10. OCPP транзакції + метринг (Промпт 3b, міграція 0014) — три нові
+        # поля на operator_sessions. transactionId Central System сама
+        # призначає (= id тієї ж сесії) у відповіді на StartTransaction;
+        # meter_start_wh/meter_stop_wh — сирі покази лічильника, kwh
+        # (наявна колонка) — похідне значення для білінгу.
+        await conn.execute("ALTER TABLE operator_sessions ADD COLUMN IF NOT EXISTS ocpp_transaction_id INTEGER;")
+        await conn.execute("ALTER TABLE operator_sessions ADD COLUMN IF NOT EXISTS meter_start_wh BIGINT;")
+        await conn.execute("ALTER TABLE operator_sessions ADD COLUMN IF NOT EXISTS meter_stop_wh BIGINT;")
+        await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_sessions_ocpp_transaction
+            ON operator_sessions(operator_id, ocpp_transaction_id) WHERE ocpp_transaction_id IS NOT NULL;
+        """)
+        await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_sessions_one_active_ocpp_per_station
+            ON operator_sessions(station_id) WHERE status = 'charging' AND ocpp_transaction_id IS NOT NULL;
+        """)
 
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
@@ -497,7 +516,8 @@ async def update_station_ocpp_state(operator_id: int, station_id: int, status: s
 
 _SESSION_FIELDS = (
     "id, operator_id, station_id, started_at, ended_at, kwh, amount_uah, "
-    "payment_id, status, driver_contact, created_at"
+    "payment_id, status, driver_contact, created_at, "
+    "ocpp_transaction_id, meter_start_wh, meter_stop_wh"
 )
 
 
@@ -577,6 +597,124 @@ async def complete_session(operator_id: int, session_id: int, kwh: float,
             WHERE id = $2 AND operator_id = $1
         """, operator_id, session_id, kwh, amount_uah)
         return result.endswith("1")
+
+
+# ---------------------------------------------------------------------------
+# OCPP транзакції + метринг (Промпт 3b, app/api/ocpp_ws.py)
+# ---------------------------------------------------------------------------
+
+async def start_ocpp_transaction(operator_id: int, station_id: int, meter_start_wh, started_at):
+    """
+    Ідемпотентно відкриває operator_session для StartTransaction.
+
+    StartTransaction.req НЕ несе transactionId (за специфікацією 1.6 його
+    призначає Central System лише у відповіді) — тому дедуп ретраю робимо
+    не по transactionId (його ще нема на першій спробі), а по "чи вже є
+    'charging'-сесія на цю станцію": якщо є — це або ретрай, або справжня
+    гонка (перепідключення станції, 3a review), і в обох випадках просто
+    повертаємо ЇЇ transactionId, нову сесію не створюємо.
+
+    transactionId = id тієї ж сесії, призначається АТОМАРНО в одному SQL-
+    виразі (writable CTE: INSERT ... RETURNING id -> UPDATE ... FROM
+    new_row) — без вікна між "вставили" і "призначили id", тому частковий
+    унікальний індекс uq_operator_sessions_one_active_ocpp_per_station
+    справді ловить конкурентний INSERT (UniqueViolationError), а не
+    пропускає його через проміжний стан NULL.
+
+    Повертає (session_id, transaction_id, is_new: bool). (None, None, False),
+    якщо station_id не належить operator_id (як create_session).
+    """
+    # УВАГА (знахідка рев'ю 3b): дедуп і uq_operator_sessions_one_active_ocpp_per_station
+    # працюють на рівні СТАНЦІЇ, не конектора (operator_sessions не має connector_id).
+    # Для одноконекторних станцій (пілот) коректно. Але мультиконекторна станція з
+    # двома одночасними сесіями отримає для 2-го конектора transactionId ПЕРШОГО
+    # (is_new=False) -> енергія 2-го конектора тихо загубиться. Перед онбордингом
+    # мультиконекторного заліза: operator_sessions.connector_id + дедуп/індекс по
+    # (station_id, connector_id). Беклог.
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("""
+            SELECT id, ocpp_transaction_id FROM operator_sessions
+            WHERE operator_id = $1 AND station_id = $2
+              AND status = 'charging' AND ocpp_transaction_id IS NOT NULL
+        """, operator_id, station_id)
+        if existing is not None:
+            return existing["id"], existing["ocpp_transaction_id"], False
+
+        insert_query = """
+            WITH new_row AS (
+                INSERT INTO operator_sessions (operator_id, station_id, status, started_at, meter_start_wh)
+                SELECT s.operator_id, s.id, 'charging', $3, $4
+                FROM operator_stations s
+                WHERE s.id = $2 AND s.operator_id = $1
+                RETURNING id
+            )
+            UPDATE operator_sessions
+            SET ocpp_transaction_id = new_row.id
+            FROM new_row
+            WHERE operator_sessions.id = new_row.id
+            RETURNING operator_sessions.id, operator_sessions.ocpp_transaction_id
+        """
+        try:
+            row = await conn.fetchrow(insert_query, operator_id, station_id, started_at, meter_start_wh)
+        except asyncpg.exceptions.UniqueViolationError:
+            # Справжня гонка: інший виклик встиг вставити 'charging'-сесію
+            # між нашим SELECT вище і цим INSERT. Читаємо переможця гонки —
+            # той самий результат, що й у гілці "already" вище.
+            row = await conn.fetchrow("""
+                SELECT id, ocpp_transaction_id FROM operator_sessions
+                WHERE operator_id = $1 AND station_id = $2
+                  AND status = 'charging' AND ocpp_transaction_id IS NOT NULL
+            """, operator_id, station_id)
+            if row is None:
+                raise
+            return row["id"], row["ocpp_transaction_id"], False
+
+        if row is None:
+            return None, None, False
+        return row["id"], row["ocpp_transaction_id"], True
+
+
+async def complete_ocpp_transaction(operator_id: int, transaction_id: int, kwh,
+                                    meter_stop_wh, ended_at):
+    """
+    Завершує OCPP-транзакцію (StopTransaction). Мʼютекс `status <>
+    'completed'` — той самий патерн, що set_wallet_topup_status/
+    set_operator_payment_status: повторна доставка StopTransaction (ретрай
+    станції без ack) з тим самим transactionId не перезаписує kwh/ended_at
+    вдруге і повертає False, викликач НЕ рахує дохід/подію вдруге.
+
+    kwh може бути None (абсурдна дельта лічильника — краще НЕ вигадувати
+    число, ніж записати неправильне; сесія все одно закривається, інакше
+    зависла б 'charging' назавжди й заблокувала б наступний старт на цій
+    станції через частковий унікальний індекс).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE operator_sessions
+            SET kwh = $3,
+                meter_stop_wh = $4,
+                ended_at = $5,
+                status = 'completed'
+            WHERE operator_id = $1 AND ocpp_transaction_id = $2 AND status <> 'completed'
+        """, operator_id, transaction_id, kwh, meter_stop_wh, ended_at)
+        return result.endswith("1")
+
+
+async def get_session_by_ocpp_transaction_id(operator_id: int, transaction_id: int):
+    """
+    Резолвить сесію за transactionId ІЗ БД (не з in-memory стану
+    ChargePoint) — критично, бо MeterValues/StopTransaction можуть прийти
+    після перепідключення станції, коли памʼять процесу з попереднього
+    з'єднання вже втрачена.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_SESSION_FIELDS} FROM operator_sessions
+            WHERE operator_id = $1 AND ocpp_transaction_id = $2
+        """, operator_id, transaction_id)
 
 
 # ---------------------------------------------------------------------------
