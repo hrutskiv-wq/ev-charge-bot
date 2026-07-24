@@ -79,7 +79,7 @@ async def create_tables(pool=None):
                     CREATE TYPE payment_provider AS ENUM ('monobank', 'telegram');
                 END IF;
                 IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'transaction_type') THEN
-                    CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal', 'bonus', 'correction', 'refund');
+                    CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal', 'bonus', 'correction', 'refund', 'hold', 'release');
                 END IF;
             END $$;
         """)
@@ -208,9 +208,24 @@ async def update_user_balance(
     компенсації від звичайних поповнень у звітності й реконсиляції.
     Раніше в enum transaction_type взагалі не було значення 'refund' у
     реальній (Alembic) схемі — див. migrations/versions/0008_add_refund_transaction_type.py.
+
+    t_type="hold" / t_type="release" (Промпт 3c-i, kWh-резервація на OCPP-
+    сесію): "hold" — ДЕБЕТ з явним запобіжником `balance >= $1` у SQL —
+    на відміну від УСІХ інших гілок списання (`ocpi_session` тощо), тут
+    баланс НЕ МАЄ права піти в мінус, інакше та сама сума могла б піти на
+    дві паралельні сесії. Повертає False (і НІЧОГО не пише — ні в
+    users.balance, ні в kw_transactions), якщо балансу не вистачає —
+    викликач (app/database/operators_repo.py::create_charging_reservation)
+    відкочує всю резервацію. "release" — КРЕДИТ (як deposit/refund), для
+    звільнення невикористаної частини резерву; окремий ledger-тип, щоб не
+    плутати з депозитом/компенсацією у звітності.
+
+    Повертає True/False: чи справді відбулась зміна балансу (для "hold" —
+    False саме тоді, коли балансу не вистачило; для решти t_type завжди
+    True — там немає умовного WHERE).
     """
 
-    async def _apply(active_conn):
+    async def _apply(active_conn) -> bool:
         await active_conn.execute(
             "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
         )
@@ -231,27 +246,60 @@ async def update_user_balance(
                 """,
                 user_id, ledger_type, amount_kwh, payment_id, session_id, desc,
             )
-        else:
+            return True
+
+        if t_type == "release":
             await active_conn.execute(
-                "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount_kwh, user_id
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
             )
-            desc = description or f"Списання за сесію зарядки ({t_type})"
+            desc = description or "Звільнення невикористаного резерву"
             await active_conn.execute(
                 """
                 INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
-                VALUES ($1, 'withdrawal', $2, $3, $4, $5)
+                VALUES ($1, $2::transaction_type, $3, $4, $5, $6)
                 """,
-                user_id, -amount_kwh, payment_id, session_id, desc,
+                user_id, "release", amount_kwh, payment_id, session_id, desc,
             )
+            return True
+
+        if t_type == "hold":
+            result = await active_conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1",
+                amount_kwh, user_id,
+            )
+            if not result.endswith("1"):
+                return False
+            desc = description or "Резерв кВт·год на сесію зарядки"
+            await active_conn.execute(
+                """
+                INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
+                VALUES ($1, $2::transaction_type, $3, $4, $5, $6)
+                """,
+                user_id, "hold", -amount_kwh, payment_id, session_id, desc,
+            )
+            return True
+
+        # Загальне списання (напр. t_type="ocpi_session") — БЕЗ ЗМІН.
+        await active_conn.execute(
+            "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount_kwh, user_id
+        )
+        desc = description or f"Списання за сесію зарядки ({t_type})"
+        await active_conn.execute(
+            """
+            INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
+            VALUES ($1, 'withdrawal', $2, $3, $4, $5)
+            """,
+            user_id, -amount_kwh, payment_id, session_id, desc,
+        )
+        return True
 
     if conn is not None:
-        await _apply(conn)
-        return
+        return await _apply(conn)
 
     pool = await get_db_pool()
     async with pool.acquire() as new_conn:
         async with new_conn.transaction():
-            await _apply(new_conn)
+            return await _apply(new_conn)
 
 async def get_user_transactions(user_id: int, limit: int = 10):
     pool = await get_db_pool()

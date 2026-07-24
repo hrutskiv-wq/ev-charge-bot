@@ -31,6 +31,17 @@ operator_id, щоб подальший перехід на /s/{qr_slug} знов
 дістається окремо через get_operator_monobank_token_encrypted(operator_id)
 для кожного оператора з цього списку.
 
+П'ятий виняток — get_reservation_by_id_tag() (Промпт 3c-i): станція
+повертає id_tag у StartTransaction/Authorize ще ДО того, як ми знаємо, чи
+це взагалі валідна резервація — сам id_tag (16 випадкових символів) і є
+секретом, той самий принцип, що qr_slug. Повертає operator_id, щоб
+викликач (app/api/ocpp_ws.py) звірив його з operator_id станції.
+
+Шостий виняток — list_stale_pending_reservations()/list_stale_active_
+reservations() (Промпт 3c-i, reconcile_charging_reservations.py): застряглі
+kWh-резервації звіряються по ВСІХ операторах — гроші (кВт·год) належать
+ВОДІЮ, не оператору, той самий принцип, що list_operators().
+
 Схема продубльована в migrations/versions/0010_white_label_tenants.py —
 при зміні оновлювати ОБИДВА місця (конвенція проєкту, див. PROJECT_CONTEXT.md).
 """
@@ -40,7 +51,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import asyncpg
 
-from app.database.connection import get_db_pool
+from app.database.connection import get_db_pool, update_user_balance
 from app.services.geo import haversine_km
 
 logger = logging.getLogger(__name__)
@@ -230,6 +241,34 @@ async def init_operator_tables():
         CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_sessions_one_active_ocpp_per_station
             ON operator_sessions(station_id) WHERE status = 'charging' AND ocpp_transaction_id IS NOT NULL;
         """)
+
+        # 11. Резервації kWh-балансу (Промпт 3c-i, міграції 0015-0016).
+        # Окрема таблиця, не розширення operator_payments — той самий
+        # аргумент, що для wallet_topups (0012): тут узагалі немає "оплати"
+        # в сенсі operator_payments, лише hold/release власного kWh-балансу
+        # водія. payment_method CHECK лише 'kwh' — модель B (UAH) окремим
+        # промптом 3c-ii розширить, не перепише.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS charging_reservations (
+            id SERIAL PRIMARY KEY,
+            operator_id INTEGER NOT NULL REFERENCES operators(id) ON DELETE CASCADE,
+            station_id INTEGER NOT NULL,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            payment_method VARCHAR(10) NOT NULL CHECK (payment_method IN ('kwh')),
+            reserved_kwh NUMERIC(10, 3) NOT NULL CHECK (reserved_kwh > 0),
+            id_tag VARCHAR(20) NOT NULL UNIQUE,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'active', 'finalized', 'cancelled', 'expired')),
+            operator_session_id INTEGER REFERENCES operator_sessions(id) ON DELETE SET NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (station_id, operator_id)
+                REFERENCES operator_stations (id, operator_id) ON DELETE CASCADE
+        );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_charging_reservations_operator_created ON charging_reservations(operator_id, created_at DESC);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_charging_reservations_session ON charging_reservations(operator_session_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_charging_reservations_status_created ON charging_reservations(status, created_at);")
 
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
@@ -684,7 +723,7 @@ async def start_ocpp_transaction(operator_id: int, station_id: int, meter_start_
 
 
 async def complete_ocpp_transaction(operator_id: int, transaction_id: int, kwh,
-                                    meter_stop_wh, ended_at):
+                                    meter_stop_wh, ended_at, conn=None):
     """
     Завершує OCPP-транзакцію (StopTransaction). Мʼютекс `status <>
     'completed'` — той самий патерн, що set_wallet_topup_status/
@@ -696,18 +735,29 @@ async def complete_ocpp_transaction(operator_id: int, transaction_id: int, kwh,
     число, ніж записати неправильне; сесія все одно закривається, інакше
     зависла б 'charging' назавжди й заблокувала б наступний старт на цій
     станції через частковий унікальний індекс).
+
+    conn (Промпт 3c-i): якщо передано — пише в транзакції викликача, той
+    самий патерн, що update_user_balance()/add_ledger_entry(). Потрібно
+    complete_ocpp_transaction_and_release() нижче, щоб завершення сесії й
+    звільнення резерву комітились АТОМАРНО (інакше крах між ними лишив би
+    резерв застряглим 'active' навіки — той самий клас бага, що блокер #1
+    wallet-realmono, PR #22).
     """
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        result = await conn.execute("""
-            UPDATE operator_sessions
-            SET kwh = $3,
-                meter_stop_wh = $4,
-                ended_at = $5,
-                status = 'completed'
-            WHERE operator_id = $1 AND ocpp_transaction_id = $2 AND status <> 'completed'
-        """, operator_id, transaction_id, kwh, meter_stop_wh, ended_at)
-        return result.endswith("1")
+    query = """
+        UPDATE operator_sessions
+        SET kwh = $3,
+            meter_stop_wh = $4,
+            ended_at = $5,
+            status = 'completed'
+        WHERE operator_id = $1 AND ocpp_transaction_id = $2 AND status <> 'completed'
+    """
+    if conn is not None:
+        result = await conn.execute(query, operator_id, transaction_id, kwh, meter_stop_wh, ended_at)
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as new_conn:
+            result = await new_conn.execute(query, operator_id, transaction_id, kwh, meter_stop_wh, ended_at)
+    return result.endswith("1")
 
 
 async def get_session_by_ocpp_transaction_id(operator_id: int, transaction_id: int):
@@ -723,6 +773,246 @@ async def get_session_by_ocpp_transaction_id(operator_id: int, transaction_id: i
             SELECT {_SESSION_FIELDS} FROM operator_sessions
             WHERE operator_id = $1 AND ocpp_transaction_id = $2
         """, operator_id, transaction_id)
+
+
+# ---------------------------------------------------------------------------
+# Резервації kWh-балансу (Промпт 3c-i — модель A: реєерв -> факт -> звільнення)
+# ---------------------------------------------------------------------------
+
+_RESERVATION_FIELDS = (
+    "id, operator_id, station_id, user_id, payment_method, reserved_kwh, "
+    "id_tag, status, operator_session_id, created_at, updated_at"
+)
+
+
+class _InsufficientBalanceForHold(Exception):
+    """Внутрішній сигнал control-flow для create_charging_reservation() — назовні не витікає."""
+
+
+async def create_charging_reservation(operator_id: int, station_id: int, user_id: int,
+                                      reserved_kwh, description: str = None):
+    """
+    Атомарно: (1) вставляє 'pending'-резервацію з новим id_tag (те, що
+    передається в remote_start_transaction() — станція поверне його ж у
+    StartTransaction, за ним on_start_transaction знайде цю резервацію),
+    (2) резервує reserved_kwh на kWh-балансі водія через update_user_
+    balance(t_type='hold') — ЄДИНУ точку запису балансу, не окремою
+    колонкою. Обидва кроки — одна транзакція: якщо балансу не вистачає,
+    відкочується і вставлена резервація теж (не лишається "мертва"
+    'pending'-резервація без реального холду за нею).
+
+    id_tag — 16 символів (secrets.token_urlsafe(12)), з запасом під
+    maxLength=20 поля idTag за специфікацією OCPP 1.6J.
+
+    Повертає (reservation_id, id_tag, None) при успіху, або
+    (None, None, "unknown_station"/"insufficient_balance") інакше.
+    """
+    id_tag = secrets.token_urlsafe(12)
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        try:
+            async with conn.transaction():
+                reservation_id = await conn.fetchval("""
+                    INSERT INTO charging_reservations (
+                        operator_id, station_id, user_id, payment_method, reserved_kwh, id_tag
+                    )
+                    SELECT s.operator_id, s.id, $3, 'kwh', $4, $5
+                    FROM operator_stations s
+                    WHERE s.id = $2 AND s.operator_id = $1
+                    RETURNING id
+                """, operator_id, station_id, user_id, reserved_kwh, id_tag)
+                if reservation_id is None:
+                    return None, None, "unknown_station"
+
+                held = await update_user_balance(
+                    user_id=user_id, amount_kwh=reserved_kwh, t_type="hold", conn=conn,
+                    session_id=f"reservation-{reservation_id}",
+                    description=description or f"Резерв {reserved_kwh} кВт·год (станція #{station_id})",
+                )
+                if not held:
+                    raise _InsufficientBalanceForHold()
+        except _InsufficientBalanceForHold:
+            return None, None, "insufficient_balance"
+
+    return reservation_id, id_tag, None
+
+
+async def get_reservation_by_id_tag(id_tag: str):
+    """
+    ПУБЛІЧНИЙ виняток (див. докстрінг модуля, п'ятий) — станція повертає
+    id_tag у StartTransaction/Authorize ще до автентифікації оператора.
+    Повертає operator_id, щоб викликач звірив його зі своїм.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations WHERE id_tag = $1
+        """, id_tag)
+
+
+async def get_reservation_by_session_id(operator_id: int, operator_session_id: int):
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE operator_id = $1 AND operator_session_id = $2
+        """, operator_id, operator_session_id)
+
+
+async def activate_reservation(operator_id: int, reservation_id: int, operator_session_id: int):
+    """
+    'pending' -> 'active' + привʼязка operator_session_id. Викликається
+    лише коли start_ocpp_transaction() (3b) повернув is_new=True — ретрай
+    StartTransaction узагалі сюди не потрапляє (той шлях просто повертає
+    вже відому сесію). WHERE status='pending' — другий рубіж на випадок
+    гонки, а не єдиний захист.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE charging_reservations
+            SET status = 'active', operator_session_id = $3, updated_at = CURRENT_TIMESTAMP
+            WHERE operator_id = $1 AND id = $2 AND status = 'pending'
+        """, operator_id, reservation_id, operator_session_id)
+        return result.endswith("1")
+
+
+async def set_reservation_status(operator_id: int, reservation_id: int, status: str, conn=None):
+    """Мʼютекс `status <> $3` — ідемпотентний перехід, той самий патерн, що set_wallet_topup_status."""
+    query = """
+        UPDATE charging_reservations
+        SET status = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE operator_id = $1 AND id = $2 AND status <> $3
+    """
+    if conn is not None:
+        result = await conn.execute(query, operator_id, reservation_id, status)
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as new_conn:
+            result = await new_conn.execute(query, operator_id, reservation_id, status)
+    return result.endswith("1")
+
+
+async def complete_ocpp_transaction_and_release(
+    operator_id: int, transaction_id: int, kwh, meter_stop_wh, ended_at,
+    reservation_id: int, reserved_kwh, user_id: int,
+):
+    """
+    Атомарний варіант complete_ocpp_transaction() для сесій, привʼязаних до
+    резервації: В ОДНІЙ транзакції — (1) завершує OCPP-сесію (той самий
+    мʼютекс, що звичайний complete_ocpp_transaction), (2) звільняє
+    невикористаний залишок резерву назад на kWh-баланс водія (update_user_
+    balance, t_type='release'), (3) позначає резервацію 'finalized'. Без
+    цього крах процесу МІЖ кроками лишив би резервацію застряглою 'active'
+    навіки — той самий клас бага, що блокер #1 wallet-realmono (PR #22).
+    reconcile_charging_reservations.py добирає лише те, чого ця атомарність
+    НЕ покриває (сесія обірвалась ще ДО StopTransaction узагалі).
+
+    kwh=None (абсурдна дельта лічильника, 3b) -> звільняємо ВЕСЬ резерв —
+    не вигадуємо, скільки спожито. kwh > reserved_kwh (спожито більше, ніж
+    дозволяв резерв — OCPP 1.6 не має вбудованого способу зупинити
+    зарядку рівно на N кВт·год) -> звільняти нічого, гучний ERROR-лог
+    (ручний розбір); надлишок споживання НЕ стягується автоматично тут.
+
+    Повертає True, якщо ЦЕЙ виклик провів фіналізацію (False — ретрай,
+    сесія вже 'completed', мʼютекс не пропустив, НІЧОГО далі не робимо).
+    """
+    if kwh is None:
+        remainder = reserved_kwh
+    else:
+        remainder = reserved_kwh - kwh
+        if remainder < 0:
+            logger.error(
+                "Резервація #%s: спожито %s кВт·год, зарезервовано лише %s — "
+                "перевитрата НЕ стягується автоматично, потрібен ручний розбір",
+                reservation_id, kwh, reserved_kwh,
+            )
+            remainder = Decimal(0)
+
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            became_completed = await complete_ocpp_transaction(
+                operator_id, transaction_id, kwh, meter_stop_wh, ended_at, conn=conn,
+            )
+            if not became_completed:
+                return False
+
+            if remainder > 0:
+                await update_user_balance(
+                    user_id=user_id, amount_kwh=remainder, t_type="release", conn=conn,
+                    session_id=f"reservation-{reservation_id}",
+                    description=f"Звільнення невикористаного резерву ({remainder} кВт·год)",
+                )
+            await set_reservation_status(operator_id, reservation_id, "finalized", conn=conn)
+            return True
+
+
+async def list_stale_pending_reservations(older_than):
+    """
+    Шостий виняток (звірка — reconcile_charging_reservations.py): 'pending'
+    резервації, старші за older_than, ще ніколи не активувались
+    (RemoteStart не підтвердився/станція не відповіла StartTransaction) —
+    hold стоїть, водій не може ним скористатись.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE status = 'pending' AND created_at < $1
+            ORDER BY created_at
+        """, older_than)
+
+
+async def list_stale_active_reservations(older_than):
+    """
+    'active' резервації, чия сесія так і не отримала StopTransaction.
+    Звіряємо по updated_at (момент, коли activate_reservation() перевела
+    статус у 'active'), НЕ по created_at — інакше затримка між створенням
+    резервації й підтвердженням станції хибно рахувалась би як "давно
+    заряджається".
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE status = 'active' AND updated_at < $1
+            ORDER BY updated_at
+        """, older_than)
+
+
+async def release_reservation_hold(operator_id: int, reservation_id: int, new_status: str) -> bool:
+    """
+    Атомарно скасовує ще НЕ фіналізовану резервацію: одним запитом (UPDATE
+    ... WHERE status IN ('pending', 'active') RETURNING ...) одночасно (1)
+    перевіряє, що резервація й досі підлягає скасуванню, і (2) забирає
+    reserved_kwh/user_id для звільнення — без окремого SELECT перед UPDATE,
+    щоб уникнути гонки (TOCTOU) з паралельним StopTransaction/reconcile.
+    Якщо OCPP-сесія паралельно встигла дійти до complete_ocpp_transaction_
+    and_release() і резервація вже 'finalized' — 0 рядків, НІЧОГО не
+    робимо, баланс вдруге не звільняється.
+
+    new_status: 'cancelled' (RemoteStart відхилено одразу після
+    create_charging_reservation — start_charging_session.py) або
+    'expired' (протухла резервація — reconcile_charging_reservations.py).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                UPDATE charging_reservations
+                SET status = $3, updated_at = CURRENT_TIMESTAMP
+                WHERE operator_id = $1 AND id = $2 AND status IN ('pending', 'active')
+                RETURNING reserved_kwh, user_id
+            """, operator_id, reservation_id, new_status)
+            if row is None:
+                return False
+            await update_user_balance(
+                user_id=row["user_id"], amount_kwh=row["reserved_kwh"], t_type="release", conn=conn,
+                session_id=f"reservation-{reservation_id}",
+                description=f"Звільнення резерву ({new_status}, {row['reserved_kwh']} кВт·год)",
+            )
+            return True
 
 
 # ---------------------------------------------------------------------------

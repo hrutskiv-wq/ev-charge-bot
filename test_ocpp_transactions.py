@@ -28,6 +28,7 @@
 """
 import base64
 import json
+from decimal import Decimal
 
 import pytest
 from cryptography.fernet import Fernet
@@ -76,6 +77,8 @@ class FakeOcppState:
         self.stations = {}     # cp_id -> dict
         self.operators = {}    # operator_id -> dict
         self.sessions = {}     # transaction_id -> dict
+        self.reservations = {}  # reservation_id -> dict (Промпт 3c-i)
+        self.release_calls = []  # [(reservation_id, remainder, user_id), ...]
         self._next_id = 100
         self.ocpp_state_calls = []  # [(operator_id, station_id, status), ...]
 
@@ -92,6 +95,14 @@ class FakeOcppState:
             "id": transaction_id, "operator_id": operator_id, "station_id": station_id,
             "status": "charging", "ocpp_transaction_id": transaction_id,
             "meter_start_wh": meter_start_wh, "meter_stop_wh": None, "kwh": None,
+        }
+
+    def add_reservation(self, reservation_id, operator_id, station_id, user_id,
+                        reserved_kwh, id_tag, status="pending", operator_session_id=None):
+        self.reservations[reservation_id] = {
+            "id": reservation_id, "operator_id": operator_id, "station_id": station_id,
+            "user_id": user_id, "payment_method": "kwh", "reserved_kwh": reserved_kwh,
+            "id_tag": id_tag, "status": status, "operator_session_id": operator_session_id,
         }
 
 
@@ -148,6 +159,41 @@ def fake_repo(monkeypatch):
         s["ended_at"] = ended_at
         return True
 
+    async def get_reservation_by_id_tag(id_tag):
+        for r in state.reservations.values():
+            if r["id_tag"] == id_tag:
+                return dict(r)
+        return None
+
+    async def activate_reservation(operator_id, reservation_id, operator_session_id):
+        r = state.reservations.get(reservation_id)
+        if r is None or r["operator_id"] != operator_id or r["status"] != "pending":
+            return False
+        r["status"] = "active"
+        r["operator_session_id"] = operator_session_id
+        return True
+
+    async def get_reservation_by_session_id(operator_id, operator_session_id):
+        for r in state.reservations.values():
+            if r["operator_id"] == operator_id and r["operator_session_id"] == operator_session_id:
+                return dict(r)
+        return None
+
+    async def complete_ocpp_transaction_and_release(operator_id, transaction_id, kwh, meter_stop_wh,
+                                                     ended_at, reservation_id, reserved_kwh, user_id):
+        became_completed = await complete_ocpp_transaction(
+            operator_id, transaction_id, kwh, meter_stop_wh, ended_at,
+        )
+        if not became_completed:
+            return False
+        remainder = reserved_kwh if kwh is None else reserved_kwh - kwh
+        if remainder > 0:
+            state.release_calls.append((reservation_id, remainder, user_id))
+        r = state.reservations.get(reservation_id)
+        if r is not None:
+            r["status"] = "finalized"
+        return True
+
     for name, func in [
         ("get_station_by_ocpp_charge_point_id", get_station_by_ocpp_charge_point_id),
         ("get_operator", get_operator),
@@ -156,6 +202,10 @@ def fake_repo(monkeypatch):
         ("start_ocpp_transaction", start_ocpp_transaction),
         ("get_session_by_ocpp_transaction_id", get_session_by_ocpp_transaction_id),
         ("complete_ocpp_transaction", complete_ocpp_transaction),
+        ("get_reservation_by_id_tag", get_reservation_by_id_tag),
+        ("activate_reservation", activate_reservation),
+        ("get_reservation_by_session_id", get_reservation_by_session_id),
+        ("complete_ocpp_transaction_and_release", complete_ocpp_transaction_and_release),
     ]:
         monkeypatch.setattr(repo, name, func)
 
@@ -365,6 +415,132 @@ def test_meter_values_without_transaction_id_is_acknowledged_and_ignored(client,
         }))
         resp = json.loads(ws.receive_text())
     assert resp == [3, "1", {}]
+
+
+# ---------------------------------------------------------------------------
+# Резервації (Промпт 3c-i) — прив'язка на StartTransaction, звільнення
+# залишку на StopTransaction. Резервація, якої нема / з чужим idTag / не
+# 'pending' — сесія веде себе точно як у 3b (жодного hold/release).
+# ---------------------------------------------------------------------------
+
+RESERVATION_ID = 42
+
+
+def test_start_transaction_activates_matching_pending_reservation(client, provisioned):
+    provisioned.add_reservation(
+        RESERVATION_ID, OPERATOR_A, STATION_ID, user_id=777,
+        reserved_kwh=Decimal("20.000"), id_tag="reserved-tag",
+    )
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StartTransaction", {
+            "connectorId": 1, "idTag": "reserved-tag", "meterStart": 1000,
+            "timestamp": "2026-07-24T10:00:00Z",
+        }))
+        resp = json.loads(ws.receive_text())
+
+    transaction_id = resp[2]["transactionId"]
+    reservation = provisioned.reservations[RESERVATION_ID]
+    assert reservation["status"] == "active"
+    assert reservation["operator_session_id"] == transaction_id
+
+
+def test_start_transaction_with_unknown_id_tag_does_not_touch_reservations(client, provisioned):
+    """idTag, що не збігається з жодною резервацією — поведінка 1:1 як у 3b."""
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StartTransaction", {
+            "connectorId": 1, "idTag": "walk-up-no-resv", "meterStart": 1000,
+            "timestamp": "2026-07-24T10:00:00Z",
+        }))
+        resp = json.loads(ws.receive_text())
+
+    assert resp[2]["idTagInfo"]["status"] == "Accepted"
+    assert provisioned.reservations == {}
+
+
+def test_start_transaction_retry_does_not_reactivate_reservation(client, provisioned):
+    """
+    Ретрай StartTransaction (is_new=False) не заходить у гілку активації
+    резервації вдруге — сесія та резервація лишаються прив'язаними лише
+    з першого разу.
+    """
+    provisioned.add_reservation(
+        RESERVATION_ID, OPERATOR_A, STATION_ID, user_id=777,
+        reserved_kwh=Decimal("20.000"), id_tag="reserved-tag",
+    )
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StartTransaction", {
+            "connectorId": 1, "idTag": "reserved-tag", "meterStart": 1000,
+            "timestamp": "2026-07-24T10:00:00Z",
+        }))
+        json.loads(ws.receive_text())
+
+        ws.send_text(_call("2", "StartTransaction", {
+            "connectorId": 1, "idTag": "reserved-tag", "meterStart": 1000,
+            "timestamp": "2026-07-24T10:00:05Z",
+        }))
+        second = json.loads(ws.receive_text())
+
+    assert second[2]["idTagInfo"]["status"] == "Accepted"
+    assert provisioned.reservations[RESERVATION_ID]["status"] == "active"
+
+
+def test_stop_transaction_releases_unused_remainder_of_active_reservation(client, provisioned):
+    provisioned.add_reservation(
+        RESERVATION_ID, OPERATOR_A, STATION_ID, user_id=777,
+        reserved_kwh=Decimal("20.000"), id_tag="reserved-tag",
+        status="active", operator_session_id=555,
+    )
+    provisioned.add_open_session(OPERATOR_A, STATION_ID, transaction_id=555, meter_start_wh=1000)
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StopTransaction", {
+            "meterStop": 16000, "timestamp": "2026-07-24T10:30:00Z", "transactionId": 555,
+        }))
+        resp = json.loads(ws.receive_text())
+
+    assert resp == [3, "1", {"idTagInfo": {"status": "Accepted"}}]
+    session = provisioned.sessions[555]
+    assert str(session["kwh"]) == "15.000"
+
+    assert provisioned.reservations[RESERVATION_ID]["status"] == "finalized"
+    assert provisioned.release_calls == [(RESERVATION_ID, Decimal("5.000"), 777)]
+
+
+def test_stop_transaction_with_absurd_delta_releases_the_whole_reservation(client, provisioned):
+    """kwh=None (абсурдна дельта) -> звільняємо ВЕСЬ резерв, не вигадуємо спожите."""
+    provisioned.add_reservation(
+        RESERVATION_ID, OPERATOR_A, STATION_ID, user_id=777,
+        reserved_kwh=Decimal("20.000"), id_tag="reserved-tag",
+        status="active", operator_session_id=555,
+    )
+    provisioned.add_open_session(OPERATOR_A, STATION_ID, transaction_id=555, meter_start_wh=5000)
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StopTransaction", {
+            "meterStop": 3000, "timestamp": "2026-07-24T10:30:00Z", "transactionId": 555,
+        }))
+        resp = json.loads(ws.receive_text())
+
+    assert resp == [3, "1", {"idTagInfo": {"status": "Accepted"}}]
+    assert provisioned.sessions[555]["kwh"] is None
+    assert provisioned.reservations[RESERVATION_ID]["status"] == "finalized"
+    assert provisioned.release_calls == [(RESERVATION_ID, Decimal("20.000"), 777)]
+
+
+def test_stop_transaction_without_reservation_behaves_exactly_like_3b(client, provisioned):
+    """Немає прив'язаної резервації (звичайна не-передоплачена сесія) — без release-виклику."""
+    provisioned.add_open_session(OPERATOR_A, STATION_ID, transaction_id=555, meter_start_wh=1000)
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StopTransaction", {
+            "meterStop": 16000, "timestamp": "2026-07-24T10:30:00Z", "transactionId": 555,
+        }))
+        json.loads(ws.receive_text())
+
+    assert provisioned.release_calls == []
+    assert str(provisioned.sessions[555]["kwh"]) == "15.000"
 
 
 # ---------------------------------------------------------------------------

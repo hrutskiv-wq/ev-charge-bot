@@ -140,9 +140,15 @@ class SimulatedChargePoint(OcppChargePoint):
         окремою фоновою таскою: якби ми await-или StartTransaction прямо
         тут, це задедлочило б read-цикл (він же обробляє і відповідь на
         StartTransaction, яку сам собі ж і чекав би).
+
+        Реальна станція ехоїть у своєму StartTransaction той самий idTag,
+        що отримала в RemoteStartTransaction.req (Промпт 3c-i: саме за цим
+        idTag Central System знаходить резервацію) — тому запам'ятовуємо
+        його тут замість дефолтного self.id_tag.
         """
         logger.info("<- RemoteStartTransaction (idTag=%s, connectorId=%s) — приймаємо",
                     id_tag, connector_id)
+        self.id_tag = id_tag
         asyncio.create_task(self.run_full_transaction_cycle())
         return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.accepted)
 
