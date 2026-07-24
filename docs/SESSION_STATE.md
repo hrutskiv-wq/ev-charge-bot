@@ -5,14 +5,17 @@
 > `PROJECT_CONTEXT.md`, конвенції — `CLAUDE.md`, стратегія —
 > `evolt-white-label-bilinh-ta-p2p.md`.
 >
-> Останнє оновлення: **2026-07-23**
+> Останнє оновлення: **2026-07-24**
 
 ## Де ми
 
 | | |
 |---|---|
-| Гілка | `main` — OCPP 3a+3b змержено (PR #23, #24) (**на прод НЕ викочено** — див. нижче); wallet-realmono (PR #22) задеплоєно. Наступну роботу починати новою гілкою від `origin/main` |
-| Останній коміт у `main` | merge PR #24 (OCPP 3b — транзакції+метринг) 2026-07-24. **Увага — прод НЕ на цьому:** OCPP 3a/3b не викочувались (потрібні nginx `/ocpp` + реальна OCPP-станція). **Прод стоїть на PR #22** (`36970f51`, wallet-realmono) |
+| Гілка | `main` має OCPP 3a/3b/3c-i + хотфікс `start_ocpp_transaction` + CI `live-db-tests` (PR #23–#27); **на прод НЕ викочено**; прод — на wallet-realmono (PR #22) |
+| Останній коміт у `main` | `7a0ca91` `feat: OCPP 3c-i` (модель A), 2026-07-24. **Прод НЕ на цьому** — OCPP 3a/3b/3c-i не викочувались (потрібні nginx `/ocpp` + реальна OCPP-станція). **Прод стоїть на PR #22** (`36970f51`, wallet-realmono) |
+| PR #27 | змержено (OCPP 3c-i — резервація kWh-балансу, модель A: резерв→факт→звільнення; міграції 0015/0016; рев'ю Opus) |
+| PR #26 | змержено (CI job `live-db-tests` з реальним Postgres) |
+| PR #25 | змержено (хотфікс `start_ocpp_transaction` — writable-CTE не проставляв `ocpp_transaction_id` на реальному PG; фікс: 2 кроки в `conn.transaction()`; рев'ю Opus + real-PG регресійний тест) |
 | PR #24 | змержено (OCPP 3b — транзакції+метринг: Authorize/Start/Stop/MeterValues + RemoteStart/Stop, міграція 0014; рев'ю Opus пройдено) |
 | PR #23 | змержено (OCPP 3a — кістяк Central System; рев'ю Opus пройдено, латентний registry-eviction закрито) |
 | PR #22 | змержено (wallet-realmono — реальні Monobank-платежі за kWh-пакети; рев'ю Opus, грошовий блокер атомарності знайдено й закрито) |
@@ -23,8 +26,8 @@
 | PR #13 | змержено (Промпт 4 — кабінет оператора) |
 | PR #11 | змержено (Промпт 2 + `CLAUDE.md`/`docs` у `main`) |
 | PR #10 | змержено (Промпт 1) |
-| Alembic head | `0014_ocpp_transactions` у `main` (OCPP 3b — 3 поля на `operator_sessions` + 2 часткові індекси), **на прод НЕ викочено**. Прод — на `0012_wallet_topups` |
-| Тести | **452 passed** (424 після OCPP 3a → 452 після OCPP 3b: +17 транзакції, +11 ізоляція, +виправлена 3a-регресія в central_system) |
+| Alembic head | `0016_charging_reservations` у `main` (3c-i: enum `hold`/`release` — `0015`, таблиця `charging_reservations` — `0016`), **на прод НЕ викочено**. Прод — на `0012_wallet_topups` |
+| Тести | **491 passed, 4 skipped** (skipped = `test_start_ocpp_transaction_live.py`, потребує `DB_URL`; ганяється в CI job `live-db-tests`) |
 | Задеплоєно на прод | **так** (2026-07-21, Промпт 4c докочений 2026-07-21 увечері й перевірений наживо) — `ENCRYPTION_KEY`, `PUBLIC_BASE_URL` у `.env`, `alembic` на `0011`, WARNING зник, `/health` відповідає. **Код Промпту 5 на проді** (перезбірки 2026-07-23 після мержів; рефакторинг вебхука `apply_bank_status`/`complete_paid_session` + `reconcile_operators.py` на сервері), звірка перевірена наживо, **cron щогодини додано 2026-07-23**. **wallet-realmono (buy-side Monobank) задеплоєно 2026-07-23** — `WALLET_OPERATOR_ID=1`, `BOT_USERNAME` у `.env`, `wallet_topups` створено, вебхук `/webhook/wallet/1` перевірено наживо (інвойс створюється + банк перепитується на статусі `created` без нарахування). **OCPP 3a — у `main` (PR #23), на прод НЕ викочено** (кістяк без транзакцій; потрібні ручний nginx WS-проксі на `/ocpp` + реальна OCPP-станція/симулятор — деплоїти при 3b або коли буде до чого під'єднатись). **OCPP 3b — у `main` (PR #24), на прод НЕ викочено** (той самий гейт: nginx `/ocpp` + реальна OCPP-станція; міграція 0014 при деплої). |
 | Перший живий платіж | **так, 2026-07-22** — сесія #1, 20 грн, Monobank Acquiring, `status=success`. Критичний шлях (див. «Зовнішні фронти») розблоковано |
 
@@ -139,6 +142,11 @@
 - Живий прогін на реальному uvicorn (RemoteStart→Start→MeterValues→Stop) спіймав реальний баг (`id_tag_info` приходить plain dict, не датаклас) — виправлено.
 - **Відоме обмеження (коментар у коді + беклог):** дедуп/індекс на рівні СТАНЦІЇ, не конектора — мультиконекторні станції поза обсягом 3b (потрібен `operator_sessions.connector_id`).
 
+**OCPP 3c-i — резервація kWh-балансу (модель A)** (міграції `0015` enum `hold`/`release` + `0016` `charging_reservations`; нові `start_charging_session.py` [CLI-вхід, без UI бота], `reconcile_charging_reservations.py`, `test_charging_reservations.py`, `test_reconcile_charging_reservations.py`; PR #27, **на прод НЕ викочено**)
+
+- Ланцюг: `create_charging_reservation` (hold через `update_user_balance`, запобіжник `balance >= $1`, в ОДНІЙ `conn.transaction()`) → RemoteStart → StartTransaction активує резервацію за `id_tag` (звірка `operator_id`) → StopTransaction: `complete_ocpp_transaction_and_release` (списати факт, звільнити залишок, `finalized` — атомарно) → reconcile добирає застрягле (`pending` > 30 хв / `active` > 24 год)
+- Модель B (грн, Monobank hold) — на **3c-ii**, гейт: живий смоук-тест
+
 ## Рев'ю: статус
 
 Рев'ю 1, 2a і 2b пройдені, усі правки застосовані. **Відкритих зауважень немає.**
@@ -163,6 +171,10 @@
 **OCPP 3a змержено в `main` (PR #23)** — **повне незалежне рев'ю Opus пройдено**. Блокерів немає; знайдено 1 латентний пункт (реєстр `_active_charge_points` — безумовний `pop` у `finally` міг викинути перепідключене з'єднання, наслідки в 3b) → закрито ідентичність-гардом + регресійним тестом (доведений відкатом). Верифіковано напряму з коду (auth, тенант-скоуп нових функцій, міграція==бутстрап). 424 passed, CI зелений. **На прод НЕ викочено** (кістяк; потрібні nginx `/ocpp` + OCPP-станція).
 
 **OCPP 3b змержено в `main` (PR #24)** — **повне незалежне рев'ю Opus пройдено**. Блокерів немає. Верифіковано напряму з коду: ідемпотентність Start/Stop (ретраї), атомарний writable CTE + часткові унікальні індекси (гонка ловиться UniqueViolation), kWh=meterStop−meterStart з delta-guard, транзакція→сесія з БД, тенант-скоуп, міграція 0014==бутстрап (колонки+індекси). Дві свідомі девіації правильні (`'completed'` уже в CHECK; Start-дедуп по активній сесії — виправив помилку в моєму промті). Знахідка (не блокер): модель per-station, не per-connector → задокументовано коментарем у коді + беклог. 452 passed, CI зелений. **На прод НЕ викочено.**
+
+**Хотфікс `start_ocpp_transaction` (PR #25)** — рев'ю Opus. Пре-існуючий 3b-баг: writable-CTE `UPDATE` не бачив щойно вставлений CTE-рядок → `ocpp_transaction_id` NULL → StartTransaction Invalid; ловиться лише реальним PG (моки ховали). Фікс: 2 кроки в `conn.transaction()`; real-PG регресійний тест (red→green доведено); скан репозиторію — єдиний екземпляр цього класу бага.
+
+**OCPP 3c-i (PR #27)** — повне рев'ю Opus, блокерів немає. 4 гарантії витримані: hold через єдину точку `update_user_balance` з `balance >= $1`; списання=факт (hold−release); ідемпотентність (мʼютекси + WHERE-status + атомарний RETURNING); reconcile ловить застрягле. Тенант: композитний FK + звірка `operator_id` в активації (`id_tag` — секрет). 491 passed.
 
 Свідомо відкладене (задокументоване коментарями в коді, не баги):
 
@@ -210,7 +222,7 @@
 
 **4. Наступні промпти**
 
-- [~] **Промпт 3 — OCPP 1.6J (фази 3a/3b/3c).** **3a (кістяк, PR #23) і 3b (транзакції+метринг, PR #24) — ЗРОБЛЕНО, рев'ю Opus пройдено обидва; на прод НЕ викочено** (потрібні nginx `/ocpp` + реальна OCPP-станція). **Далі 3c** — інтеграція оплати/гаманця на станції (spend-side): тригер RemoteStart від оплати/балансу, ціна за фактом після StopTransaction, списання kWh-балансу АБО грн через Monobank hold+capture. Це замикає повну метровану модель гаманця.
+- [~] **Промпт 3 — OCPP 1.6J (фази 3a/3b/3c-i/3c-ii).** **3a/3b/3c-i — ЗРОБЛЕНО** (модель A: резерв→факт→звільнення на kWh-балансі), **рев'ю Opus пройдено, на прод НЕ викочено** (потрібні nginx `/ocpp` + реальна OCPP-станція). **Далі 3c-ii** — модель B (грн через Monobank hold/finalize/cancel), гейт: живий смоук-тест hold→finalize/hold→cancel на реальному банку.
 - [x] ~~**Промпт 4 — кабінет оператора.**~~ Змержено 2026-07-21, PR #13 — онбординг, еквайринг-токен, майстер станції з QR-PNG, тарифи, виручка, CSV
 - [x] ~~**Міні-фіча — активація оператора кнопкою.**~~ Змержено 2026-07-21, PR #14, рев'ю пройдено
 - [x] ~~**Промпт 4c — станції операторів у водійському пошуку.**~~ Змержено 2026-07-21, PR #15, докочено на прод і перевірено наживо
@@ -223,6 +235,14 @@
 - [x] ~~`feature/white-label` і `feature/qr-flow`~~ — видалені 2026-07-21
 - [ ] `feature/ai-agent-setup` — `docs/` звідти вже в `main`, лишився тільки `ai_agent/`
 - [ ] `reconcile_operators.py` не закриває `aiohttp.ClientSession`/конектор перед виходом — на кожному прогоні (тепер щогодини під cron) сипле `ERROR:asyncio:Unclosed client session` / `Unclosed connector` у лог. Не баг даних (робота виконується, exit 0), лише шум у логах — обгорнути сесію в `async with` або додати `await session.close()` перед виходом (виявлено при живій перевірці 2026-07-23)
+- [ ] Крон для `reconcile_charging_reservations.py` (як `reconcile_operators`/`reconcile_payments`) — інакше застряглі холди звіряються лише вручну
+- [ ] Модель B (3c-ii, грн через Monobank hold/finalize/cancel) — ПЕРЕД кодом живий смоук-тест hold→finalize і hold→cancel (cancel на нефіналізованому hold не підтверджений документацією)
+- [ ] Деплой OCPP (3a/3b/3c-i) на прод — гейт: ручний nginx WS-проксі `/ocpp` + реальна OCPP-станція; при деплої alembic до `0016`
+- [ ] Перевитрата (`kwh > reserved`) не стягується автоматично — лише ERROR-лог; продумати донарахування для реального заліза
+- [ ] CRLF/EOL: додати `.gitattributes` (`* text=auto eol=lf`) + renormalize — інакше кожен коміт із Windows тягне 100+ фантомних CRLF-«змін»
+- [ ] `.claude/` не в `.gitignore` — додати
+- [ ] Модель ролей/доступу в боті («тільки клієнт / клієнт+оператор / оператор») — окремий малий бандл; ролі: `users`=клієнт, `operators` через `get_operator_by_telegram_id`=оператор; варіанти: перемикач у меню / per-handler guard / allowlist. Уточнити мету перед стартом
+- [ ] (дрібне) enum-значення `transaction_type` `'hold'`/`'release'` продубльовані міграцією+бутстрапом, але без окремого schema-drift тесту саме на значення enum
 
 **6. Знайдено при рев'ю Промпту 4 (не блокує PR, не робити зараз)**
 
