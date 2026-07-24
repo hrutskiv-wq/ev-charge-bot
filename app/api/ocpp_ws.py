@@ -148,9 +148,14 @@ class ChargePoint(OcppChargePoint):
     свідомо відсутнє; бібліотека сама відповість CallError 'NotImplemented'
     (route_map не міститиме запису для цих Action).
 
-    Прив'язки до водія/оплати НЕМАЄ (Промпт 3c): StartTransaction відкриває
-    operator_session без payment_id/user, StopTransaction лише записує
-    фактичні кВт·год. Authorize завжди Accepted — перевірки балансу нема.
+    Прив'язки до водія/оплати НЕМАЄ за замовчуванням (Промпт 3c-i додає
+    ОПЦІЙНУ): якщо id_tag у StartTransaction збігається з активною
+    резервацією (app/database/operators_repo.py::create_charging_
+    reservation, модель A — kWh-баланс), сесія прив'язується до неї й на
+    StopTransaction звільняється невикористаний залишок. Якщо id_tag НЕ
+    відповідає жодній резервації (ручний/тестовий старт без бота) —
+    сесія працює точно як у 3b, без жодної зміни поведінки. Authorize
+    завжди Accepted — перевірки балансу нема (модель авторизації — 3c/3c-ii).
     """
 
     def __init__(self, cp_id: str, connection, operator_id: int, station_id: int):
@@ -210,6 +215,12 @@ class ChargePoint(OcppChargePoint):
                 id_tag_info=IdTagInfo(status=AuthorizationStatus.invalid),
             )
 
+        if is_new:
+            # Резервація (Промпт 3c-i) прив'язується ЛИШЕ на НОВІЙ сесії —
+            # ретрай StartTransaction узагалі не заходить у цю гілку
+            # (is_new=False), тож повторної спроби активації немає.
+            await self._try_activate_reservation(id_tag, session_id)
+
         await repo.update_station_ocpp_state(self.operator_id, self.station_id)
         logger.info(
             "🔌 OCPP StartTransaction: станція %s, сесія #%s, transactionId=%s%s",
@@ -219,6 +230,31 @@ class ChargePoint(OcppChargePoint):
             transaction_id=transaction_id,
             id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted),
         )
+
+    async def _try_activate_reservation(self, id_tag: str, session_id: int) -> None:
+        """
+        Якщо id_tag відповідає ПЕНДІНГ-резервації ЦЬОГО оператора —
+        привʼязує її до щойно створеної сесії (Промпт 3c-i). Якщо ні
+        (невідомий id_tag, чужий оператор, статус не 'pending') — сесія
+        просто лишається без резервації, точно як у 3b: жодної відмови,
+        жодного логу рівня ERROR — це очікуваний шлях для ручних/тестових
+        стартів без бота.
+        """
+        reservation = await repo.get_reservation_by_id_tag(id_tag)
+        if reservation is None or reservation["operator_id"] != self.operator_id:
+            return
+        if reservation["status"] != "pending":
+            logger.warning(
+                "OCPP StartTransaction: резервація #%s для id_tag=%s у статусі '%s', "
+                "не 'pending' — не привʼязую (станція %s)",
+                reservation["id"], id_tag, reservation["status"], self.id,
+            )
+            return
+
+        activated = await repo.activate_reservation(self.operator_id, reservation["id"], session_id)
+        if activated:
+            logger.info("🔒 OCPP StartTransaction: сесія #%s привʼязана до резервації #%s (%s кВт·год)",
+                        session_id, reservation["id"], reservation["reserved_kwh"])
 
     @on(Action.stop_transaction)
     async def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
@@ -253,19 +289,29 @@ class ChargePoint(OcppChargePoint):
                 "(meter_start=%s, meter_stop=%s) — kWh НЕ записано, потрібен ручний розбір",
                 session["id"], meter_start_wh, meter_stop,
             )
+            kwh = None
+        else:
+            kwh = (delta_wh / Decimal(1000)).quantize(Decimal("0.001"))
+
+        # Резервація (Промпт 3c-i) прив'язується до сесії лише при активації
+        # (див. _try_activate_reservation) — якщо її нема або вона не 'active',
+        # завершуємо сесію так само, як і в 3b (без hold/release).
+        reservation = await repo.get_reservation_by_session_id(self.operator_id, session["id"])
+        if reservation is not None and reservation["status"] == "active":
+            await repo.complete_ocpp_transaction_and_release(
+                self.operator_id, transaction_id, kwh, meter_stop, ended_at,
+                reservation_id=reservation["id"], reserved_kwh=reservation["reserved_kwh"],
+                user_id=reservation["user_id"],
+            )
+        else:
             await repo.complete_ocpp_transaction(
-                self.operator_id, transaction_id, kwh=None,
+                self.operator_id, transaction_id, kwh=kwh,
                 meter_stop_wh=meter_stop, ended_at=ended_at,
             )
-            return call_result.StopTransaction(id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted))
 
-        kwh = (delta_wh / Decimal(1000)).quantize(Decimal("0.001"))
-        await repo.complete_ocpp_transaction(
-            self.operator_id, transaction_id, kwh=kwh,
-            meter_stop_wh=meter_stop, ended_at=ended_at,
-        )
-        logger.info("🔌 OCPP StopTransaction: станція %s, сесія #%s, %s кВт·год",
-                    self.id, session["id"], kwh)
+        if kwh is not None:
+            logger.info("🔌 OCPP StopTransaction: станція %s, сесія #%s, %s кВт·год",
+                        self.id, session["id"], kwh)
         return call_result.StopTransaction(id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted))
 
     @on(Action.meter_values)

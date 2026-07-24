@@ -144,6 +144,11 @@ TENANT_SCOPED_CALLS = [
     ("start_ocpp_transaction", lambda op_id: repo.start_ocpp_transaction(op_id, 10, 1000, SINCE), "operator_id"),
     ("complete_ocpp_transaction", lambda op_id: repo.complete_ocpp_transaction(op_id, 555, Decimal("10.500"), 20000, SINCE), "operator_id"),
     ("get_session_by_ocpp_transaction_id", lambda op_id: repo.get_session_by_ocpp_transaction_id(op_id, 555), "operator_id"),
+    ("create_charging_reservation", lambda op_id: repo.create_charging_reservation(op_id, 10, 555, Decimal("20.000")), "operator_id"),
+    ("get_reservation_by_session_id", lambda op_id: repo.get_reservation_by_session_id(op_id, 999), "operator_id"),
+    ("activate_reservation", lambda op_id: repo.activate_reservation(op_id, 5, 999), "operator_id"),
+    ("set_reservation_status", lambda op_id: repo.set_reservation_status(op_id, 5, "finalized"), "operator_id"),
+    ("release_reservation_hold", lambda op_id: repo.release_reservation_hold(op_id, 5, "cancelled"), "operator_id"),
     ("create_operator_payment", lambda op_id: repo.create_operator_payment(op_id, "inv-1", 100), "insert"),
     ("get_operator_payment_by_invoice", lambda op_id: repo.get_operator_payment_by_invoice(op_id, "inv-1"), "operator_id"),
     ("get_operator_payment", lambda op_id: repo.get_operator_payment(op_id, 5), "operator_id"),
@@ -715,6 +720,8 @@ _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0012_wallet_topups.py",
     _ROOT / "migrations" / "versions" / "0013_ocpp_station_fields.py",
     _ROOT / "migrations" / "versions" / "0014_ocpp_transactions.py",
+    _ROOT / "migrations" / "versions" / "0015_hold_release_transaction_types.py",
+    _ROOT / "migrations" / "versions" / "0016_charging_reservations.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -774,7 +781,8 @@ def test_migration_and_idempotent_bootstrap_declare_same_columns():
     repo_tables = _declared_columns(_REPO_FILE.read_text(encoding="utf-8"))
 
     expected = {"operators", "operator_stations", "operator_sessions",
-                "operator_payout_ledger", "operator_payments", "wallet_topups"}
+                "operator_payout_ledger", "operator_payments", "wallet_topups",
+                "charging_reservations"}
     assert set(migration_tables) == expected
     assert set(repo_tables) == expected
 
@@ -850,7 +858,7 @@ def test_every_tenant_table_carries_operator_id():
     """Правило «кожна таблиця з operator_id» — перевіряємо саме на схемі."""
     tables = _declared_columns(_migrations_source())
     for table in ("operator_stations", "operator_sessions", "operator_payout_ledger",
-                  "operator_payments", "wallet_topups"):
+                  "operator_payments", "wallet_topups", "charging_reservations"):
         assert "operator_id" in tables[table], f"{table} без operator_id"
     # у самій таблиці операторів роль operator_id грає її ж первинний ключ
     assert "id" in tables["operators"]
