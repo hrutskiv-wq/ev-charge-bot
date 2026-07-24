@@ -775,6 +775,30 @@ async def get_session_by_ocpp_transaction_id(operator_id: int, transaction_id: i
         """, operator_id, transaction_id)
 
 
+async def get_active_ocpp_session(operator_id: int, station_id: int):
+    """
+    Активна (ще не завершена) OCPP-сесія станції — та сама умова, що й
+    "перевірка наявної сесії" у start_ocpp_transaction() вище. Частковий
+    унікальний індекс uq_operator_sessions_one_active_ocpp_per_station
+    гарантує щонайбільше ОДИН такий рядок на станцію (на рівні СТАНЦІЇ, не
+    конектора — той самий відомий виняток, що й у start_ocpp_transaction:
+    мультиконекторна станція тут поки не розрізняється).
+
+    Потрібно для /ocpp_stop (app/handlers/ocpp_admin.py, через
+    app/services/ocpp_charging.py): знайти ocpp_transaction_id, щоб
+    послати RemoteStopTransaction. Саме списання факту й фіналізація
+    резервації — і далі виключно робота on_stop_transaction
+    (app/api/ocpp_ws.py), тут вона НЕ дублюється.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_SESSION_FIELDS} FROM operator_sessions
+            WHERE operator_id = $1 AND station_id = $2
+              AND status = 'charging' AND ocpp_transaction_id IS NOT NULL
+        """, operator_id, station_id)
+
+
 # ---------------------------------------------------------------------------
 # Резервації kWh-балансу (Промпт 3c-i — модель A: реєерв -> факт -> звільнення)
 # ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ from app.api.ocpi import router as api_cdr_router
 from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
 from app.handlers.operator_billing import router as operator_billing_router
+from app.handlers.ocpp_admin import router as ocpp_admin_router
 from app.api.payments import payments_router
 from app.api.operator_webhook import operator_webhook_router
 from app.api.wallet_webhook import wallet_webhook_router
@@ -111,14 +112,20 @@ app.include_router(ocpp_router)
 app.include_router(driver_router)
 
 # Реєстрація роутерів aiogram (Telegram-апдейти).
-# operator_billing_router — ПЕРЕД user_router: user_router закінчується
-# хендлером-приймачем "будь-який текст без '/' -> ШІ-чат" (StateFilter("*")),
-# і якби кабінет оператора йшов пізніше, жоден вільнотекстовий крок його
-# майстрів (назва станції, токен еквайрингу тощо) до нього не доходив би —
-# ловився б раніше тим самим ШІ-чатом (див. докладний коментар на початку
-# app/handlers/operator_billing.py).
+# operator_billing_router і ocpp_admin_router — ПЕРЕД user_router:
+# user_router закінчується хендлером-приймачем "будь-який текст без '/' ->
+# ШІ-чат" (StateFilter("*")), і якби кабінет оператора йшов пізніше, жоден
+# вільнотекстовий крок його майстрів (назва станції, токен еквайрингу тощо)
+# до нього не доходив би — ловився б раніше тим самим ШІ-чатом (див.
+# докладний коментар на початку app/handlers/operator_billing.py).
+# ocpp_admin_router (/ocpp_start, /ocpp_stop) технічно міг би йти й після
+# user_router — обидві його команди суто Command(...)-фільтровані, а
+# catch-all явно виключає текст, що починається з "/" — але лишається тут
+# заради тієї самої конвенції й щоб регресія (test_ocpp_admin_router.py)
+# перевіряла реальний порядок, а не лише сподівання на нього.
 dp.include_router(bot_stations_router)
 dp.include_router(operator_billing_router)
+dp.include_router(ocpp_admin_router)
 dp.include_router(user_router)
 dp.include_router(charge_router)
 

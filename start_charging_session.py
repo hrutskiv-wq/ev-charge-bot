@@ -1,80 +1,60 @@
 """
-Ручний адмінський/CLI вхід у резервацію+зарядку (Промпт 3c-i, модель A:
-kWh-баланс, "резерв наперед -> заряд -> списання факту -> звільнення
-решти"). Без UI бота в цьому бандлі — той самий підхід, що
-provision_ocpp_station.py для самого провіжну станції: реальний
-telegram-хендлер прийде окремою задачею, коли модель A вже прожита живим
-трафіком.
+Ручний CLI-вхід у резервацію+зарядку (Промпт 3c-i, модель A: kWh-баланс,
+"резерв наперед -> заряд -> списання факту -> звільнення решти"). Тонка
+обгортка над app/services/ocpp_charging.py — те саме сервісне ядро тепер
+використовують і бот-команди /ocpp_start/ocpp_stop
+(app/handlers/ocpp_admin.py).
 
-Композиція двох уже готових шматків:
-  1. create_charging_reservation() (app/database/operators_repo.py) —
-     атомарно резервує reserved_kwh на kWh-балансі водія й заводить
-     'pending'-резервацію з новим id_tag.
-  2. remote_start_transaction() (app/api/ocpp_ws.py) — Central System ->
-     станція, RemoteStartTransaction.req зі щойно виданим id_tag; сама
-     сесія відкриється, коли станція відповість власним StartTransaction.req
-     (on_start_transaction), тоді on_start_transaction і привʼяже сесію до
-     цієї резервації (_try_activate_reservation).
-
-Якщо RemoteStart не підтвердився (станція відхилила / не підключена до
-ЦЬОГО процесу — обмеження _active_charge_points, див. app/api/ocpp_ws.py) —
-hold одразу звільняється назад через release_reservation_hold(), щоб гроші
-водія не зависали без жодного шансу на зарядку.
+ВАЖЛИВО: цей скрипт запускається ОКРЕМИМ процесом (docker compose exec) —
+його _active_charge_points завжди порожній, тому RemoteStart звідси на
+реальному проді ЗАВЖДИ впаде ChargePointNotConnected (лише живий
+uvicorn-процес бачить активні OCPP-з'єднання станцій; саме тому й з'явились
+бот-команди — вони працюють IN-PROCESS). Скрипт лишається корисним для
+локальної розробки (симулятор + застосунок в одному процесі, той самий
+event loop — той самий підхід, що в review_prompt3c-i.md) і як приклад
+виклику сервісного шару без бота.
 
 Використання:
     python start_charging_session.py <operator_id> <station_id> <user_id> <reserved_kwh>
     docker compose exec bot python start_charging_session.py 1 10 555 20.0
-
-Станція має бути OCPP (mode='ocpp') і зараз підключена до ЦЬОГО процесу
-(живий WS у _active_charge_points) — інакше ChargePointNotConnected.
 """
 import argparse
 import asyncio
 from decimal import Decimal, InvalidOperation
 
-from app.api.ocpp_ws import ChargePointNotConnected, remote_start_transaction
 from app.database import connection
-from app.database import operators_repo as repo
+from app.services.ocpp_charging import ChargingStartResult, start_charging_session as _start_charging_session
+
+_STATUS_MESSAGES = {
+    "unknown_station": lambda r: "❌ Резервацію не створено: станція не належить оператору",
+    "insufficient_balance": lambda r: "❌ Резервацію не створено: недостатньо балансу",
+    "not_ocpp": lambda r: f"❌ Резервацію #{r.reservation_id} звільнено: станція не є OCPP-станцією "
+                          f"(немає ocpp_charge_point_id)",
+    "not_connected": lambda r: f"❌ Резервацію #{r.reservation_id} звільнено: станція зараз не підключена "
+                               f"до цього процесу",
+    "rejected": lambda r: f"❌ Резервацію #{r.reservation_id} звільнено: станція відхилила "
+                          f"RemoteStartTransaction",
+}
 
 
 async def start_charging_session(operator_id: int, station_id: int, user_id: int, reserved_kwh: Decimal):
     """
-    Повертає (reservation_id, id_tag) при успіху, або (None, None) — у
-    консоль вже надруковано причину відмови, звідси нічого далі виправляти.
+    Друкує прогрес у консоль і повертає (reservation_id, id_tag) при успіху,
+    або (None, None) — уся логіка в app.services.ocpp_charging, тут лише
+    форматування результату під консоль (той самий контракт, що й раніше).
     """
-    reservation_id, id_tag, error = await repo.create_charging_reservation(
-        operator_id, station_id, user_id, reserved_kwh,
-    )
-    if error is not None:
-        print(f"❌ Резервацію не створено: {error}")
-        return None, None
+    result: ChargingStartResult = await _start_charging_session(operator_id, station_id, user_id, reserved_kwh)
 
-    print(f"🔒 Резервація #{reservation_id} створена: {reserved_kwh} кВт·год утримано на балансі "
-          f"водія {user_id} (id_tag={id_tag})")
+    if result.status == "ok":
+        print(f"🔒 Резервація #{result.reservation_id} створена: {reserved_kwh} кВт·год утримано на балансі "
+              f"водія {user_id} (id_tag={result.id_tag})")
+        print(f"✅ RemoteStartTransaction прийнято — очікую StartTransaction.req "
+              f"для активації резервації #{result.reservation_id}")
+        return result.reservation_id, result.id_tag
 
-    station = await repo.get_station(operator_id, station_id)
-    if station is None or station.get("ocpp_charge_point_id") is None:
-        print(f"❌ Станція #{station_id} не є OCPP-станцією (немає ocpp_charge_point_id) — "
-              f"звільняю резерв назад")
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return None, None
-
-    cp_id = station["ocpp_charge_point_id"]
-    try:
-        accepted = await remote_start_transaction(operator_id, cp_id, id_tag=id_tag)
-    except ChargePointNotConnected:
-        print(f"❌ Станція {cp_id} зараз не підключена до цього процесу — звільняю резерв назад")
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return None, None
-
-    if not accepted:
-        print(f"❌ Станція {cp_id} відхилила RemoteStartTransaction — звільняю резерв назад")
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return None, None
-
-    print(f"✅ RemoteStartTransaction прийнято станцією {cp_id} — очікую StartTransaction.req "
-          f"для активації резервації #{reservation_id}")
-    return reservation_id, id_tag
+    formatter = _STATUS_MESSAGES.get(result.status, lambda r: f"❌ Невідомий статус: {r.status}")
+    print(formatter(result))
+    return None, None
 
 
 if __name__ == "__main__":

@@ -144,6 +144,7 @@ TENANT_SCOPED_CALLS = [
     ("start_ocpp_transaction", lambda op_id: repo.start_ocpp_transaction(op_id, 10, 1000, SINCE), "operator_id"),
     ("complete_ocpp_transaction", lambda op_id: repo.complete_ocpp_transaction(op_id, 555, Decimal("10.500"), 20000, SINCE), "operator_id"),
     ("get_session_by_ocpp_transaction_id", lambda op_id: repo.get_session_by_ocpp_transaction_id(op_id, 555), "operator_id"),
+    ("get_active_ocpp_session", lambda op_id: repo.get_active_ocpp_session(op_id, 10), "operator_id"),
     ("create_charging_reservation", lambda op_id: repo.create_charging_reservation(op_id, 10, 555, Decimal("20.000")), "operator_id"),
     ("get_reservation_by_session_id", lambda op_id: repo.get_reservation_by_session_id(op_id, 999), "operator_id"),
     ("activate_reservation", lambda op_id: repo.activate_reservation(op_id, 5, 999), "operator_id"),
