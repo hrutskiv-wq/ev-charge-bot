@@ -226,3 +226,38 @@ async def test_ocpp_stop_not_connected_gives_clear_answer(monkeypatch):
 
     assert "не підключена" in message.sent[0][0]
     assert "777" in message.sent[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Герметизація hold — неочікувані винятки з сервісу не мають лишати адміна
+# без відповіді (feature/ocpp-hold-hardening)
+# ---------------------------------------------------------------------------
+
+async def test_ocpp_start_unexpected_exception_gives_static_answer_no_traceback_leak(monkeypatch):
+    UNIQUE_MARKER = "db-connection-lost-xyz789"
+
+    async def fake_start(*a, **kw):
+        raise RuntimeError(UNIQUE_MARKER)
+    monkeypatch.setattr(ocpp_charging, "start_charging_session", fake_start)
+
+    message = FakeMessage(f"/ocpp_start {OPERATOR_A} {STATION_ID} {USER_ID} 20.0")
+    await ocpp_admin.cmd_ocpp_start(message)  # не має перевикинути назовні
+
+    assert len(message.sent) == 1
+    assert message.sent[0][0].startswith("⚠️")
+    assert UNIQUE_MARKER not in message.sent[0][0], "Текст винятку не має йти в чат — лише в лог"
+
+
+async def test_ocpp_stop_unexpected_exception_gives_static_answer_no_traceback_leak(monkeypatch):
+    UNIQUE_MARKER = "station-handshake-timeout-abc123"
+
+    async def fake_stop(*a, **kw):
+        raise TimeoutError(UNIQUE_MARKER)
+    monkeypatch.setattr(ocpp_charging, "stop_charging_session", fake_stop)
+
+    message = FakeMessage(f"/ocpp_stop {OPERATOR_A} {STATION_ID}")
+    await ocpp_admin.cmd_ocpp_stop(message)  # не має перевикинути назовні
+
+    assert len(message.sent) == 1
+    assert message.sent[0][0].startswith("⚠️")
+    assert UNIQUE_MARKER not in message.sent[0][0], "Текст винятку не має йти в чат — лише в лог"

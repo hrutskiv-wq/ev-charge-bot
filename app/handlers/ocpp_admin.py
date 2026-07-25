@@ -92,7 +92,30 @@ async def cmd_ocpp_start(message: Message):
     logger.info("🔌 /ocpp_start від адмін-чату %s: operator=%s station=%s user=%s reserved_kwh=%s",
                 message.chat.id, operator_id, station_id, user_id, reserved_kwh)
 
-    result = await ocpp_charging.start_charging_session(operator_id, station_id, user_id, reserved_kwh)
+    try:
+        result = await ocpp_charging.start_charging_session(operator_id, station_id, user_id, reserved_kwh)
+    except Exception:
+        # ocpp_charging.start_charging_session() НАМАГАЄТЬСЯ звільнити hold
+        # (шлях try/except BaseException всередині сервісу) і перевикидає
+        # оригінальний виняток — але це не гарантія: виняток міг статись і
+        # в repo.create_charging_reservation() (резервації тоді взагалі не
+        # існує, тож і звільняти нічого), і компенсуюче звільнення саме
+        # могло впасти (тоді сервіс лише залогував і лишив hold висіти на
+        # крон-звірку). Тому текст нижче НЕ стверджує напевно, що резерв
+        # повернено — лише UX: адмін має побачити ЩОСЬ, інакше команда
+        # мовчки не відповість. Текст самого винятку в чат не йде
+        # (анти-оракул, той самий принцип, що в OCPP-хендшейку й
+        # Monobank-вебхуку) — деталі лише в лог.
+        logger.exception(
+            "🔥 /ocpp_start: неочікуваний збій сервісу (operator=%s station=%s user=%s)",
+            operator_id, station_id, user_id,
+        )
+        await message.answer(
+            "⚠️ Внутрішня помилка. Резерв мав бути звільнений автоматично — "
+            "ПЕРЕВІР лог і баланс водія. Якщо hold завис, його добере "
+            "reconcile_charging_reservations.py."
+        )
+        return
 
     if result.status == "ok":
         await message.answer(
@@ -128,7 +151,19 @@ async def cmd_ocpp_stop(message: Message):
     logger.info("🔌 /ocpp_stop від адмін-чату %s: operator=%s station=%s",
                 message.chat.id, operator_id, station_id)
 
-    result = await ocpp_charging.stop_charging_session(operator_id, station_id)
+    try:
+        result = await ocpp_charging.stop_charging_session(operator_id, station_id)
+    except Exception:
+        # На відміну від /ocpp_start, тут гроші не рухаються (stop_charging_
+        # session() ніякого hold/release не робить — settle робить виключно
+        # on_stop_transaction на StopTransaction.req від станції), тож текст
+        # інший: нічого "повертати" немає, лише повідомити про сам збій.
+        logger.exception(
+            "🔥 /ocpp_stop: неочікуваний збій сервісу (operator=%s station=%s)",
+            operator_id, station_id,
+        )
+        await message.answer("⚠️ Внутрішня помилка. Перевір лог і спробуй ще раз.")
+        return
 
     if result.status == "ok":
         await message.answer(

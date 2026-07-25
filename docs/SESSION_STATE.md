@@ -5,14 +5,14 @@
 > `PROJECT_CONTEXT.md`, конвенції — `CLAUDE.md`, стратегія —
 > `evolt-white-label-bilinh-ta-p2p.md`.
 >
-> Останнє оновлення: **2026-07-24**
+> Останнє оновлення: **2026-07-25**
 
 ## Де ми
 
 | | |
 |---|---|
 | Гілка | `main` — OCPP 3a/3b/3c-i + IN-PROCESS адмін-тригер (`/ocpp_start`/`/ocpp_stop`) **ЗАДЕПЛОЄНО на прод 2026-07-24** (nginx `/ocpp` WS-проксі готовий, живий wss-смоук пройдено) |
-| Останній коміт у `main` | `3978b10` `feat: бот-адмінкоманди /ocpp_start /ocpp_stop` — IN-PROCESS вхід у резервацію+зарядку, 2026-07-24 (поверх `403569f`). **Прод ТЕПЕР НА ЦЬОМУ КОМІТІ** |
+| Останній коміт у `main` | `a024e91` `docs: SESSION_STATE` — **docs-only**, лише документація, поверх `3978b10`. **Прод — на `3978b10`** (`feat: бот-адмінкоманди /ocpp_start /ocpp_stop`, 2026-07-24): тіп `main` і коміт на проді — НЕ одне й те саме, коли різниця лише docs-комітом, це очікувано, а не дрейф коду |
 | PR (гілка `feature/ocpp-admin-commands`, коміт `3978b10`) | змержено й **ЗАДЕПЛОЄНО** (бот-адмінкоманди `/ocpp_start`/`/ocpp_stop` — IN-PROCESS RemoteStart/RemoteStop; закриває знахідку «3c-i незапускний на проді», див. «Зроблено»; рев'ю Opus, одна правка — адмін-гейт) |
 | PR #27 | змержено (OCPP 3c-i — резервація kWh-балансу, модель A: резерв→факт→звільнення; міграції 0015/0016; рев'ю Opus) |
 | PR #26 | змержено (CI job `live-db-tests` з реальним Postgres) |
@@ -28,7 +28,7 @@
 | PR #11 | змержено (Промпт 2 + `CLAUDE.md`/`docs` у `main`) |
 | PR #10 | змержено (Промпт 1) |
 | Alembic head | `0016_charging_reservations` у `main`, **ЗАДЕПЛОЄНО на прод 2026-07-24** (`alembic upgrade` 0011→0016: enum `transaction_type` тепер містить `hold`/`release` — 0015, таблиця `charging_reservations` — 0016). **Виправлення документа:** тут раніше помилково писалось «прод на `0012_wallet_topups`» — фактично прод був на `0011_operator_payments` до цього деплою |
-| Тести | **526 passed, 4 skipped** (skipped = `test_start_ocpp_transaction_live.py`, потребує `DB_URL`; ганяється в CI job `live-db-tests`) |
+| Тести | **534 passed, 4 skipped** (skipped = `test_start_ocpp_transaction_live.py`, потребує `DB_URL`; ганяється в CI job `live-db-tests`) — +8 у `feature/ocpp-hold-hardening` (526 базових + 8), ще НЕ в `main` |
 | Задеплоєно на прод | **так** (2026-07-21, Промпт 4c докочений 2026-07-21 увечері й перевірений наживо) — `ENCRYPTION_KEY`, `PUBLIC_BASE_URL` у `.env`, WARNING зник, `/health` відповідає. **Код Промпту 5 на проді** (перезбірки 2026-07-23 після мержів; рефакторинг вебхука `apply_bank_status`/`complete_paid_session` + `reconcile_operators.py` на сервері), звірка перевірена наживо, **cron щогодини додано 2026-07-23**. **wallet-realmono (buy-side Monobank) задеплоєно 2026-07-23** — `WALLET_OPERATOR_ID=1`, `BOT_USERNAME` у `.env`, `wallet_topups` створено, вебхук `/webhook/wallet/1` перевірено наживо. **OCPP 3a/3b/3c-i + бот-адмінкоманди `/ocpp_start`/`/ocpp_stop` — ЗАДЕПЛОЄНО 2026-07-24**: Alembic 0011→0016; nginx `/ocpp` WS-проксі готовий (`location /ocpp`, `Upgrade`/`Connection`, timeout 3600s); OCPP 3a підтверджено живим `wss://`-смоуком (Boot/Status/Heartbeat); повна жива валідація 3b/3c-i (модель A) через `/ocpp_start`/`/ocpp_stop` з лог-супергрупи — див. «Зроблено». |
 | Перший живий платіж | **так, 2026-07-22** — сесія #1, 20 грн, Monobank Acquiring, `status=success`. Критичний шлях (див. «Зовнішні фронти») розблоковано |
 
@@ -156,6 +156,16 @@
 - Реєстрація роутера перед `user_router` перевірена через справжній `aiogram.Dispatcher` (`test_ocpp_admin_router.py`), не лише коментарем
 - **Жива валідація на проді (2026-07-24):** повний цикл із лог-супергрупи — `/ocpp_start` → hold 5.0 кВт·год → StartTransaction/MeterValues → `/ocpp_stop` → StopTransaction → факт 3.50 кВт·год + release 1.50 кВт·год → резервація `finalized`; баланс 10.00 → 6.50, арифметика точна
 
+**Герметизація hold + документація крона звірки** (без нової міграції; +8 тестів у `test_ocpp_charging_service.py`/`test_ocpp_admin_handlers.py` → 534 passed, 4 skipped; гілка `feature/ocpp-hold-hardening`, **рев'ю Opus пройдено, 3 правки застосовано, ще НЕ змержено**)
+
+- **Знахідка (закрита):** `start_charging_session()` (`app/services/ocpp_charging.py`) після успішного hold ловив ЛИШЕ `ChargePointNotConnected` між резервацією і RemoteStart — будь-який інший виняток (asyncpg-збій, таймаут, помилка ocpp-бібліотеки, `websockets.ConnectionClosed`, `asyncio.CancelledError` при рестарті контейнера) виходив із функції без release: резервація лишалась `'pending'`, hold висів, водій тихо втрачав кВт·год. До 2026-07-24 нешкідливо (шлях нічим було запустити на проді) — тепер живий (`/ocpp_start`)
+- Пост-резерваційний блок обгорнуто в `try/except BaseException` (не `Exception` — `CancelledError` у Python 3.8+ від `BaseException`); release під `asyncio.shield()`, щоб компенсуюча корутина дожила до кінця навіть якщо саму задачу скасовано; внутрішній try/except навколо самого release логує збій, але НЕ маскує оригінальний виняток (`raise` без аргументу перевикидає саме його); завжди `raise` — неочікуваний виняток НЕ перетворюється на доменний статус `ChargingStartResult` (статуси — передбачені бізнес-гілки, баг не мусить осісти в них непоміченим)
+- `app/handlers/ocpp_admin.py`: `cmd_ocpp_start`/`cmd_ocpp_stop` обгорнуто `except Exception` (НЕ `BaseException` — скасування задачі aiogram лишається скасуванням) навколо виклику сервісу — статичне повідомлення адміну замість тиші, текст винятку в чат не йде (той самий анти-оракул принцип, що в OCPP-хендшейку й Monobank-вебхуку), деталі лише в `logger.exception`
+- `README.md`: команда `reconcile_charging_reservations.py` задокументована поруч із `reconcile_operators`/`reconcile_payments` (розділ «Звірка kWh-резервацій OCPP»), з явним попередженням про критичність `-T` для `docker compose exec` у cron (без нього — TTY-вимога, команда мовчки падає щогодини)
+- Свідомо НЕ чіпали: `release_reservation_hold()`, `create_charging_reservation()`, `stop_charging_session()`, `on_stop_transaction`/`complete_ocpp_transaction_and_release()`, `reconcile_charging_reservations.py` (код), сам cron на сервері — усе за специфікацією бандла
+- **Рев'ю Opus, 3 правки:** (1) повідомлення `/ocpp_start` про збій раніше стверджувало «резерв повернено» безумовно — неправда, якщо виняток стався в `create_charging_reservation()` (резервації ще нема) або якщо саме звільнення теж впало (крон ще не стоїть на сервері) — текст пом'якшено на «мав бути звільнений... ПЕРЕВІР баланс»; (2) коментар про `asyncio.shield()` стверджував, що без нього release взагалі не виконався б — емпірично на Python 3.11 неправда для одиночного `cancel()` (прапорець скасування знімається після першого кидка), shield захищає лише від ПОВТОРНОГО cancel — коментар і супутній `logger.error` переформульовано чесно; (3) наявний тест на `CancelledError` був синтетичним (`raise` з мока, жодної реальної задачі, `shield` не залучався) — доданий восьмий тест зі справжнім подвійним `task.cancel()`, що фактично провокує сценарій, який shield захищає (підтверджено red/green: без `asyncio.shield()` цей тест падає)
+- Повний дифф + вивід тестів + розділ «Де тут рухаються гроші» → `review_prompt-ocpp-hold-hardening.md`
+
 ## Рев'ю: статус
 
 Рев'ю 1, 2a і 2b пройдені, усі правки застосовані. **Відкритих зауважень немає.**
@@ -246,7 +256,7 @@
 - [x] ~~`feature/white-label` і `feature/qr-flow`~~ — видалені 2026-07-21
 - [ ] `feature/ai-agent-setup` — `docs/` звідти вже в `main`, лишився тільки `ai_agent/`
 - [ ] `reconcile_operators.py` не закриває `aiohttp.ClientSession`/конектор перед виходом — на кожному прогоні (тепер щогодини під cron) сипле `ERROR:asyncio:Unclosed client session` / `Unclosed connector` у лог. Не баг даних (робота виконується, exit 0), лише шум у логах — обгорнути сесію в `async with` або додати `await session.close()` перед виходом (виявлено при живій перевірці 2026-07-23)
-- [ ] Крон для `reconcile_charging_reservations.py` (як `reconcile_operators`/`reconcile_payments`) — досі НЕ налаштований, застряглі холди звіряються лише вручну
+- [ ] Крон для `reconcile_charging_reservations.py` (як `reconcile_operators`/`reconcile_payments`) — досі НЕ налаштований на сервері, застряглі холди звіряються лише вручну. Команда вже задокументована в `README.md` (розділ «Звірка kWh-резервацій OCPP») — лишається ручний крок власника на проді (crontab), сам крон агентом не чіпається
 - [ ] Модель B (3c-ii, грн через Monobank hold/finalize/cancel) — ПЕРЕД кодом живий смоук-тест hold→finalize і hold→cancel (cancel на нефіналізованому hold не підтверджений документацією)
 - [x] ~~Деплой OCPP (3a/3b/3c-i) на прод~~ — **зроблено 2026-07-24**: nginx WS-проксі `/ocpp`, alembic `0011`→`0016`, живий wss-смоук + повна валідація моделі A
 - [ ] Перевитрата (`kwh > reserved`) не стягується автоматично — лише ERROR-лог; продумати донарахування для реального заліза
@@ -254,7 +264,7 @@
 - [x] ~~`.claude/` не в `.gitignore`~~ — додано в бандлі бот-адмінкоманд (2026-07-24)
 - [ ] Модель ролей/доступу в боті («тільки клієнт / клієнт+оператор / оператор») — окремий малий бандл; ролі: `users`=клієнт, `operators` через `get_operator_by_telegram_id`=оператор; варіанти: перемикач у меню / per-handler guard / allowlist. Уточнити мету перед стартом
 - [ ] (дрібне) enum-значення `transaction_type` `'hold'`/`'release'` продубльовані міграцією+бутстрапом, але без окремого schema-drift тесту саме на значення enum
-- [ ] `app/services/ocpp_charging.py::start_charging_session()` ловить лише `ChargePointNotConnected` між hold і RemoteStart — будь-який ІНШИЙ виняток (мережевий збій, помилка OCPP-бібліотеки тощо) лишить резервацію `'pending'` і hold НЕ звільниться. Обгорнути пост-резерваційну логіку в try/except і звільняти hold на БУДЬ-який виняток, не лише очікуваний
+- [x] ~~`app/services/ocpp_charging.py::start_charging_session()` ловить лише `ChargePointNotConnected` між hold і RemoteStart~~ — **закрито `feature/ocpp-hold-hardening`** (див. «Зроблено»): пост-резерваційна логіка обгорнута в `try/except BaseException` + `asyncio.shield()` на release
 - [ ] (опц.) `/ocpp_cps` — адмінкоманда: список станцій, зараз підключених до `_active_charge_points` цього процесу — зручно для діагностики без прямого доступу до логів/БД
 - [ ] Драйвер-фейсинг флоу для 3c-i (Telegram UI поверх `create_charging_reservation`/`app/services/ocpp_charging.py`, вибір станції водієм, показ QR/статусу) — зараз тригер лише адмінський (`/ocpp_start`/`/ocpp_stop`), без UI бота
 
