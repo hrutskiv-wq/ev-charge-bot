@@ -140,6 +140,31 @@ docker compose exec bot python reconcile_operators.py   # у контейнер�
 нарахувань. Для звірки платежів водіїв (не операторів) — окремий
 `reconcile_payments.py --days N`.
 
+### Звірка kWh-резервацій OCPP (Промпт 3c-i)
+
+Аналогічно, `reconcile_charging_reservations.py` добирає резервації, чий
+OCPP-цикл застряг і не дійшов до StopTransaction (станція не відповіла на
+RemoteStart, або перепідключилась і "забула" transactionId):
+
+```bash
+python reconcile_charging_reservations.py                    # локально
+docker compose exec bot python reconcile_charging_reservations.py   # у контейнері
+```
+
+Той самий cron-контракт, що й у `reconcile_operators.py`/`reconcile_payments.py`
+(exit 0 — чисто, exit 1 — знайдено й автоматично звільнено, пуш підсумку в
+`LOGS_CHAT_ID`). Приклад запису в crontab (щогодини, поруч із наявними
+звірками):
+
+```cron
+0 * * * * cd /ШЛЯХ/ev_charge_bot && docker compose exec -T bot python reconcile_charging_reservations.py >> /var/log/ev-charge-bot-reconcile.log 2>&1
+```
+
+**`-T` критичний:** без нього `docker compose exec` вимагає TTY, а в cron
+його немає — команда мовчки падатиме щогодини без жодного видимого сліду в
+логах (сам cron-рядок "виконається", але процес усередині контейнера так і
+не стартує).
+
 ## Локальна розробка проти моків
 
 Зовнішні системи, без яких флоу не протестувати:
@@ -173,6 +198,7 @@ uvicorn mock_monobank:app --port 8081      # еквайринг Monobank
 | `app/api/` | HTTP-ендпоінти: OCPI, платежі, webhook операторів |
 | `reconcile_operators.py` | звірка операторського білінгу (Промпт 5) |
 | `reconcile_payments.py` | звірка платежів водіїв (поповнення балансу) |
+| `reconcile_charging_reservations.py` | звірка застряглих kWh-резервацій OCPP (Промпт 3c-i) |
 | `templates/driver/` | Jinja2-шаблони сторінок водія (без зовнішніх ресурсів) |
 | `migrations/versions/` | Alembic — **джерело правди** для схеми |
 

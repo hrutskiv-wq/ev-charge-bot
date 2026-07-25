@@ -15,6 +15,7 @@ ChargePointNotConnected. Ці функції призначені для вик�
 консоль чи Telegram лишається виклику (start_charging_session.py /
 app/handlers/ocpp_admin.py відповідно).
 """
+import asyncio
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -78,23 +79,64 @@ async def start_charging_session(operator_id: int, station_id: int, user_id: int
     if error is not None:
         return ChargingStartResult(status=error)
 
-    station = await repo.get_station(operator_id, station_id)
-    if station is None or station.get("ocpp_charge_point_id") is None:
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return ChargingStartResult(status="not_ocpp", reservation_id=reservation_id, id_tag=id_tag)
-
-    cp_id = station["ocpp_charge_point_id"]
+    # Від цього рядка й до кінця функції баланс водія вже списано в hold
+    # (create_charging_reservation() вище відпрацював). Три await нижче —
+    # get_station/remote_start_transaction — можуть впасти НЕ лише
+    # ChargePointNotConnected (мережевий збій, таймаут, помилка ocpp-
+    # бібліотеки, websockets.ConnectionClosed, asyncio.CancelledError при
+    # рестарті контейнера). Будь-який вихід звідси без release лишає hold
+    # застряглим і водій тихо втрачає кВт·год — тому весь блок нижче в
+    # try/except BaseException (не Exception: CancelledError у Python 3.8+
+    # успадковується від BaseException, а скасування задачі рівно тут —
+    # цілком реальний сценарій).
     try:
-        accepted = await remote_start_transaction(operator_id, cp_id, id_tag=id_tag)
-    except ChargePointNotConnected:
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return ChargingStartResult(status="not_connected", reservation_id=reservation_id, id_tag=id_tag)
+        station = await repo.get_station(operator_id, station_id)
+        if station is None or station.get("ocpp_charge_point_id") is None:
+            await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
+            return ChargingStartResult(status="not_ocpp", reservation_id=reservation_id, id_tag=id_tag)
 
-    if not accepted:
-        await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
-        return ChargingStartResult(status="rejected", reservation_id=reservation_id, id_tag=id_tag)
+        cp_id = station["ocpp_charge_point_id"]
+        try:
+            accepted = await remote_start_transaction(operator_id, cp_id, id_tag=id_tag)
+        except ChargePointNotConnected:
+            await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
+            return ChargingStartResult(status="not_connected", reservation_id=reservation_id, id_tag=id_tag)
 
-    return ChargingStartResult(status="ok", reservation_id=reservation_id, id_tag=id_tag)
+        if not accepted:
+            await repo.release_reservation_hold(operator_id, reservation_id, "cancelled")
+            return ChargingStartResult(status="rejected", reservation_id=reservation_id, id_tag=id_tag)
+
+        return ChargingStartResult(status="ok", reservation_id=reservation_id, id_tag=id_tag)
+    except BaseException:
+        logger.exception(
+            "🔥 Неочікуваний збій між hold і RemoteStart — звільняю резервацію #%s "
+            "(operator_id=%s, station_id=%s, user_id=%s)",
+            reservation_id, operator_id, station_id, user_id,
+        )
+        try:
+            # shield: захищає САМЕ від ПОВТОРНОГО task.cancel() на цій же
+            # задачі (напр. штатний shutdown, що скасовує все двічі) — тоді
+            # плейн await тут теж кинув би CancelledError і release не
+            # дочекався б підтвердження. При одиночному cancel плейн await
+            # у except-блоці й без shield спокійно добігає (прапорець
+            # скасування знімається після першого кидка) — перевірено на
+            # Python 3.11 (той самий інтерпретатор, що в Dockerfile і CI).
+            # shield лишається про запас на другий сценарій, а не тому, що
+            # без нього release взагалі не виконався б.
+            await asyncio.shield(repo.release_reservation_hold(operator_id, reservation_id, "cancelled"))
+        except BaseException:
+            # Ловиться рівно в сценарії повторного cancel: зовнішній await
+            # на shield кидає CancelledError, а сама корутина release під
+            # shield могла і впасти, і успішно дожити у фоні — звідси ми
+            # цього напевно не знаємо. Первинну причину це логування
+            # маскувати не повинно:
+            logger.error(
+                "🔥 Не дочекались підтвердження звільнення резервації #%s (operator_id=%s) — "
+                "release міг упасти, а міг і дожити у фоні під shield; фінальна сітка — "
+                "крон reconcile_charging_reservations.py",
+                reservation_id, operator_id,
+            )
+        raise
 
 
 async def stop_charging_session(operator_id: int, station_id: int) -> ChargingStopResult:

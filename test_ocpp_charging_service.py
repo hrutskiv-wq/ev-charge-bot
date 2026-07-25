@@ -13,8 +13,16 @@ test_charging_reservations.py; тут перевіряється лише ОРК
 нього, плюс паритет CLI (start_charging_session.py) з сервісом після
 рефактора.
 
+Група "герметизація hold" (feature/ocpp-hold-hardening) додатково
+перевіряє: БУДЬ-ЯКИЙ неочікуваний виняток між hold і RemoteStart (не лише
+ChargePointNotConnected) теж звільняє hold рівно раз і перевикидається
+назовні незміненим — включно з asyncio.CancelledError і з випадком, коли
+саме звільнення теж падає (тоді назовні летить ОРИГІНАЛЬНИЙ виняток, не
+помилка release).
+
 Запуск: pytest test_ocpp_charging_service.py -v
 """
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -177,6 +185,164 @@ async def test_start_rejected_releases_hold(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Герметизація hold — неочікувані винятки між hold і RemoteStart
+# (feature/ocpp-hold-hardening)
+# ---------------------------------------------------------------------------
+
+async def test_start_get_station_unexpected_error_releases_hold_and_reraises(monkeypatch):
+    async def fake_create(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation", fake_create)
+
+    async def fake_get_station(*a, **kw):
+        raise RuntimeError("db connection lost")
+    monkeypatch.setattr(repo, "get_station", fake_get_station)
+
+    release_calls = []
+    async def fake_release(operator_id, reservation_id, new_status):
+        release_calls.append((operator_id, reservation_id, new_status))
+        return True
+    monkeypatch.setattr(repo, "release_reservation_hold", fake_release)
+
+    with pytest.raises(RuntimeError, match="db connection lost"):
+        await ocpp_charging.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("5.000"))
+
+    assert release_calls == [(OPERATOR_A, RESERVATION_ID, "cancelled")]
+
+
+async def test_start_remote_start_unexpected_error_releases_hold_and_reraises(monkeypatch):
+    async def fake_create(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation", fake_create)
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_station()))
+
+    async def fake_remote_start(*a, **kw):
+        raise TimeoutError("station handshake timed out")
+    monkeypatch.setattr(ocpp_charging, "remote_start_transaction", fake_remote_start)
+
+    release_calls = []
+    async def fake_release(operator_id, reservation_id, new_status):
+        release_calls.append((operator_id, reservation_id, new_status))
+        return True
+    monkeypatch.setattr(repo, "release_reservation_hold", fake_release)
+
+    with pytest.raises(TimeoutError, match="station handshake timed out"):
+        await ocpp_charging.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("5.000"))
+
+    assert release_calls == [(OPERATOR_A, RESERVATION_ID, "cancelled")]
+
+
+async def test_start_cancelled_error_releases_hold_and_reraises(monkeypatch):
+    """
+    asyncio.CancelledError успадковується від BaseException, не Exception —
+    рестарт контейнера/скасування задачі рівно між hold і RemoteStart мусить
+    так само звільняти hold, а не лише "звичайні" винятки.
+    """
+    async def fake_create(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation", fake_create)
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_station()))
+
+    async def fake_remote_start(*a, **kw):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(ocpp_charging, "remote_start_transaction", fake_remote_start)
+
+    release_calls = []
+    async def fake_release(operator_id, reservation_id, new_status):
+        release_calls.append((operator_id, reservation_id, new_status))
+        return True
+    monkeypatch.setattr(repo, "release_reservation_hold", fake_release)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ocpp_charging.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("5.000"))
+
+    assert release_calls == [(OPERATOR_A, RESERVATION_ID, "cancelled")]
+
+
+async def test_start_real_double_cancel_release_still_completes_under_shield(monkeypatch):
+    """
+    Тест вище (`test_start_cancelled_error_releases_hold_and_reraises`)
+    синтетичний — `raise asyncio.CancelledError()` з мока не скасовує
+    жодну реальну задачу, тож asyncio.shield() узагалі не залучається.
+    Цей тест скасовує СПРАВЖНЮ задачу ДВІЧІ поспіль — сценарій, який
+    насправді потребує shield (рев'ю: одиночний cancel добігає release і
+    без shield, бо прапорець скасування знімається одразу після першого
+    кидка; лише ПОВТОРНИЙ cancel на тій самій задачі обірвав би плейн
+    await, поки release ще не завершився):
+
+    1-й cancel ловиться на await remote_start_transaction() (зовнішній
+    except BaseException) і стартує release під shield; 2-й cancel
+    прилітає на зовнішній await(shield) саме тоді, коли release-корутина
+    ще виконується у фоні (await asyncio.sleep всередині неї) — без
+    shield цей другий cancel обірвав би й саму release-корутину.
+    """
+    async def fake_create(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation", fake_create)
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_station()))
+
+    remote_start_entered = asyncio.Event()
+    block_remote_start = asyncio.Event()
+
+    async def fake_remote_start(*a, **kw):
+        remote_start_entered.set()
+        await block_remote_start.wait()
+        return True  # ніколи не досягається — задачу скасують раніше
+    monkeypatch.setattr(ocpp_charging, "remote_start_transaction", fake_remote_start)
+
+    release_entered = asyncio.Event()
+    release_calls = []
+    async def fake_release(operator_id, reservation_id, new_status):
+        release_entered.set()
+        await asyncio.sleep(0.05)  # тримає release "у польоті" для 2-го cancel
+        release_calls.append((operator_id, reservation_id, new_status))
+        return True
+    monkeypatch.setattr(repo, "release_reservation_hold", fake_release)
+
+    task = asyncio.create_task(
+        ocpp_charging.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("5.000"))
+    )
+    await remote_start_entered.wait()
+
+    task.cancel()  # 1-й cancel — ловиться на await remote_start_transaction()
+    await release_entered.wait()  # except BaseException вже стартував release під shield
+
+    task.cancel()  # 2-й cancel — влучає в зовнішній await(shield), НЕ в саму release-корутину
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.sleep(0.1)  # дати фоновій release-корутині (під shield) дожити до кінця
+
+    assert release_calls == [(OPERATOR_A, RESERVATION_ID, "cancelled")], (
+        "Подвійне скасування задачі: release під asyncio.shield() мав дожити "
+        "до кінця у фоні, навіть коли зовнішній await на shield теж скасовано"
+    )
+
+
+async def test_start_release_itself_fails_original_exception_still_wins(monkeypatch):
+    """
+    Якщо і основна операція впала, і компенсуюче звільнення теж впало —
+    назовні має вилетіти ОРИГІНАЛЬНИЙ виняток (діагностика первинної
+    причини важливіша за помилку компенсації), а не помилку release.
+    """
+    async def fake_create(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation", fake_create)
+
+    async def fake_get_station(*a, **kw):
+        raise ValueError("original")
+    monkeypatch.setattr(repo, "get_station", fake_get_station)
+
+    async def fake_release(*a, **kw):
+        raise RuntimeError("release failed")
+    monkeypatch.setattr(repo, "release_reservation_hold", fake_release)
+
+    with pytest.raises(ValueError, match="original"):
+        await ocpp_charging.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("5.000"))
+
+
+# ---------------------------------------------------------------------------
 # stop_charging_session()
 # ---------------------------------------------------------------------------
 
@@ -290,6 +456,23 @@ async def test_cli_wrapper_returns_none_none_on_any_failure_status(monkeypatch):
     result = await cli.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("20.000"))
 
     assert result == (None, None)
+
+
+async def test_cli_wrapper_propagates_unexpected_exception_from_service(monkeypatch):
+    """
+    Паритет із сервісом після герметизації hold: CLI-обгортка нічого не
+    ловить сама (немає try/except у start_charging_session() тут) — тож
+    неочікуваний виняток із сервісу (уже після власного release) проходить
+    назовні незміненим і в CLI-шляху так само, не лише в бот-хендлерах.
+    """
+    import start_charging_session as cli
+
+    async def fake_service_start(*a, **kw):
+        raise RuntimeError("db connection lost")
+    monkeypatch.setattr(cli, "_start_charging_session", fake_service_start)
+
+    with pytest.raises(RuntimeError, match="db connection lost"):
+        await cli.start_charging_session(OPERATOR_A, STATION_ID, USER_ID, Decimal("20.000"))
 
 
 async def test_cli_wrapper_handles_unknown_status_gracefully(monkeypatch, capsys):
