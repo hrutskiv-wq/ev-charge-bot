@@ -14,6 +14,7 @@ operator_* містить у WHERE `operator_id` і отримує його па
 
 Запуск: pytest test_operator_isolation.py -v
 """
+import inspect
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -127,6 +128,9 @@ TENANT_SCOPED_CALLS = [
     ("get_operator", lambda op_id: repo.get_operator(op_id), "own_id"),
     ("set_operator_status", lambda op_id: repo.set_operator_status(op_id, "active"), "own_id"),
     ("set_operator_monobank_token", lambda op_id: repo.set_operator_monobank_token(op_id, "enc"), "own_id"),
+    ("mark_operator_token_verified", lambda op_id: repo.mark_operator_token_verified(op_id), "own_id"),
+    ("activate_operator_if_pending", lambda op_id: repo.activate_operator_if_pending(op_id), "own_id"),
+    ("set_operator_public", lambda op_id: repo.set_operator_public(op_id, True), "own_id"),
     ("get_operator_monobank_token_encrypted", lambda op_id: repo.get_operator_monobank_token_encrypted(op_id), "own_id"),
     ("list_stations", lambda op_id: repo.list_stations(op_id), "operator_id"),
     ("get_station", lambda op_id: repo.get_station(op_id, 10), "operator_id"),
@@ -327,6 +331,126 @@ async def test_dedicated_token_getter_is_scoped_to_one_operator(fake_conn):
     assert args == (OPERATOR_A,)
 
 
+async def test_create_operator_defaults_commission_pct_to_five(fake_conn):
+    """
+    Бізнес-рішення 2026-07-23 (5%, без абонплати) — Python-дефолт
+    create_operator() без явного commission_pct. DB DEFAULT звірений
+    окремим тестом (test_commission_pct_default_matches_migration_
+    bootstrap_and_python_param нижче); тут — саме виклик без аргументу.
+    """
+    await repo.create_operator("Готель Едем", 555444333, phone="+380501234567")
+    query, args = _single_call(fake_conn)
+    assert "INSERT INTO operators" in query
+    assert args == ("Готель Едем", "+380501234567", 555444333, 5)
+
+
+async def test_set_operator_monobank_token_resets_verification_in_the_same_query(fake_conn):
+    """
+    Новий токен скидає monobank_token_verified_at у NULL В ОДНОМУ UPDATE —
+    інакше стара верифікація лишилась би чинною для НОВОГО (можливо,
+    невалідного) значення токена, і самообслуговуваний онбординг можна
+    було б обійти підміною токена вже ПІСЛЯ автоактивації.
+    """
+    await repo.set_operator_monobank_token(OPERATOR_A, "encrypted-new-token")
+    query, args = _single_call(fake_conn)
+    assert "monobank_token_encrypted = $2" in query
+    assert "monobank_token_verified_at = NULL" in query
+    assert args == (OPERATOR_A, "encrypted-new-token")
+
+
+async def test_activate_operator_if_pending_is_atomic_and_idempotent(monkeypatch):
+    """
+    UPDATE ... WHERE status='pending' RETURNING в одному запиті (той самий
+    ідіом, що release_reservation_hold, Промпт 3c-i): 0 рядків -> False,
+    без окремого SELECT перед UPDATE — паралельний виклик не може
+    активувати оператора двічі.
+    """
+    class OnceConnection(FakeConnection):
+        def __init__(self):
+            super().__init__()
+            self._already_activated = False
+
+        async def fetchrow(self, query, *args):
+            self._record(query, args)
+            if self._already_activated:
+                return None
+            self._already_activated = True
+            return {"id": args[0]}
+
+    conn = OnceConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    first = await repo.activate_operator_if_pending(OPERATOR_A)
+    second = await repo.activate_operator_if_pending(OPERATOR_A)
+
+    assert first is True
+    assert second is False
+    query, _args = conn.calls[0]
+    assert "WHERE id = $1 AND status = 'pending'" in query
+    assert "RETURNING id" in query
+    assert "activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP)" in query, (
+        "activated_at має писатись тим самим виразом, що й set_operator_status() — "
+        "обидва шляхи фіксують ОДИН і той самий факт першої активації"
+    )
+
+
+async def test_activate_operator_if_pending_does_not_overwrite_existing_activated_at(monkeypatch):
+    """
+    Рев'ю: activate_operator_if_pending() і set_operator_status() мають
+    писати activated_at ОДНАКОВО (COALESCE), а не лише "в цьому конкретному
+    коді збігається". Симулюємо повторний перехід pending->active (статус
+    вручну повернули в pending — сьогодні такого шляху в застосунку немає,
+    але COALESCE у SQL мусить захищати від цього незалежно) — перше
+    значення activated_at не має перезаписатись.
+    """
+    state = {"status": "pending", "activated_at": None}
+
+    class StatefulConnection(FakeConnection):
+        async def fetchrow(self, query, *args):
+            self._record(query, args)
+            assert "COALESCE(activated_at, CURRENT_TIMESTAMP)" in query
+            if state["status"] != "pending":
+                return None
+            state["status"] = "active"
+            if state["activated_at"] is None:
+                state["activated_at"] = "FIRST_ACTIVATION_TS"
+            return {"id": args[0]}
+
+    conn = StatefulConnection()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.activate_operator_if_pending(OPERATOR_A) is True
+    first_ts = state["activated_at"]
+    assert first_ts is not None
+
+    state["status"] = "pending"  # гіпотетичний повторний перехід
+    assert await repo.activate_operator_if_pending(OPERATOR_A) is True
+    assert state["activated_at"] == first_ts, "COALESCE мав зберегти перше значення activated_at"
+
+
+async def test_set_operator_status_active_sets_activated_at_only_if_unset(fake_conn):
+    """
+    activated_at означає "коли оператор ПЕРШИЙ РАЗ став активним" — COALESCE,
+    не безумовний CURRENT_TIMESTAMP: повторна активація після suspend не
+    має переписувати цей факт. Для будь-якого ІНШОГО статусу (suspended)
+    activated_at запит навіть не згадує.
+    """
+    await repo.set_operator_status(OPERATOR_A, "active")
+    query, _args = _single_call(fake_conn)
+    assert "activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP)" in query
+
+    fake_conn.calls.clear()
+    await repo.set_operator_status(OPERATOR_A, "suspended")
+    query, _args = _single_call(fake_conn)
+    assert "activated_at" not in query
+
+
 @pytest.mark.parametrize("call", [
     lambda: repo.get_station(OPERATOR_A, 10),
     lambda: repo.list_stations(OPERATOR_A),
@@ -396,6 +520,11 @@ async def test_list_public_stations_near_is_a_public_exception_filtered_by_geogr
     assert "JOIN operators" in query
     assert "s.status = 'active'" in query
     assert "o.status = 'active'" in query
+    assert "o.is_public = TRUE" in query, (
+        "Активний статус — не те саме, що публічна видимість (самообслуговуваний "
+        "онбординг): без цього фільтра щойно автоактивований оператор одразу "
+        "з'явився б у пошуку всім водіям без модерації вільнотекстової назви/адреси"
+    )
     assert "s.lat IS NOT NULL" in query and "s.lng IS NOT NULL" in query
     assert args == (), "Функція не приймає operator_id — фільтр географічний, не тенантний"
 
@@ -723,6 +852,7 @@ _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0014_ocpp_transactions.py",
     _ROOT / "migrations" / "versions" / "0015_hold_release_transaction_types.py",
     _ROOT / "migrations" / "versions" / "0016_charging_reservations.py",
+    _ROOT / "migrations" / "versions" / "0017_operator_self_service.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -813,7 +943,36 @@ def test_migration_and_idempotent_bootstrap_declare_same_altered_columns():
     migration_altered = _declared_alter_columns(_migrations_source())
     repo_altered = _declared_alter_columns(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_altered == repo_altered
-    assert len(migration_altered) == 6, "Очікувались рівно 6 нових полів OCPP (Промпти 3a+3b)"
+    assert len(migration_altered) == 9, (
+        "Очікувались 6 полів OCPP (Промпти 3a+3b) + 3 поля самообслуговуваного "
+        "онбордингу (monobank_token_verified_at/activated_at/is_public, міграція 0017)"
+    )
+
+
+def test_commission_pct_default_matches_migration_bootstrap_and_python_param():
+    """
+    Третя гарантія, яку власник попросив звірити вручну (2026-07-28, разом
+    із рев'ю самообслуговуваного онбордингу): Python-параметр
+    create_operator(), DB DEFAULT у migrations/versions/0017_operator_
+    self_service.py (upgrade), і DB DEFAULT у init_operator_tables() мають
+    узгоджено казати "5". `ALTER COLUMN ... SET DEFAULT` — НЕ CREATE TABLE
+    і НЕ ADD COLUMN, тож жоден із двох тестів вище (declare_same_columns/
+    declare_same_altered_columns) цю розбіжність не зловить.
+    """
+    expected_line = "ALTER TABLE operators ALTER COLUMN commission_pct SET DEFAULT 5;"
+    migration_source = _migrations_source()
+    repo_source = _REPO_FILE.read_text(encoding="utf-8")
+
+    assert expected_line in migration_source, "DEFAULT 5 відсутній у migrations/versions/0017 (upgrade)"
+    assert expected_line in repo_source, "DEFAULT 5 відсутній у init_operator_tables()"
+
+    # downgrade() 0017 навмисно містить SET DEFAULT 4 (симетричний відкат,
+    # не драйф) — перевіряємо, що цей рядок НЕ просочився в бутстрап
+    # (init_operator_tables() відкату не має, лише прямий шлях уперед).
+    assert "ALTER TABLE operators ALTER COLUMN commission_pct SET DEFAULT 4;" not in repo_source
+
+    python_default = inspect.signature(repo.create_operator).parameters["commission_pct"].default
+    assert python_default == 5, "Python-параметр create_operator(commission_pct=...) має збігатися з DB DEFAULT"
 
 
 def test_idempotency_is_guaranteed_by_partial_unique_indexes():
