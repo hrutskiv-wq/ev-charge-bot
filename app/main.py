@@ -23,7 +23,6 @@ from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
 from app.handlers.operator_billing import router as operator_billing_router
 from app.handlers.ocpp_admin import router as ocpp_admin_router
-from app.api.payments import payments_router
 from app.api.operator_webhook import operator_webhook_router
 from app.api.wallet_webhook import wallet_webhook_router
 from app.api.ocpp_ws import ocpp_router
@@ -105,7 +104,6 @@ app.add_middleware(
 
 # Реєстрація роутерів FastAPI (HTTP API)
 app.include_router(api_cdr_router)
-app.include_router(payments_router)
 app.include_router(operator_webhook_router)
 app.include_router(wallet_webhook_router)
 app.include_router(ocpp_router)

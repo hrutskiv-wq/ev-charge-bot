@@ -6,7 +6,10 @@ kw_transactions (реальне нарахування кВт·год). Лови
 
   - платіж позначено 'success' у payments, але відповідного нарахування
     в kw_transactions немає (гроші взяли, кВт·год не дали) — саме так
-    поводився старий Monobank-webhook до фіксу update_user_balance();
+    поводився старий Monobank-webhook «Банки» (app/api/payments.py,
+    видалено — мертвий тестовий флоу, buy-side пакетів іде через
+    Monobank Acquiring, app/api/wallet_webhook.py) до фіксу
+    update_user_balance();
   - є нарахування (kw_transactions.payment_id вказує на платіж), але
     платежу з таким id немає або він не 'success' (нарахування без
     підтвердженого платежу — потенційна накрутка або баг);
@@ -14,7 +17,6 @@ kw_transactions (реальне нарахування кВт·год). Лови
     (з урахуванням двох фіксованих пакетів "750 грн -> 50 кВт·год" і
     "1350 грн -> 100 кВт·год зі знижкою" — це НЕ прямий поділ на
     PRICE_PER_KWH, тому звіряємо саме за тією ж логікою, що й у
-    app/api/payments.py::monobank_webhook і
     app/handlers/user.py::process_successful_payment).
 
 Використання:

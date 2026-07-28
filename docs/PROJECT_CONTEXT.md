@@ -50,7 +50,6 @@ Telegram-бот + HTTP API для мережі зарядних станцій �
 
 ### Безпека зовнішніх ендпоінтів
 - `app/api/ocpi.py` (`/ocpi/emsp/2.2.1/*`) — усі вхідні запити від CPO (CDR, callback команд) вимагають заголовок `Authorization: Token <OCPI_SECRET_TOKEN>` (перевіряється через `verify_ocpi_token` dependency). Той самий токен використовує `app/services/ocpi/client.py` для вихідних запитів до CPO.
-- `app/api/payments.py` (`/webhook/monobank`) — перевіряє заголовок `x-sign` (ECDSA/SHA-256) проти публічного ключа Monobank (`GET /api/merchant/pubkey`, кешується в пам'яті процесу, потребує `MONOBANK_API_TOKEN`).
 - `OCPIConfig` (`app/services/ocpi/config.py`) **навмисно падає при імпорті**, якщо `OCPI_SECRET_TOKEN` не заданий — жодного дефолтного значення.
 
 ### Модулі
@@ -85,7 +84,7 @@ pytest
 pytest test_ocpi_client.py -v
 ```
 
-Обов'язкові змінні середовища — див. `.env.example`. Без `OCPI_SECRET_TOKEN` застосунок не стартує; без `MONOBANK_API_TOKEN` — падає верифікація webhook Monobank (перевірка виконується лінива, при першому вхідному webhook).
+Обов'язкові змінні середовища — див. `.env.example`. Без `OCPI_SECRET_TOKEN` застосунок не стартує.
 
 ## Поточний стан (2026-07-17)
 
