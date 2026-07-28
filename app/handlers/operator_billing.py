@@ -47,14 +47,16 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from app.core.crypto import encrypt_secret
+from app.core.crypto import EncryptionKeyMissing, decrypt_secret, encrypt_secret
 from app.core.loader import bot
 from app.database import operators_repo as repo
 from app.keyboards.operator import (
-    get_admin_activation_keyboard, get_cabinet_menu, get_connector_presets_keyboard,
-    get_revenue_csv_keyboard, get_revenue_period_keyboard, get_station_detail_keyboard,
-    get_station_list_keyboard,
+    get_admin_activation_keyboard, get_admin_suspend_keyboard, get_cabinet_menu,
+    get_checklist_keyboard, get_connector_presets_keyboard, get_revenue_csv_keyboard,
+    get_revenue_period_keyboard, get_station_detail_keyboard, get_station_list_keyboard,
 )
+from app.services import operator_activation
+from app.services.monobank_acquiring import MonobankError, verify_merchant_token
 from app.services.operator_notify import CONFIRM_PREFIX
 from app.services.qr_image import generate_station_qr_png
 from app.states.operator_states import (
@@ -77,6 +79,19 @@ _OPERATOR_STATUS_NOTES = {
 }
 _STATION_STATUS_LABELS = {"active": "🟢 активна", "offline": "🟡 офлайн", "disabled": "⚪ вимкнена"}
 _PERIOD_LABELS = {"today": "сьогодні", "week": "тиждень", "month": "місяць"}
+
+
+def _is_suspended(operator) -> bool:
+    """
+    Головний запобіжник самообслуговуваного онбордингу: suspended-оператор
+    і далі БАЧИТЬ кабінет (станції, виручку) — прозорість не шкодить, — але
+    не може НІЧОГО змінювати (нова станція, тариф/статус станції, токен).
+    Раніше це було відкритим питанням у беклозі (Промпт 4, рев'ю), явно
+    вирішено тут: guard викликається на кожному ВХОДІ в мутуючу дію, не на
+    кожному кроці майстра (вузьке вікно гонки під час майстра — свідомо
+    прийнятний компроміс, не вартий guard-а на кожному проміжному кроці).
+    """
+    return operator["status"] == "suspended"
 
 
 def _is_free_text(message: Message) -> bool:
@@ -118,7 +133,7 @@ async def _send_cabinet_home(target, operator, edit: bool = False):
     text = f"🏷️ <b>Кабінет оператора «{html.escape(operator['name'])}»</b>"
     if note:
         text += f"\n{note}"
-    kb = get_cabinet_menu(has_token)
+    kb = get_cabinet_menu(has_token, show_checklist=operator["status"] == "pending")
     if edit:
         await target.edit_text(text, parse_mode="HTML", reply_markup=kb)
     else:
@@ -161,13 +176,14 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
     # рядок в operators уже записано).
     username = f"@{from_user.username}" if from_user.username else str(from_user.id)
     text = (
-        "🆕 <b>Новий оператор на модерації</b>\n"
+        "🆕 <b>Новий оператор зареєструвався</b>\n"
         f"ID: <code>{operator_id}</code>\n"
         f"Назва: {html.escape(name)}\n"
         f"Телефон: {html.escape(phone)}\n"
         f"Telegram: {html.escape(username)} (id {from_user.id})\n\n"
-        "Активуйте кнопкою нижче, або вручну: "
-        f"set_operator_status({operator_id}, 'active')"
+        "Активується автоматично, щойно підтвердить токен Monobank і додасть "
+        "станцію — дія не потрібна. Форсувати негайно (запасний шлях): "
+        f"кнопка нижче, або set_operator_status({operator_id}, 'active')"
     )
     try:
         await bot.send_message(
@@ -180,6 +196,46 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
         # (напр. переглянувши таблицю руками).
         logger.error("Не вдалося сповістити LOGS_CHAT_ID про нового оператора %s: %s",
                      operator_id, e)
+
+
+async def _notify_admins_operator_auto_activated(operator_id: int, name: str):
+    """
+    Змінений жанр сповіщення (рев'ю специфікації): не «дія потрібна» (як
+    _notify_admins_new_operator вище), а «інформація» — оператор пройшов усі
+    три критерії й активувався сам. Кнопка тут — «Призупинити», головний
+    запобіжник самообслуговування, не «Активувати».
+    """
+    chat_id = os.getenv("LOGS_CHAT_ID")
+    if not chat_id:
+        return
+    text = (
+        "✅ <b>Оператор активувався самостійно</b>\n"
+        f"ID: <code>{operator_id}</code>\n"
+        f"Назва: {html.escape(name)}\n\n"
+        "Профіль заповнено, токен Monobank підтверджено банком, додано станцію — "
+        "оплати вже приймаються. Дії не потрібно; призупинити — кнопкою нижче."
+    )
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML",
+            reply_markup=get_admin_suspend_keyboard(operator_id),
+        )
+    except Exception as e:
+        logger.error("Не вдалося сповістити LOGS_CHAT_ID про автоактивацію оператора %s: %s",
+                     operator_id, e)
+
+
+async def _announce_auto_activation(operator, message: Message):
+    """
+    Спільний "епілог" для обох тригерів автоактивації (підтвердження токена
+    і створення станції — save_monobank_token/cabinet_verify_token та
+    station_wizard_tariff_start): повідомляє самого оператора в те саме
+    повідомлення, що завершує крок, і штовхає інформаційний пуш адміну.
+    """
+    await message.answer(
+        "🎉 Усі кроки пройдено — кабінет активовано автоматично! Станції тепер приймають оплати."
+    )
+    await _notify_admins_operator_auto_activated(operator["id"], operator["name"])
 
 
 @router.message(StateFilter(OperatorOnboarding.waiting_for_name), _is_free_text)
@@ -216,10 +272,10 @@ async def onboarding_phone(message: Message, state: FSMContext):
         return
 
     await message.answer(
-        "✅ Заявку подано! Очікуйте підтвердження — ми напишемо, коли акаунт "
-        "активовано. До того часу можна одразу підключити еквайринг і додати "
-        "станції через /operator: платежі почнуть прийматись одразу після "
-        "активації."
+        "✅ Заявку подано! Кабінет активується автоматично, щойно ви підключите "
+        "й підтвердите токен Monobank та додасте хоча б одну станцію — жодної "
+        "додаткової дії з нашого боку не потрібно. Прогрес видно в кабінеті "
+        "(/operator → «📋 Прогрес активації»)."
     )
     await _notify_admins_new_operator(operator_id, name, phone, message.from_user)
 
@@ -299,6 +355,102 @@ async def admin_activate_operator(callback: CallbackQuery):
                     operator_id, e)
 
 
+@router.callback_query(F.data.startswith("opadm:suspend:"), StateFilter("*"))
+async def admin_suspend_operator(callback: CallbackQuery):
+    """
+    Кнопка «🚫 Призупинити» під сповіщенням про автоактивацію — головний
+    запобіжник самообслуговуваного онбордингу: якщо оператор, що активувався
+    сам, викликає підозру, я вимикаю прийом оплат одним кліком з того ж
+    місця. Той самий гейт і той самий формат callback_data (не секрет), що
+    admin_activate_operator вище.
+    """
+    if not _is_from_admin_chat(callback.message.chat.id):
+        logger.warning(
+            "Telegram-користувач %s (чат %s) спробував призупинити оператора "
+            "поза адмін-чатом: %r", callback.from_user.id, callback.message.chat.id,
+            callback.data,
+        )
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    try:
+        operator_id = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некоректна кнопка", show_alert=True)
+        return
+
+    operator = await repo.get_operator(operator_id)
+    if operator is None:
+        await callback.answer("Оператора не знайдено", show_alert=True)
+        return
+
+    if operator["status"] == "suspended":
+        await callback.answer("Уже призупинено")
+        return
+
+    await repo.set_operator_status(operator_id, "suspended")
+    logger.info("🚫 Оператора %s призупинено через адмін-чат %s",
+                operator_id, callback.message.chat.id)
+
+    try:
+        await bot.send_message(
+            chat_id=operator["telegram_id"],
+            text="⛔ Ваш кабінет призупинено. Зверніться до підтримки.",
+        )
+    except Exception as e:
+        logger.error("Не вдалося сповістити оператора %s (telegram_id=%s) про призупинення: %s",
+                     operator_id, operator["telegram_id"], e)
+
+    await callback.answer("Готово")
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n🚫 <b>Призупинено</b>", parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.info("Не вдалося оновити повідомлення про призупинення оператора %s: %s",
+                    operator_id, e)
+
+
+# ---------------------------------------------------------------------------
+# Чек-лист прогресу активації (самообслуговуваний онбординг)
+# ---------------------------------------------------------------------------
+
+def _checklist_text(checklist) -> str:
+    def mark(done):
+        return "✅" if done else "❌"
+
+    lines = [
+        "📋 <b>Прогрес активації</b>",
+        "",
+        f"{mark(checklist.profile_complete)} Профіль (назва й телефон)",
+        f"{mark(checklist.token_verified)} Токен Monobank підключено й підтверджено банком",
+        f"{mark(checklist.has_station)} Додано хоча б одну станцію",
+        "",
+    ]
+    if checklist.ready:
+        lines.append("🎉 Усі кроки пройдено — кабінет активний.")
+    else:
+        lines.append(
+            "Щойно всі пункти стануть ✅ — кабінет активується автоматично, "
+            "без жодної додаткової дії з нашого боку."
+        )
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "opm:checklist", StateFilter("*"))
+async def cabinet_checklist(callback: CallbackQuery):
+    operator = await _resolve_operator_for(callback.from_user.id)
+    if operator is None:
+        await callback.answer("Спершу зареєструйтесь: /operator", show_alert=True)
+        return
+    checklist = await operator_activation.get_checklist(operator["id"])
+    await callback.answer()
+    await callback.message.edit_text(
+        _checklist_text(checklist), parse_mode="HTML",
+        reply_markup=get_checklist_keyboard(checklist),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Підключення еквайрингу Monobank
 # ---------------------------------------------------------------------------
@@ -308,6 +460,9 @@ async def cabinet_connect_token(callback: CallbackQuery, state: FSMContext):
     operator = await _resolve_operator_for(callback.from_user.id)
     if operator is None:
         await callback.answer("Спершу зареєструйтесь: /operator", show_alert=True)
+        return
+    if _is_suspended(operator):
+        await callback.answer(_OPERATOR_STATUS_NOTES["suspended"], show_alert=True)
         return
     if callback.message.chat.type != "private":
         await callback.answer("Токен приймається лише в приватному чаті з ботом.", show_alert=True)
@@ -334,6 +489,54 @@ async def _try_delete_token_message(message: Message, operator_id: int = None):
                     operator_id, e)
 
 
+async def _verify_token_and_respond(operator, encrypted_token: str, target: Message):
+    """
+    Спільна перевірка токена для save_monobank_token() (одразу після
+    збереження) і cabinet_verify_token() (повторна спроба з чек-листа —
+    БЕЗ повторного вводу токена). Розшифровує токен лише в межах цього
+    виклику — назовні (лог, чат) відкритий токен ніколи не потрапляє.
+
+    Три можливі результати чітко розрізнені: банк явно відхилив токен
+    (MonobankError НЕ кинуто, verify_merchant_token повернув False) —
+    оператор лишається pending, і це видно з тексту; банк недоступний
+    зараз (MonobankError) — так само pending, але без натяку, що токен
+    поганий (текст самого винятку в чат НЕ йде — анти-оракул); підтверджено
+    — mark_operator_token_verified() + спроба автоактивації.
+    """
+    try:
+        token_plain = decrypt_secret(encrypted_token)
+    except EncryptionKeyMissing as e:
+        logger.error("Не вдалося розшифрувати токен оператора %s для перевірки: %s",
+                     operator["id"], e)
+        await target.answer("⚠️ Не вдалось перевірити токен зараз. Спробуйте ще раз пізніше.")
+        return
+
+    try:
+        valid = await verify_merchant_token(token_plain)
+    except MonobankError as e:
+        logger.error("Перевірка токена оператора %s не вдалась: %s", operator["id"], e)
+        await target.answer(
+            "⚠️ Не вдалось перевірити токен банком зараз (тимчасова недоступність). "
+            "Токен уже збережено, вводити повторно не треба — спробуйте перевірку ще раз "
+            "трохи пізніше («📋 Прогрес активації» → «🔁 Перевірити токен ще раз»)."
+        )
+        return
+
+    if not valid:
+        await target.answer(
+            "❌ Банк не підтвердив токен. Перевірте, що скопіювали правильний токен мерчанта, "
+            "і підключіть його ще раз через «💳 Підключити еквайринг»."
+        )
+        return
+
+    await repo.mark_operator_token_verified(operator["id"])
+    await target.answer("✅ Токен підтверджено банком.")
+
+    just_activated = await operator_activation.try_auto_activate(operator["id"])
+    if just_activated:
+        await _announce_auto_activation(operator, target)
+
+
 @router.message(StateFilter(MonobankConnect.waiting_for_token), _is_free_text)
 async def save_monobank_token(message: Message, state: FSMContext):
     await state.clear()
@@ -347,6 +550,7 @@ async def save_monobank_token(message: Message, state: FSMContext):
 
     operator = await _resolve_operator_for(message.from_user.id)
     token = message.text.strip()
+    encrypted = None
 
     if operator is not None and token:
         encrypted = encrypt_secret(token)
@@ -363,7 +567,35 @@ async def save_monobank_token(message: Message, state: FSMContext):
         return
 
     tail = token[-4:] if len(token) >= 4 else token
-    await message.answer(f"✅ Токен збережено, закінчується на …{tail}.")
+    await message.answer(f"Токен збережено, закінчується на …{tail}. Перевіряю банком…")
+    await _verify_token_and_respond(operator, encrypted, message)
+
+
+@router.callback_query(F.data == "opm:verify_token", StateFilter("*"))
+async def cabinet_verify_token(callback: CallbackQuery):
+    """
+    «🔁 Перевірити токен ще раз» у чек-листі — без повторного вводу токена.
+
+    _is_suspended guard тут не закриває дірку в безпеці (try_auto_activate
+    все одно вимагає status='pending', тож suspended-оператор не міг би
+    активуватись через цей шлях) — це про інше: призупинений оператор не
+    має змушувати систему марно ходити в банк.
+    """
+    operator = await _resolve_operator_for(callback.from_user.id)
+    if operator is None:
+        await callback.answer("Спершу зареєструйтесь: /operator", show_alert=True)
+        return
+    if _is_suspended(operator):
+        await callback.answer(_OPERATOR_STATUS_NOTES["suspended"], show_alert=True)
+        return
+
+    encrypted = await repo.get_operator_monobank_token_encrypted(operator["id"])
+    if not encrypted:
+        await callback.answer("Спершу підключіть токен: «💳 Підключити еквайринг»", show_alert=True)
+        return
+
+    await callback.answer("Перевіряю…")
+    await _verify_token_and_respond(operator, encrypted, callback.message)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +607,9 @@ async def cabinet_add_station_start(callback: CallbackQuery, state: FSMContext):
     operator = await _resolve_operator_for(callback.from_user.id)
     if operator is None:
         await callback.answer("Спершу зареєструйтесь: /operator", show_alert=True)
+        return
+    if _is_suspended(operator):
+        await callback.answer(_OPERATOR_STATUS_NOTES["suspended"], show_alert=True)
         return
     await state.set_state(StationWizard.waiting_for_name)
     await callback.answer()
@@ -544,6 +779,13 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
     if operator is None:
         await message.answer("Спершу зареєструйтесь: /operator")
         return
+    if _is_suspended(operator):
+        # Вхід у майстер (cabinet_add_station_start) уже захищений, але
+        # FSM-стан живе в Redis — призупинення посеред майстра не скасовує
+        # вже розпочату сесію. Це ОСТАННІЙ крок, де рядок реально пишеться
+        # в БД, тож саме тут — фінальний рубіж захисту.
+        await message.answer(_OPERATOR_STATUS_NOTES["suspended"])
+        return
 
     station_id, qr_slug = await repo.create_station(
         operator["id"], data["name"], data["tariff_uah_kwh"],
@@ -552,6 +794,13 @@ async def station_wizard_tariff_start(message: Message, state: FSMContext):
         power_kw=data.get("power_kw"), tariff_uah_start=tariff_start,
     )
     await _send_new_station_qr(message, data["name"], qr_slug)
+
+    # Друга з двох точок, де автоактивація МОЖЕ закрити останній критерій
+    # (перша — _verify_token_and_respond вище): станція могла стати саме
+    # тим, чого бракувало, якщо токен уже підтверджено раніше.
+    just_activated = await operator_activation.try_auto_activate(operator["id"])
+    if just_activated:
+        await _announce_auto_activation(operator, message)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +883,9 @@ async def station_action(callback: CallbackQuery, state: FSMContext):
             reply_markup=get_station_detail_keyboard(station_id, station["status"]),
         )
     elif action == "toggle":
+        if _is_suspended(operator):
+            await callback.answer(_OPERATOR_STATUS_NOTES["suspended"], show_alert=True)
+            return
         new_status = "disabled" if station["status"] == "active" else "active"
         await repo.set_station_status(operator["id"], station_id, new_status)
         station = await repo.get_station(operator["id"], station_id)
@@ -650,6 +902,9 @@ async def station_action(callback: CallbackQuery, state: FSMContext):
             caption=f"QR станції «{station['name']}»",
         )
     elif action == "tariff":
+        if _is_suspended(operator):
+            await callback.answer(_OPERATOR_STATUS_NOTES["suspended"], show_alert=True)
+            return
         await state.set_state(TariffEdit.waiting_for_new_tariff)
         await state.update_data(station_id=station_id)
         await callback.answer()
@@ -675,6 +930,9 @@ async def tariff_edit_apply(message: Message, state: FSMContext):
     operator = await _resolve_operator_for(message.from_user.id)
     if operator is None or station_id is None:
         await message.answer("Спершу зареєструйтесь: /operator")
+        return
+    if _is_suspended(operator):
+        await message.answer(_OPERATOR_STATUS_NOTES["suspended"])
         return
 
     station = await repo.get_station(operator["id"], station_id)

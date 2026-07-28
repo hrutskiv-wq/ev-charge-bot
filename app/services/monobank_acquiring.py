@@ -29,6 +29,7 @@ BASE_URL = os.getenv("MONOBANK_ACQUIRING_BASE_URL", "https://api.monobank.ua").r
 
 CREATE_INVOICE_PATH = "/api/merchant/invoice/create"
 INVOICE_STATUS_PATH = "/api/merchant/invoice/status"
+MERCHANT_DETAILS_PATH = "/api/merchant/details"
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -136,3 +137,38 @@ async def get_invoice_status(operator_token: str, invoice_id: str) -> dict:
             f"Monobank не віддав статус інвойсу {invoice_id} (HTTP {resp.status_code}): {resp.text}"
         )
     return resp.json()
+
+
+async def verify_merchant_token(operator_token: str) -> bool:
+    """
+    Підтверджує токен реальним зверненням до банку (GET
+    /api/merchant/details) — найсильніший автоматичний сигнал довіри для
+    самообслуговуваного онбордингу оператора: пройти цю перевірку може лише
+    той, у кого справді є живий мерчант-акаунт Monobank Acquiring.
+
+    Повертає True/False лише коли банк дав ОДНОЗНАЧНУ відповідь:
+      * True — HTTP 200, токен валідний;
+      * False — HTTP 401/403, банк явно відхилив токен (це і є "недійсний
+        токен", а не помилка виклику).
+    Будь-що інше (мережевий збій, таймаут, 5xx, неочікуваний код) —
+    MonobankError: тут НЕВІДОМО, токен поганий чи банк тимчасово
+    недоступний, тож викликач має лишити оператора в 'pending' із
+    нейтральним "спробуйте пізніше", а не позначати токен невалідним.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{BASE_URL}{MERCHANT_DETAILS_PATH}",
+                headers={"X-Token": operator_token},
+                timeout=DEFAULT_TIMEOUT,
+            )
+    except httpx.HTTPError as e:
+        raise MonobankError(f"Monobank недоступний при перевірці токена: {e}") from e
+
+    if resp.status_code in (401, 403):
+        return False
+    if resp.status_code != 200:
+        raise MonobankError(
+            f"Monobank повернув неочікуваний статус при перевірці токена (HTTP {resp.status_code}): {resp.text}"
+        )
+    return True

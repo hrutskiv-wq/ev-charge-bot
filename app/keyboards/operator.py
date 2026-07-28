@@ -7,13 +7,34 @@ CONNECTOR_PRESETS = ["Type 2", "GB/T AC", "Schuko", "CEE 5-pin (3ф)"]
 CONNECTOR_OTHER_CALLBACK = "opconn:__other__"
 
 
-def get_cabinet_menu(has_token: bool):
+def get_cabinet_menu(has_token: bool, show_checklist: bool = False):
+    """show_checklist — лише поки status == 'pending' (самообслуговуваний онбординг)."""
     builder = InlineKeyboardBuilder()
+    if show_checklist:
+        builder.button(text="📋 Прогрес активації", callback_data="opm:checklist")
     builder.button(text="🔌 Мої станції", callback_data="opm:stations")
     builder.button(text="➕ Додати станцію", callback_data="opm:add_station")
     token_label = "💳 Еквайринг підключено" if has_token else "💳 Підключити еквайринг"
     builder.button(text=token_label, callback_data="opm:token")
     builder.button(text="💰 Виручка", callback_data="opm:revenue")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_checklist_keyboard(checklist):
+    """
+    Кнопка на кожен незакритий критерій: немає токена взагалі -> підключити;
+    є, але ще не підтверджений банком -> повторна перевірка (БЕЗ повторного
+    вводу токена). Обидва пункти можуть бути закриті одночасно.
+    """
+    builder = InlineKeyboardBuilder()
+    if not checklist.has_token:
+        builder.button(text="💳 Підключити еквайринг", callback_data="opm:token")
+    elif not checklist.token_verified:
+        builder.button(text="🔁 Перевірити токен ще раз", callback_data="opm:verify_token")
+    if not checklist.has_station:
+        builder.button(text="➕ Додати станцію", callback_data="opm:add_station")
+    builder.button(text="⬅️ Кабінет", callback_data="opm:home")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -59,9 +80,21 @@ def get_revenue_csv_keyboard(period: str):
 
 
 def get_admin_activation_keyboard(operator_id: int):
-    """Кнопка під повідомленням про нового оператора в LOGS_CHAT_ID."""
+    """
+    Кнопка під повідомленням про нового оператора в LOGS_CHAT_ID. Ручний
+    запасний шлях — самообслуговуваний онбординг активує оператора
+    автоматично, ця кнопка лишається для форсованої негайної активації.
+    """
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Активувати", callback_data=f"opadm:activate:{operator_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_suspend_keyboard(operator_id: int):
+    """Кнопка під сповіщенням про автоактивацію — головний запобіжник самообслуговування."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Призупинити", callback_data=f"opadm:suspend:{operator_id}")
     builder.adjust(1)
     return builder.as_markup()
 

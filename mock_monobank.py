@@ -118,6 +118,26 @@ async def invoice_status(invoiceId: str, x_token: str = Header(None)):
     return {k: v for k, v in invoice.items() if not k.startswith("_")}
 
 
+@app.get("/api/merchant/details")
+async def merchant_details(x_token: str = Header(None)):
+    """
+    Мок для верифікації токена самообслуговуваного онбордингу
+    (app/services/monobank_acquiring.py::verify_merchant_token()). Будь-який
+    непорожній токен, окрім спеціального маркера "invalid-token" (зручно для
+    ручної перевірки гілки відмови), вважається валідним мерчантом.
+    """
+    if not x_token:
+        raise HTTPException(status_code=403, detail="X-Token required")
+    if x_token == "invalid-token":
+        raise HTTPException(status_code=403, detail="invalid merchant token")
+    return {
+        "merchantId": f"mock-{x_token[-6:]}",
+        "merchantName": "Mock Merchant",
+        "edrpou": "00000000",
+        "workSchedule": [],
+    }
+
+
 @app.post("/mock/pay/{invoice_id}")
 async def mock_pay(invoice_id: str, result: str = "success"):
     """Імітує дію водія: оплату (або провал) інвойсу."""

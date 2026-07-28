@@ -158,6 +158,7 @@ class RepoState:
     def add_operator(self, **overrides):
         op = {"id": self.next_operator_id, "name": "Готель Едем", "phone": "+380501112233",
               "telegram_id": TELEGRAM_A, "status": "pending", "commission_pct": 4,
+              "monobank_token_verified_at": None, "activated_at": None, "is_public": False,
               "created_at": None}
         op.update(overrides)
         self.operators_by_tid[op["telegram_id"]] = op
@@ -194,6 +195,8 @@ def rs(monkeypatch):
         if op is None:
             return False
         op["status"] = status
+        if status == "active" and op.get("activated_at") is None:
+            op["activated_at"] = "ACTIVATED"
         return True
 
     async def create_operator(name, telegram_id, phone=None, commission_pct=4):
@@ -208,6 +211,32 @@ def rs(monkeypatch):
 
     async def set_operator_monobank_token(operator_id, token_encrypted):
         st.tokens[operator_id] = token_encrypted
+        op = st.operators_by_id.get(operator_id)
+        if op is not None:
+            # Дзеркалить реальний repo: новий токен скидає підтвердження.
+            op["monobank_token_verified_at"] = None
+        return True
+
+    async def mark_operator_token_verified(operator_id):
+        op = st.operators_by_id.get(operator_id)
+        if op is None:
+            return False
+        op["monobank_token_verified_at"] = "VERIFIED"
+        return True
+
+    async def activate_operator_if_pending(operator_id):
+        op = st.operators_by_id.get(operator_id)
+        if op is None or op["status"] != "pending":
+            return False
+        op["status"] = "active"
+        op["activated_at"] = "ACTIVATED"
+        return True
+
+    async def set_operator_public(operator_id, is_public):
+        op = st.operators_by_id.get(operator_id)
+        if op is None:
+            return False
+        op["is_public"] = is_public
         return True
 
     async def list_stations(operator_id):
@@ -269,6 +298,9 @@ def rs(monkeypatch):
         ("create_operator", create_operator),
         ("get_operator_monobank_token_encrypted", get_operator_monobank_token_encrypted),
         ("set_operator_monobank_token", set_operator_monobank_token),
+        ("mark_operator_token_verified", mark_operator_token_verified),
+        ("activate_operator_if_pending", activate_operator_if_pending),
+        ("set_operator_public", set_operator_public),
         ("list_stations", list_stations),
         ("get_station", get_station),
         ("create_station", create_station),
@@ -304,6 +336,20 @@ def encryption_key(monkeypatch):
 def _no_admin_chat(monkeypatch):
     """LOGS_CHAT_ID не задано за замовчуванням — тести на нього вмикають окремо."""
     monkeypatch.delenv("LOGS_CHAT_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _default_verify_token(monkeypatch):
+    """
+    save_monobank_token()/cabinet_verify_token() реально звертаються до
+    банку (verify_merchant_token) — тести НЕ мають залежати від мережі.
+    За замовчуванням банк "підтверджує" будь-який токен; тести на конкретні
+    гілки (невалідний токен / банк недоступний) підміняють цю заглушку
+    самостійно.
+    """
+    async def _default_verify(token):
+        return True
+    monkeypatch.setattr(ob, "verify_merchant_token", _default_verify)
 
 
 # ---------------------------------------------------------------------------
@@ -1232,3 +1278,406 @@ def test_parse_skip(raw, expected):
 ])
 def test_parse_positive_decimal(raw, expected):
     assert ob._parse_positive_decimal(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# Самообслуговуваний онбординг: верифікація токена банком
+# ---------------------------------------------------------------------------
+
+async def test_save_monobank_token_verified_but_activation_incomplete_does_not_activate(
+        rs, fake_bot, encryption_key, admin_env):
+    """Токен підтверджено, але станції ще немає — не остання ланка, активації не буде."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("merchant-token-ABCD")
+
+    await ob.save_monobank_token(message, state)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "pending"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] is not None
+    texts = [t for t, _ in message.sent]
+    assert any("підтверджено банком" in t for t in texts)
+    assert not any("активовано" in t for t in texts)
+    assert fake_bot.sent == [], "Активації не було — сповіщення адміну про автоактивацію не мало піти"
+
+
+async def test_save_monobank_token_completes_last_criterion_triggers_auto_activation(
+        rs, fake_bot, encryption_key, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    rs.add_station(id=10, operator_id=OPERATOR_A)  # 2 із 3 критеріїв уже закриті
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("merchant-token-ABCD")
+
+    await ob.save_monobank_token(message, state)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    texts = [t for t, _ in message.sent]
+    assert any("активовано автоматично" in t for t in texts)
+
+    assert len(fake_bot.sent) == 1
+    chat_id, admin_text, kwargs = fake_bot.sent[0]
+    assert chat_id == str(ADMIN_CHAT_ID)
+    assert "активувався самостійно" in admin_text
+    button_data = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert f"opadm:suspend:{OPERATOR_A}" in button_data
+
+
+async def test_auto_activation_notification_escapes_html_in_operator_name(
+        rs, fake_bot, encryption_key, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending",
+                    name="Готель <b>Едем</b> & Ко")
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("merchant-token-ABCD")
+
+    await ob.save_monobank_token(message, state)
+
+    _chat_id, admin_text, _kwargs = fake_bot.sent[0]
+    assert "<b>Едем</b>" not in admin_text
+    assert "&lt;b&gt;Едем&lt;/b&gt; &amp; Ко" in admin_text
+
+
+async def test_station_wizard_completion_triggers_auto_activation_when_last_criterion(
+        rs, fake_bot, admin_env, monkeypatch):
+    """Другий тригер (перший — токен вище): станція може стати ОСТАННЬОЮ ланкою, якщо токен уже підтверджено."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending",
+                    monobank_token_verified_at="2026-07-28")
+    monkeypatch.setattr(ob, "generate_station_qr_png", lambda url: b"\x89PNG\r\n\x1a\nfake")
+
+    state = FakeFSMContext()
+    state.data.update(name="Готель Едем", tariff_uah_kwh=12.5)
+    await state.set_state(ob.StationWizard.waiting_for_tariff_start)
+    message = FakeMessage("-")
+
+    await ob.station_wizard_tariff_start(message, state)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    texts = [t for t, _ in message.sent]
+    assert any("активовано автоматично" in t for t in texts)
+    assert len(fake_bot.sent) == 1
+    _chat_id, admin_text, _kwargs = fake_bot.sent[0]
+    assert "активувався самостійно" in admin_text
+
+
+async def test_save_monobank_token_invalid_token_does_not_activate(rs, fake_bot, encryption_key, monkeypatch):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+
+    async def fake_verify(token):
+        return False
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("bad-token")
+
+    await ob.save_monobank_token(message, state)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "pending"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] is None
+    assert any("не підтвердив" in t for t, _ in message.sent)
+    assert fake_bot.sent == []
+
+
+async def test_save_monobank_token_bank_unavailable_leaves_pending_no_crash(rs, fake_bot, encryption_key, monkeypatch):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+
+    UNIQUE_MARKER = "connection-refused-xyz789"
+    async def fake_verify(token):
+        raise ob.MonobankError(UNIQUE_MARKER)
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("some-token")
+
+    await ob.save_monobank_token(message, state)  # не має перевикинути
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "pending"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] is None
+    texts = [t for t, _ in message.sent]
+    assert any("тимчасова недоступність" in t for t in texts)
+    assert not any(UNIQUE_MARKER in t for t in texts), "Текст винятку не має йти в чат"
+
+
+async def test_cabinet_verify_token_without_saved_token_shows_alert(rs, monkeypatch):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    calls = []
+    async def fake_verify(token):
+        calls.append(token)
+        return True
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    callback = FakeCallback("opm:verify_token", telegram_id=TELEGRAM_A)
+    await ob.cabinet_verify_token(callback)
+
+    assert calls == [], "Немає збереженого токена — банк не мав опитуватись"
+    assert callback.answers[-1][1] is True  # show_alert
+
+
+async def test_cabinet_verify_token_retries_without_reentering_token(rs, fake_bot, encryption_key, admin_env):
+    """«🔁 Перевірити ще раз» — розшифровує ВЖЕ збережений токен, без повторного вводу."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+    rs.tokens[OPERATOR_A] = ob.encrypt_secret("previously-saved-token")
+
+    callback = FakeCallback("opm:verify_token", telegram_id=TELEGRAM_A)
+    await ob.cabinet_verify_token(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    assert any("підтверджено банком" in t for t, _ in callback.message.sent)
+
+
+# ---------------------------------------------------------------------------
+# Чек-лист прогресу активації
+# ---------------------------------------------------------------------------
+
+async def test_checklist_screen_shows_pending_items_and_buttons(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    callback = FakeCallback("opm:checklist", telegram_id=TELEGRAM_A)
+
+    await ob.cabinet_checklist(callback)
+
+    text = callback.message.edited[0][0]
+    assert "✅ Профіль" in text, "Ім'я й телефон уже задані онбордингом"
+    assert "❌ Токен" in text
+    assert "❌ Додано" in text
+
+    kb = callback.message.edited[0][1]["reply_markup"]
+    button_data = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "opm:token" in button_data
+    assert "opm:add_station" in button_data
+    assert "opm:verify_token" not in button_data
+
+
+async def test_checklist_screen_shows_retry_button_when_token_saved_but_unverified(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    rs.tokens[OPERATOR_A] = "encrypted-but-not-verified"
+    callback = FakeCallback("opm:checklist", telegram_id=TELEGRAM_A)
+
+    await ob.cabinet_checklist(callback)
+
+    kb = callback.message.edited[0][1]["reply_markup"]
+    button_data = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "opm:verify_token" in button_data
+    assert "opm:token" not in button_data
+
+
+async def test_checklist_screen_all_done_shows_active_message(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active",
+                    monobank_token_verified_at="2026-07-28")
+    rs.tokens[OPERATOR_A] = "encrypted-verified"
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+    callback = FakeCallback("opm:checklist", telegram_id=TELEGRAM_A)
+
+    await ob.cabinet_checklist(callback)
+
+    text = callback.message.edited[0][0]
+    assert "✅ Профіль" in text and "✅ Токен" in text and "✅ Додано" in text
+    assert "кабінет активний" in text
+
+
+async def test_cabinet_home_shows_checklist_button_only_when_pending(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    message = FakeMessage("/operator")
+
+    await ob.cmd_operator_cabinet(message, FakeFSMContext())
+
+    kb = message.sent[0][1]["reply_markup"]
+    button_data = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "opm:checklist" in button_data
+
+
+async def test_cabinet_home_hides_checklist_button_when_active(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    message = FakeMessage("/operator")
+
+    await ob.cmd_operator_cabinet(message, FakeFSMContext())
+
+    kb = message.sent[0][1]["reply_markup"]
+    button_data = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "opm:checklist" not in button_data
+
+
+# ---------------------------------------------------------------------------
+# Призупинення оператора кнопкою з адмін-чату (головний запобіжник)
+# ---------------------------------------------------------------------------
+
+async def test_admin_suspend_sets_status_and_notifies_operator(rs, fake_bot, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    callback = FakeCallback(f"opadm:suspend:{OPERATOR_A}", telegram_id=999999,
+                            chat_id=ADMIN_CHAT_ID, html_text="✅ Оператор активувався самостійно")
+
+    await ob.admin_suspend_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "suspended"
+    assert len(fake_bot.sent) == 1
+    chat_id, text, _kwargs = fake_bot.sent[0]
+    assert chat_id == TELEGRAM_A
+    assert "призупинено" in text.lower()
+    assert callback.answers[-1] == ("Готово", False)
+    assert "Призупинено" in callback.message.edited[0][0]
+
+
+async def test_admin_suspend_rejected_from_non_admin_chat(rs, fake_bot, admin_env, caplog):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    callback = FakeCallback(f"opadm:suspend:{OPERATOR_A}", chat_id=555555)
+
+    with caplog.at_level("WARNING"):
+        await ob.admin_suspend_operator(callback)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "active"
+    assert fake_bot.sent == []
+    assert callback.answers == [("Недоступно", True)]
+    assert "поза адмін-чатом" in caplog.text
+
+
+async def test_admin_suspend_second_click_is_idempotent(rs, fake_bot, admin_env):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    first = FakeCallback(f"opadm:suspend:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+    await ob.admin_suspend_operator(first)
+    assert len(fake_bot.sent) == 1
+
+    second = FakeCallback(f"opadm:suspend:{OPERATOR_A}", chat_id=ADMIN_CHAT_ID)
+    await ob.admin_suspend_operator(second)
+
+    assert rs.operators_by_id[OPERATOR_A]["status"] == "suspended"
+    assert len(fake_bot.sent) == 1, "Повторне натискання не має слати друге сповіщення"
+    assert second.answers == [("Уже призупинено", False)]
+
+
+async def test_admin_suspend_unknown_operator_shows_alert(rs, fake_bot, admin_env):
+    callback = FakeCallback("opadm:suspend:999999", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_suspend_operator(callback)
+
+    assert fake_bot.sent == []
+    assert callback.answers == [("Оператора не знайдено", True)]
+
+
+async def test_admin_suspend_rejects_malformed_callback_data(rs, fake_bot, admin_env):
+    callback = FakeCallback("opadm:suspend:not-a-number", chat_id=ADMIN_CHAT_ID)
+
+    await ob.admin_suspend_operator(callback)
+
+    assert fake_bot.sent == []
+    assert callback.answers == [("Некоректна кнопка", True)]
+
+
+# ---------------------------------------------------------------------------
+# Suspended-оператор: перегляд лишається, мутації — ні (явне рішення,
+# раніше відкрите питання беклогу Промпту 4)
+# ---------------------------------------------------------------------------
+
+async def test_suspended_operator_cannot_connect_token(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    callback = FakeCallback("opm:token", telegram_id=TELEGRAM_A)
+    state = FakeFSMContext()
+
+    await ob.cabinet_connect_token(callback, state)
+
+    assert state.state is None
+    assert callback.answers[-1][1] is True
+
+
+async def test_suspended_operator_cannot_start_station_wizard(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    callback = FakeCallback("opm:add_station", telegram_id=TELEGRAM_A)
+    state = FakeFSMContext()
+
+    await ob.cabinet_add_station_start(callback, state)
+
+    assert state.state is None
+    assert callback.answers[-1][1] is True
+
+
+async def test_suspended_operator_cannot_toggle_station_status(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.add_station(id=10, operator_id=OPERATOR_A, status="active")
+    callback = FakeCallback("opst:10:toggle", telegram_id=TELEGRAM_A)
+
+    await ob.station_action(callback, FakeFSMContext())
+
+    assert rs.stations[10]["status"] == "active", "Статус станції не мав змінитись"
+    assert callback.answers[-1][1] is True
+
+
+async def test_suspended_operator_cannot_enter_tariff_edit(rs):
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+    callback = FakeCallback("opst:10:tariff", telegram_id=TELEGRAM_A)
+    state = FakeFSMContext()
+
+    await ob.station_action(callback, state)
+
+    assert state.state is None
+    assert callback.answers[-1][1] is True
+
+
+async def test_suspended_operator_cannot_submit_tariff_edit(rs):
+    """Захист і на самому фінальному кроці — на випадок призупинення посеред редагування тарифу."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.add_station(id=10, operator_id=OPERATOR_A, tariff_uah_kwh=12.5)
+    state = FakeFSMContext()
+    state.data["station_id"] = 10
+    await state.set_state(ob.TariffEdit.waiting_for_new_tariff)
+    message = FakeMessage("15.0")
+
+    await ob.tariff_edit_apply(message, state)
+
+    assert rs.stations[10]["tariff_uah_kwh"] == 12.5, "Тариф не мав змінитись"
+    assert "призупинено" in message.sent[0][0].lower()
+
+
+async def test_suspended_operator_can_still_view_station_read_only(rs):
+    """Прозорість не шкодить: перегляд картки станції suspended-оператору лишається доступним."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.add_station(id=10, operator_id=OPERATOR_A)
+    callback = FakeCallback("opst:10:view", telegram_id=TELEGRAM_A)
+
+    await ob.station_action(callback, FakeFSMContext())
+
+    assert callback.message.edited, "Перегляд картки станції має відбутись навіть для suspended"
+
+
+async def test_suspended_operator_cannot_verify_token(rs, monkeypatch):
+    """
+    Дірки в безпеці немає (try_auto_activate вимагає status='pending'), але
+    призупинений оператор не має змушувати систему марно ходити в банк.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.tokens[OPERATOR_A] = "encrypted-but-not-verified"
+    calls = []
+    async def fake_verify(token):
+        calls.append(token)
+        return True
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    callback = FakeCallback("opm:verify_token", telegram_id=TELEGRAM_A)
+    await ob.cabinet_verify_token(callback)
+
+    assert calls == [], "Suspended-оператор не мав дійти до звернення в банк"
+    assert callback.answers[-1][1] is True
+
+
+async def test_suspended_operator_mid_wizard_cannot_create_station(rs, monkeypatch):
+    """
+    Вхід у майстер (cabinet_add_station_start) захищений, але FSM-стан
+    живе в Redis — якщо оператора призупинили ПОСЕРЕД майстра, останній
+    крок (де рядок реально пишеться в БД) мусить лишитись останнім рубежем.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    monkeypatch.setattr(ob, "generate_station_qr_png", lambda url: b"\x89PNG\r\n\x1a\nfake")
+
+    state = FakeFSMContext()
+    state.data.update(name="Готель Едем", tariff_uah_kwh=12.5)
+    await state.set_state(ob.StationWizard.waiting_for_tariff_start)
+    message = FakeMessage("-")
+
+    await ob.station_wizard_tariff_start(message, state)
+
+    assert rs.created_stations == [], "Станція не мала створитись"
+    assert "призупинено" in message.sent[0][0].lower()

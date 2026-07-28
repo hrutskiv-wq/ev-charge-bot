@@ -270,6 +270,19 @@ async def init_operator_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_charging_reservations_session ON charging_reservations(operator_session_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_charging_reservations_status_created ON charging_reservations(status, created_at);")
 
+        # 12. Самообслуговуваний онбординг (Промпт "самообслуговуваний
+        # онбординг", міграція 0017) — три нові поля на operators. DEFAULT/
+        # CHECK звірені посимвольно з migrations/versions/0017_operator_
+        # self_service.py — коментар там пояснює призначення кожного поля.
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS monobank_token_verified_at TIMESTAMP WITH TIME ZONE;")
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP WITH TIME ZONE;")
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE;")
+        # commission_pct: DEFAULT 4->5 (бізнес-рішення 2026-07-23), лише для
+        # НОВИХ рядків — наявні оператори (прод: id=1, 4.00) свідомо НЕ
+        # чіпаються жодним UPDATE. Той самий рядок, символ у символ, що в
+        # migrations/versions/0017_operator_self_service.py — звірено вручну.
+        await conn.execute("ALTER TABLE operators ALTER COLUMN commission_pct SET DEFAULT 5;")
+
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
 
@@ -279,12 +292,25 @@ async def init_operator_tables():
 
 # Явний перелік полів замість SELECT * — щоб monobank_token_encrypted
 # ніколи не потрапив у звичайну вибірку, лог чи дамп кабінету випадково.
-_OPERATOR_FIELDS = "id, name, phone, telegram_id, status, commission_pct, created_at"
+_OPERATOR_FIELDS = (
+    "id, name, phone, telegram_id, status, commission_pct, "
+    "monobank_token_verified_at, activated_at, is_public, created_at"
+)
 
 
 async def create_operator(name: str, telegram_id: int, phone: str = None,
-                          commission_pct: float = 4):
-    """Створює оператора. Повертає його id, або None якщо telegram_id уже зайнятий."""
+                          commission_pct: float = 5):
+    """
+    Створює оператора. Повертає його id, або None якщо telegram_id уже зайнятий.
+
+    commission_pct default 5 (бізнес-рішення 2026-07-23, 5% без абонплати;
+    попередній default 4 був розбіжністю з ним) — стосується ЛИШЕ нових
+    рядків. Наявні оператори (прод, 2026-07-28: рівно один, id=1, 4.00)
+    свідомо НЕ бекфіляться жодним UPDATE. Той самий default продубльовано
+    в DB (ALTER COLUMN ... SET DEFAULT 5, міграція 0017 +
+    init_operator_tables()) — звірено вручну, схема-дрифт тест значень
+    DEFAULT не перевіряє.
+    """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval("""
@@ -314,11 +340,27 @@ async def get_operator_by_telegram_id(telegram_id: int):
 
 
 async def set_operator_status(operator_id: int, status: str):
+    """
+    Ручний шлях (admin_activate_operator — активація й повторна активація
+    після suspend; admin_suspend_operator — призупинення). Коли status =
+    'active', заразом виставляє activated_at, ЯКЩО він ще NULL —
+    COALESCE, а не безумовний CURRENT_TIMESTAMP: activated_at означає
+    "коли оператор ПЕРШИЙ РАЗ став активним", повторна активація після
+    suspend не має його перезаписувати. Той самий факт, що фіксує
+    repo.activate_operator_if_pending() для автоактивації.
+    """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "UPDATE operators SET status = $2 WHERE id = $1", operator_id, status
-        )
+        if status == "active":
+            result = await conn.execute(
+                "UPDATE operators SET status = $2, "
+                "activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP) WHERE id = $1",
+                operator_id, status,
+            )
+        else:
+            result = await conn.execute(
+                "UPDATE operators SET status = $2 WHERE id = $1", operator_id, status,
+            )
         return result.endswith("1")
 
 
@@ -327,11 +369,18 @@ async def set_operator_monobank_token(operator_id: int, token_encrypted: str):
     Зберігає ВЖЕ зашифрований токен еквайрингу оператора. Шифрування
     (Fernet на ENCRYPTION_KEY) робиться шаром вище — репозиторій навмисно
     не бачить відкритого токена, щоб той не міг потрапити сюди в лог.
+
+    Скидає monobank_token_verified_at у NULL В ОДНОМУ запиті: підтвердження
+    банком стосується КОНКРЕТНОГО значення токена, тому новий токен (навіть
+    якщо старий уже пройшов реальну перевірку) має пройти її заново —
+    інакше самообслуговуваний онбординг можна було б обійти, підмінивши
+    токен на невалідний вже ПІСЛЯ автоактивації.
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE operators SET monobank_token_encrypted = $2 WHERE id = $1",
+            "UPDATE operators SET monobank_token_encrypted = $2, monobank_token_verified_at = NULL "
+            "WHERE id = $1",
             operator_id, token_encrypted,
         )
         return result.endswith("1")
@@ -348,6 +397,71 @@ async def get_operator_monobank_token_encrypted(operator_id: int):
         return await conn.fetchval(
             "SELECT monobank_token_encrypted FROM operators WHERE id = $1", operator_id
         )
+
+
+async def mark_operator_token_verified(operator_id: int) -> bool:
+    """
+    Позначає ПОТОЧНИЙ збережений токен реально підтвердженим банком
+    (app/services/monobank_acquiring.py::verify_merchant_token() відповів
+    успіхом). Викликається ЛИШЕ після успішної живої перевірки — сама ця
+    функція нічого не перевіряє, лише записує факт.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE operators SET monobank_token_verified_at = CURRENT_TIMESTAMP WHERE id = $1",
+            operator_id,
+        )
+        return result.endswith("1")
+
+
+async def activate_operator_if_pending(operator_id: int) -> bool:
+    """
+    Атомарна автоактивація (самообслуговуваний онбординг): UPDATE ...
+    WHERE status = 'pending' RETURNING — той самий ідемпотентний ідіом, що
+    release_reservation_hold() (Промпт 3c-i): перевірка й зміна статусу в
+    ОДНОМУ запиті, без окремого SELECT перед UPDATE, тож паралельний виклик
+    (два тригери автоактивації майже одночасно) не може активувати оператора
+    двічі й не подвоює сповіщення — 0 рядків другому виклику, False.
+
+    Викликач (app/services/operator_activation.py::try_auto_activate)
+    відповідає за те, щоб усі три критерії активації вже виконались ДО
+    цього виклику — тут лише атомарний перехід статусу.
+
+    activated_at — через COALESCE, той самий вираз, що й у
+    set_operator_status(): обидва шляхи (авто- й ручна активація) фіксують
+    ОДИН і той самий факт "коли оператор ПЕРШИЙ РАЗ став активним", тож
+    мають писати його однаково, а не лише збігатись випадково для наявних
+    сьогодні викликів.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE operators SET status = 'active', "
+            "activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP) "
+            "WHERE id = $1 AND status = 'pending' RETURNING id",
+            operator_id,
+        )
+        return row is not None
+
+
+async def set_operator_public(operator_id: int, is_public: bool) -> bool:
+    """
+    Перемикач ПУБЛІЧНОЇ видимості станцій оператора у водійському пошуку
+    (list_public_stations_near) — КРИТИЧНА межа безпеки, окрема від status.
+    Автоактивація (як і ручна admin_activate_operator) НІКОЛИ сама не
+    зводить is_public у TRUE: назву/адресу станції оператор вводить вільним
+    текстом, і без модерації показувати це всім водіям автоматично не
+    можна. У цьому бандлі свідомо немає бот-кнопки для цього перемикача —
+    лише прямий виклик (той самий підхід, що set_operator_status() до появи
+    кнопки активації, Промпт 4).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE operators SET is_public = $2 WHERE id = $1", operator_id, is_public,
+        )
+        return result.endswith("1")
 
 
 async def list_operators():
@@ -444,8 +558,16 @@ async def list_public_stations_near(lat: float, lng: float, radius_km: float = 3
     """
     ПУБЛІЧНИЙ пошук станцій для водія (Промпт 4c) — третій свідомий виняток
     з правила ізоляції, див. докстрінг модуля. Повертає лише активні станції
-    активних операторів із заданими координатами, відсортовані за
-    відстанню зростанням; кожен рядок додатково несе 'distance_km'.
+    активних operators.is_public=TRUE операторів із заданими координатами,
+    відсортовані за відстанню зростанням; кожен рядок додатково несе
+    'distance_km'.
+
+    is_public — КРИТИЧНА межа безпеки (самообслуговуваний онбординг,
+    операторам.py): активація (навіть автоматична) НІКОЛИ сама не пускає
+    станцію в публічний пошук, це окреме, свідомо ручне рішення
+    (set_operator_public). Без цього фільтра щойно автоактивований оператор
+    з'явився б у видачі всім водіям одразу, без жодної модерації вільного
+    тексту назви/адреси станції.
 
     SQL відсіює статуси й відсутні координати (дешево — індекс на
     operator_id уже є, датасет малий). Сама відстань — Python, через
@@ -458,7 +580,7 @@ async def list_public_stations_near(lat: float, lng: float, radius_km: float = 3
             SELECT {', '.join(f's.{f.strip()}' for f in _STATION_FIELDS.split(','))}
             FROM operator_stations s
             JOIN operators o ON o.id = s.operator_id
-            WHERE s.status = 'active' AND o.status = 'active'
+            WHERE s.status = 'active' AND o.status = 'active' AND o.is_public = TRUE
               AND s.lat IS NOT NULL AND s.lng IS NOT NULL
         """)
 
