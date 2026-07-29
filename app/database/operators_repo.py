@@ -40,7 +40,11 @@ operator_id, щоб подальший перехід на /s/{qr_slug} знов
 Шостий виняток — list_stale_pending_reservations()/list_stale_active_
 reservations() (Промпт 3c-i, reconcile_charging_reservations.py): застряглі
 kWh-резервації звіряються по ВСІХ операторах — гроші (кВт·год) належать
-ВОДІЮ, не оператору, той самий принцип, що list_operators().
+ВОДІЮ, не оператору, той самий принцип, що list_operators(). Обидві (і
+release_reservation_hold()) з Промпту 3c-ii (модель B, міграція 0018)
+фільтрують `payment_method = 'kwh'` у WHERE — fail-closed на рівні SQL:
+uah-рядок (user_id може бути NULL) інакше дійшов би до update_user_
+balance(user_id=NULL) і впав би NotNullViolation.
 
 Схема продубльована в migrations/versions/0010_white_label_tenants.py —
 при зміні оновлювати ОБИДВА місця (конвенція проєкту, див. PROJECT_CONTEXT.md).
@@ -282,6 +286,49 @@ async def init_operator_tables():
         # чіпаються жодним UPDATE. Той самий рядок, символ у символ, що в
         # migrations/versions/0017_operator_self_service.py — звірено вручну.
         await conn.execute("ALTER TABLE operators ALTER COLUMN commission_pct SET DEFAULT 5;")
+
+        # 13. Модель B — гривневий hold через Monobank (Промпт 3c-ii,
+        # міграція 0018). Розширення тієї самої charging_reservations
+        # (блок 11), не нова таблиця — статуси й механізм "резерв->факт->
+        # звільнення" спільні для kWh і грн. Символ у символ звірено з
+        # migrations/versions/0018_charging_reservations_uah.py — CHECK-
+        # обмеження generic-регекс нижче (_ALTER_COLUMN_RE) не парсить,
+        # тому окремий явний тест (test_operator_isolation.py) звіряє їхній
+        # текст посимвольно.
+        await conn.execute("ALTER TABLE charging_reservations DROP CONSTRAINT IF EXISTS charging_reservations_payment_method_check;")
+        await conn.execute("""
+        ALTER TABLE charging_reservations
+            ADD CONSTRAINT charging_reservations_payment_method_check
+            CHECK (payment_method IN ('kwh', 'uah'));
+        """)
+        await conn.execute("ALTER TABLE charging_reservations DROP CONSTRAINT IF EXISTS charging_reservations_status_check;")
+        await conn.execute("""
+        ALTER TABLE charging_reservations
+            ADD CONSTRAINT charging_reservations_status_check
+            CHECK (status IN ('awaiting_hold', 'pending', 'active', 'settling', 'finalized', 'cancelled', 'expired'));
+        """)
+        await conn.execute("ALTER TABLE charging_reservations ALTER COLUMN reserved_kwh DROP NOT NULL;")
+        await conn.execute("ALTER TABLE charging_reservations ALTER COLUMN user_id DROP NOT NULL;")
+        await conn.execute("ALTER TABLE charging_reservations ADD COLUMN IF NOT EXISTS reserved_uah NUMERIC(10, 2);")
+        await conn.execute("ALTER TABLE charging_reservations ADD COLUMN IF NOT EXISTS invoice_id VARCHAR(64);")
+        await conn.execute("ALTER TABLE charging_reservations ADD COLUMN IF NOT EXISTS final_amount_uah NUMERIC(10, 2);")
+        await conn.execute("ALTER TABLE charging_reservations ADD COLUMN IF NOT EXISTS driver_contact VARCHAR(64);")
+        await conn.execute("ALTER TABLE charging_reservations DROP CONSTRAINT IF EXISTS charging_reservations_payment_shape_check;")
+        await conn.execute("""
+        ALTER TABLE charging_reservations
+            ADD CONSTRAINT charging_reservations_payment_shape_check
+            CHECK (
+                (payment_method = 'kwh' AND reserved_kwh IS NOT NULL AND user_id IS NOT NULL
+                 AND reserved_uah IS NULL AND invoice_id IS NULL)
+                OR
+                (payment_method = 'uah' AND reserved_uah IS NOT NULL AND invoice_id IS NOT NULL
+                 AND reserved_kwh IS NULL)
+            );
+        """)
+        await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_charging_reservations_invoice_id
+            ON charging_reservations(invoice_id) WHERE invoice_id IS NOT NULL;
+        """)
 
         logger.info("🏷️ Таблиці White-Label білінгу (оператори/станції/сесії/журнал) верифіковано.")
 
@@ -927,7 +974,8 @@ async def get_active_ocpp_session(operator_id: int, station_id: int):
 
 _RESERVATION_FIELDS = (
     "id, operator_id, station_id, user_id, payment_method, reserved_kwh, "
-    "id_tag, status, operator_session_id, created_at, updated_at"
+    "id_tag, status, operator_session_id, created_at, updated_at, "
+    "reserved_uah, invoice_id, final_amount_uah, driver_contact"
 )
 
 
@@ -1100,12 +1148,17 @@ async def list_stale_pending_reservations(older_than):
     резервації, старші за older_than, ще ніколи не активувались
     (RemoteStart не підтвердився/станція не відповіла StartTransaction) —
     hold стоїть, водій не може ним скористатись.
+
+    `AND payment_method = 'kwh'` (Промпт 3c-ii, fail-closed на рівні SQL):
+    без цього uah-рядок потрапив би в release_reservation_hold() нижче й
+    упав би на update_user_balance(user_id=NULL) — NotNullViolation.
+    uah-версію цього кроку звірка веде окремо (docs/plan-3c-ii.md, розділ 5).
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         return await conn.fetch(f"""
             SELECT {_RESERVATION_FIELDS} FROM charging_reservations
-            WHERE status = 'pending' AND created_at < $1
+            WHERE payment_method = 'kwh' AND status = 'pending' AND created_at < $1
             ORDER BY created_at
         """, older_than)
 
@@ -1117,26 +1170,37 @@ async def list_stale_active_reservations(older_than):
     статус у 'active'), НЕ по created_at — інакше затримка між створенням
     резервації й підтвердженням станції хибно рахувалась би як "давно
     заряджається".
+
+    `AND payment_method = 'kwh'` — той самий fail-closed фільтр, що в
+    list_stale_pending_reservations() вище (Промпт 3c-ii).
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         return await conn.fetch(f"""
             SELECT {_RESERVATION_FIELDS} FROM charging_reservations
-            WHERE status = 'active' AND updated_at < $1
+            WHERE payment_method = 'kwh' AND status = 'active' AND updated_at < $1
             ORDER BY updated_at
         """, older_than)
 
 
 async def release_reservation_hold(operator_id: int, reservation_id: int, new_status: str) -> bool:
     """
-    Атомарно скасовує ще НЕ фіналізовану резервацію: одним запитом (UPDATE
-    ... WHERE status IN ('pending', 'active') RETURNING ...) одночасно (1)
-    перевіряє, що резервація й досі підлягає скасуванню, і (2) забирає
-    reserved_kwh/user_id для звільнення — без окремого SELECT перед UPDATE,
-    щоб уникнути гонки (TOCTOU) з паралельним StopTransaction/reconcile.
-    Якщо OCPP-сесія паралельно встигла дійти до complete_ocpp_transaction_
-    and_release() і резервація вже 'finalized' — 0 рядків, НІЧОГО не
-    робимо, баланс вдруге не звільняється.
+    Атомарно скасовує ще НЕ фіналізовану kWh-резервацію: одним запитом
+    (UPDATE ... WHERE payment_method = 'kwh' AND status IN ('pending',
+    'active') RETURNING ...) одночасно (1) перевіряє, що резервація й досі
+    підлягає скасуванню, і (2) забирає reserved_kwh/user_id для звільнення
+    — без окремого SELECT перед UPDATE, щоб уникнути гонки (TOCTOU) з
+    паралельним StopTransaction/reconcile. Якщо OCPP-сесія паралельно
+    встигла дійти до complete_ocpp_transaction_and_release() і резервація
+    вже 'finalized' — 0 рядків, НІЧОГО не робимо, баланс вдруге не
+    звільняється.
+
+    `payment_method = 'kwh'` у WHERE — fail-closed (Промпт 3c-ii): ця
+    функція звільняє kWh-БАЛАНС через update_user_balance(), а uah-рядок
+    може мати user_id=NULL (водій не зареєстрований) — без цього фільтра
+    виклик на uah-резервацію впав би NotNullViolation. Гривневий еквівалент
+    (скасування hold у банку) — cancel_invoice(), викликається окремо
+    (app/services/ocpp_charging.py, reconcile_charging_reservations.py).
 
     new_status: 'cancelled' (RemoteStart відхилено одразу після
     create_charging_reservation — start_charging_session.py) або
@@ -1148,7 +1212,8 @@ async def release_reservation_hold(operator_id: int, reservation_id: int, new_st
             row = await conn.fetchrow("""
                 UPDATE charging_reservations
                 SET status = $3, updated_at = CURRENT_TIMESTAMP
-                WHERE operator_id = $1 AND id = $2 AND status IN ('pending', 'active')
+                WHERE operator_id = $1 AND id = $2 AND payment_method = 'kwh'
+                    AND status IN ('pending', 'active')
                 RETURNING reserved_kwh, user_id
             """, operator_id, reservation_id, new_status)
             if row is None:
@@ -1159,6 +1224,240 @@ async def release_reservation_hold(operator_id: int, reservation_id: int, new_st
                 description=f"Звільнення резерву ({new_status}, {row['reserved_kwh']} кВт·год)",
             )
             return True
+
+
+# ---------------------------------------------------------------------------
+# Модель B — гривневий hold через Monobank (Промпт 3c-ii)
+#
+# На відміну від моделі A (вище), тут НЕМАЄ жодного виклику update_user_
+# balance(): гроші заблоковані НЕ в нашій БД, а в банку (Monobank hold).
+# Банк — джерело істини (docs/plan-3c-ii.md, розділ 2); рядок
+# charging_reservations для uah — лише ЛОКАЛЬНИЙ КЕШ останнього відомого
+# стану банку, синхронізується вебхуком (app/api/charging_hold_webhook.py)
+# і звіркою (reconcile_charging_reservations.py), обидва завжди СПЕРШУ
+# перепитують банк (get_invoice_status), а не діють за цим кешем наосліп.
+# ---------------------------------------------------------------------------
+
+async def create_charging_reservation_uah(operator_id: int, station_id: int, hold_amount_uah,
+                                          invoice_id: str, driver_contact: str = None):
+    """
+    Реєструє UAH-резервацію одразу у статусі 'awaiting_hold' — інвойс у
+    банку вже створено (paymentType=hold), але банк ще не підтвердив, що
+    гроші заблоковані (це підтверджує вебхук/звірка, окремим кроком).
+
+    id_tag генерується одразу, не чекаючи підтвердження hold, — це лише
+    внутрішній OCPP-ідентифікатор (маршрутизація StartTransaction),
+    існування якого банку ніяк не стосується.
+
+    user_id НЕ приймається: водій моделі B платить карткою через Monobank,
+    необов'язково є зареєстрованим водієм бота (той самий принцип, що
+    driver_qr.py — оплата без реєстрації). Опційний driver_contact — той
+    самий патерн, що operator_sessions.driver_contact.
+
+    Повертає (reservation_id, id_tag, None) при успіху, або
+    (None, None, "unknown_station"), якщо station_id не належить operator_id.
+    """
+    id_tag = secrets.token_urlsafe(12)
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        reservation_id = await conn.fetchval("""
+            INSERT INTO charging_reservations (
+                operator_id, station_id, payment_method, reserved_uah,
+                invoice_id, id_tag, driver_contact, status
+            )
+            SELECT s.operator_id, s.id, 'uah', $3, $4, $5, $6, 'awaiting_hold'
+            FROM operator_stations s
+            WHERE s.id = $2 AND s.operator_id = $1
+            RETURNING id
+        """, operator_id, station_id, hold_amount_uah, invoice_id, id_tag, driver_contact)
+        if reservation_id is None:
+            return None, None, "unknown_station"
+
+    return reservation_id, id_tag, None
+
+
+async def get_reservation_by_invoice_id(operator_id: int, invoice_id: str):
+    """
+    Резервація за invoice_id У МЕЖАХ оператора — той самий принцип, що
+    get_operator_payment_by_invoice() для operator_payments. Потрібно
+    вебхуку (app/api/charging_hold_webhook.py): саме так інвойс чужого
+    оператора не підтверджує чужу ж резервацію.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE operator_id = $1 AND invoice_id = $2
+        """, operator_id, invoice_id)
+
+
+async def mark_reservation_hold_confirmed(operator_id: int, reservation_id: int) -> bool:
+    """
+    Мʼютексний перехід 'awaiting_hold' -> 'pending': банк підтвердив hold
+    (invoice/status == 'hold'), тепер можна слати RemoteStart. Той самий
+    WHERE-guard ідіом, що activate_reservation()/set_reservation_status() —
+    перевірка й зміна статусу в ОДНОМУ запиті, тож паралельний виклик
+    (вебхук і резервний тригер звірки на ту саму резервацію, docs/plan-
+    3c-ii.md розділ 5) не може провести перехід двічі.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE charging_reservations
+            SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+            WHERE operator_id = $1 AND id = $2 AND status = 'awaiting_hold'
+        """, operator_id, reservation_id)
+        return result.endswith("1")
+
+
+async def claim_reservation_for_settlement(operator_id: int, reservation_id: int,
+                                            expected_status: str = "active"):
+    """
+    Головний захист від подвійного дзвінка в банк (docs/plan-3c-ii.md,
+    розділ 2, п.1): атомарна ЛОКАЛЬНА заявка `expected_status` -> 'settling'
+    ОДНИМ UPDATE ... RETURNING — рівно ОДИН переможець піде дзвонити в банк
+    (finalize/cancel), паралельний виклик (ретрай StopTransaction, гонка зі
+    звіркою) бачить 0 рядків і повертає None. Це наш ВЛАСНИЙ, повністю
+    перевірений на рівні SQL захист — НЕ покладаємось на те, що банк сам
+    захищає від повторного finalize (непідтверджене припущення нашого ж
+    мока, не факт: див. беклог docs/SESSION_STATE.md "перевірити подвійний
+    finalize живим смоуком").
+
+    `expected_status` — джерельний статус, з якого дозволено заявити:
+    `'active'` (дефолт) — живий шлях complete_ocpp_transaction_and_release_uah
+    (ocpp_charging.py) і крок звірки для застряглих 'active'-резервацій;
+    `'pending'` — крок звірки для застряглих 'pending'-резервацій (другий
+    блокер рев'ю: cancel_invoice() там теж мусить бути захищений цим самим
+    мʼютексом, інакше запізнілий StartTransaction може активувати рядок,
+    який звірка саме зараз скасовує в банку).
+
+    Повертає dict {'reserved_uah', 'invoice_id', 'operator_session_id'} при
+    успіху, або None (резервація вже не `expected_status`/не 'uah' —
+    переможець уже інший виклик).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE charging_reservations
+            SET status = 'settling', updated_at = CURRENT_TIMESTAMP
+            WHERE operator_id = $1 AND id = $2 AND payment_method = 'uah' AND status = $3
+            RETURNING reserved_uah, invoice_id, operator_session_id
+        """, operator_id, reservation_id, expected_status)
+        return dict(row) if row is not None else None
+
+
+async def record_uah_settlement(operator_id: int, reservation_id: int, status: str, final_amount_uah) -> bool:
+    """
+    Записує результат розрахунку з банком — finalize/cancel УЖЕ ВІДБУВСЯ
+    на боці банку до виклику цієї функції, вона лише фіксує факт локально.
+    Мʼютекс `status <> $3` (той самий патерн, що set_reservation_status()):
+    ретрай після краху МІЖ успішним дзвінком у банк і цим записом не
+    перезаписує final_amount_uah вдруге.
+
+    status у нормальному шляху завжди 'finalized' — і після finalize
+    (final_amount_uah > 0), і після cancel (final_amount_uah = 0): з
+    погляду НАШОЇ системи резервація однаково завершена, різниця лише в
+    сумі. Параметр лишається явним, а не захардкодженим, щоб виклик
+    читався однозначно (аналог complete_ocpp_transaction_and_release()
+    для kWh, де 'finalized' теж єдиний нормальний фінал).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE charging_reservations
+            SET status = $3, final_amount_uah = $4, updated_at = CURRENT_TIMESTAMP
+            WHERE operator_id = $1 AND id = $2 AND status <> $3
+        """, operator_id, reservation_id, status, final_amount_uah)
+        return result.endswith("1")
+
+
+async def list_stale_awaiting_hold_reservations(older_than):
+    """
+    Звірка, крок 1 (docs/plan-3c-ii.md, розділ 5): 'awaiting_hold'
+    резервації, старші за older_than — інвойс створено, банк ще не
+    підтвердив hold (або підтвердив, а вебхук про це не почув). Сама
+    функція нічого не вирішує — викликач ОБОВ'ЯЗКОВО перепитує банк
+    (get_invoice_status), перш ніж щось робити: якщо банк каже 'hold' —
+    RemoteStart із цього процесу (окремого від живого uvicorn з `/ocpp`)
+    НЕБЕЗПЕЧНИЙ (той самий клас бага, що "3c-i незапускний на проді") —
+    лише алерт на ручний розбір, ніколи спроба самій стартувати зарядку.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE status = 'awaiting_hold' AND created_at < $1
+            ORDER BY created_at
+        """, older_than)
+
+
+async def list_stale_pending_uah_reservations(older_than):
+    """
+    uah-аналог list_stale_pending_reservations() (звірка, крок 2 — docs/
+    plan-3c-ii.md розділ 5): 'pending' uah-резервації, старші за older_than
+    — RemoteStart надіслано, але StartTransaction від станції так і не
+    прийшов. ОКРЕМА функція, не той самий payment_method='kwh'-фільтрований
+    список: звільнення тут — cancel_invoice() у банку, а не update_user_
+    balance(), тому й крон-крок їх обробляє окремо.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE payment_method = 'uah' AND status = 'pending' AND created_at < $1
+            ORDER BY created_at
+        """, older_than)
+
+
+async def list_stale_active_uah_reservations(older_than):
+    """
+    Звірка, крок 3 (БЛОКЕР рев'ю бандла 3c-ii — закрито цим кроком): 'active'
+    uah-резервації, старші за older_than (за updated_at, той самий поріг
+    --active-hours, що для kWh-сестри list_stale_active_reservations()).
+
+    До цієї функції ЖОДЕН із п'яти наявних запитів звірки не бачив
+    застряглу 'active' uah-резервацію: list_stale_pending/active_
+    reservations фільтровані на payment_method='kwh' (fail-closed),
+    awaiting_hold/pending_uah/settling дивляться зовсім інші статуси. Два
+    реальні сценарії, які це ловить:
+      1. StopTransaction ніколи не прийшов узагалі (станція впала, водій
+         висмикнув кабель) — сесія лишається 'charging' назавжди.
+      2. Крах МІЖ complete_ocpp_transaction() (сесія вже 'completed') і
+         claim_reservation_for_settlement() (резервація ще НЕ встигла
+         стати 'settling') — вужчий за перший, але той самий клас "hold
+         висить у банку без жодного алерту", що вже раз стався (блокер
+         #1 wallet-realmono, PR #22).
+    Без цього кроку hold висів би до 9-денного автоскасування банку, а
+    оператор не отримав би НІЧОГО за фактично віддану енергію.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE payment_method = 'uah' AND status = 'active' AND updated_at < $1
+            ORDER BY updated_at
+        """, older_than)
+
+
+async def list_stale_settling_reservations(older_than):
+    """
+    Звірка, крок 4 (docs/plan-3c-ii.md, розділ 5): 'settling' резервації,
+    старші за older_than — локальний claim (claim_reservation_for_
+    settlement) відбувся, але розрахунок із банком не завершився вчасно
+    (крах МІЖ claim і дзвінком у банк, або МІЖ банком і record_uah_
+    settlement()). Поріг задає SETTLING_STALE_SECONDS
+    (reconcile_charging_reservations.py) — свідомо КОРОТКИЙ (не 24 години,
+    як для kWh 'active') і свідомо БІЛЬШИЙ за monobank_acquiring.
+    DEFAULT_TIMEOUT, щоб звірка не наздогнала ще живий у мережі виклик
+    finalize/cancel.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(f"""
+            SELECT {_RESERVATION_FIELDS} FROM charging_reservations
+            WHERE status = 'settling' AND updated_at < $1
+            ORDER BY updated_at
+        """, older_than)
 
 
 # ---------------------------------------------------------------------------

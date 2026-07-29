@@ -17,12 +17,15 @@ app/handlers/ocpp_admin.py відповідно).
 """
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from app.api.ocpp_ws import ChargePointNotConnected, remote_start_transaction, remote_stop_transaction
+from app.core.crypto import EncryptionKeyMissing, decrypt_secret
 from app.database import operators_repo as repo
+from app.services.monobank_acquiring import MonobankError, cancel_invoice, create_invoice, finalize_invoice
 
 logger = logging.getLogger(__name__)
 
@@ -166,3 +169,196 @@ async def stop_charging_session(operator_id: int, station_id: int) -> ChargingSt
         return ChargingStopResult(status="rejected", transaction_id=transaction_id)
 
     return ChargingStopResult(status="ok", transaction_id=transaction_id)
+
+
+# ---------------------------------------------------------------------------
+# Модель B — гривневий hold через Monobank (Промпт 3c-ii)
+#
+# На відміну від kWh-моделі вище, тут НЕМАЄ єдиної RemoteStart-у-відповідь-
+# на-команду: оплата водієм асинхронна (відкриває pageUrl, платить карткою
+# коли завгодно), тому старт зарезервованого hold і фактичний RemoteStart —
+# ДВА окремі кроки рознесені в часі. Перший — start_charging_reservation_
+# uah() нижче (створює інвойс + локальний 'awaiting_hold'-рядок). Другий —
+# у вебхуку (app/api/charging_hold_webhook.py), коли банк підтвердить hold.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChargingStartUahResult:
+    """
+    status:
+      "ok"                — інвойс створено, водій може платити за page_url.
+      "unknown_station"   — station_id не належить operator_id.
+      "not_ocpp"          — станція не в режимі OCPP.
+      "no_monobank_token" — у оператора не збережено (чи не розшифровується)
+                            токен еквайрингу — платити нікуди.
+      "bank_error"        — банк не створив інвойс (недоступний/відмовив).
+
+    reservation_id/id_tag/page_url — None, якщо статус не "ok".
+    """
+    status: str
+    reservation_id: Optional[int] = None
+    id_tag: Optional[str] = None
+    page_url: Optional[str] = None
+
+
+async def start_charging_reservation_uah(operator_id: int, station_id: int, hold_amount_uah,
+                                         redirect_url: str, webhook_url: str,
+                                         driver_contact: str = None) -> ChargingStartUahResult:
+    """
+    Створює hold-інвойс у банку (paymentType="hold") токеном ОПЕРАТОРА +
+    локальну резервацію одразу у статусі 'awaiting_hold'
+    (repo.create_charging_reservation_uah). RemoteStart тут НЕ
+    відбувається — станція стартує лише коли банк підтвердить hold
+    (вебхук, docs/plan-3c-ii.md розділ 3, варіант А).
+
+    Станція перевіряється (існує, режим OCPP) ДО дзвінка в банк — дешевше
+    не створювати інвойс узагалі, ніж створювати й одразу скасовувати.
+    """
+    station = await repo.get_station(operator_id, station_id)
+    if station is None:
+        return ChargingStartUahResult(status="unknown_station")
+    if station.get("ocpp_charge_point_id") is None:
+        return ChargingStartUahResult(status="not_ocpp")
+
+    token_encrypted = await repo.get_operator_monobank_token_encrypted(operator_id)
+    if not token_encrypted:
+        return ChargingStartUahResult(status="no_monobank_token")
+    try:
+        operator_token = decrypt_secret(token_encrypted)
+    except (EncryptionKeyMissing, ValueError) as e:
+        logger.error("Модель B: не вдалося розшифрувати токен оператора %s: %s", operator_id, e)
+        return ChargingStartUahResult(status="no_monobank_token")
+
+    try:
+        invoice = await create_invoice(
+            operator_token,
+            amount_uah=hold_amount_uah,
+            reference=f"charging-hold-{station_id}-{secrets.token_hex(4)}",
+            redirect_url=redirect_url,
+            webhook_url=webhook_url,
+            destination=f"Зарядка {station['name']}: гарантія {hold_amount_uah} грн, спишеться лише спожите",
+            payment_type="hold",
+        )
+    except MonobankError as e:
+        logger.error("Модель B: банк не створив hold-інвойс (оператор=%s станція=%s): %s",
+                     operator_id, station_id, e)
+        return ChargingStartUahResult(status="bank_error")
+
+    reservation_id, id_tag, error = await repo.create_charging_reservation_uah(
+        operator_id, station_id, hold_amount_uah, invoice["invoiceId"], driver_contact=driver_contact,
+    )
+    if error is not None:
+        # Теоретично неможливо (станція вже перевірена вище), захист про
+        # всяк випадок: інвойс у банку лишиться неоплаченим і сам протухне
+        # за validity — гроші водія не в грі, поки він не заплатив.
+        logger.error("Модель B: create_charging_reservation_uah повернув %s (оператор=%s станція=%s)",
+                     error, operator_id, station_id)
+        return ChargingStartUahResult(status=error)
+
+    return ChargingStartUahResult(
+        status="ok", reservation_id=reservation_id, id_tag=id_tag, page_url=invoice["pageUrl"],
+    )
+
+
+def compute_uah_settlement_amount(tariff_uah_start, tariff_uah_kwh, kwh, reserved_uah) -> Decimal:
+    """
+    Чиста функція (без I/O) — вартість фактично спожитого в грн, КАПОВАНА
+    утриманою сумою (рішення Q4/варіант 1, docs/plan-3c-ii.md розділ 4:
+    перевитрату понад hold НЕ намагаємось стягнути — за нашим власним
+    моком банк finalize понад утримання й так відхиляє, підтвердити живим
+    смоуком це поки не вдалось, беклог docs/SESSION_STATE.md). ОДНА
+    реалізація, спільна для on_stop_transaction-шляху (kwh відомий одразу
+    після StopTransaction) і кроку 3 звірки (kwh читається з уже
+    'completed' сесії) — не дві копії тієї самої формули.
+
+    kwh=None (абсурдна дельта лічильника, 3b) -> вартість 0: як kWh-модель
+    звільняє ПОВНИЙ резерв при kwh=None (не вигадуємо, скільки спожито),
+    так і тут — 0 означає, що подальший виклик піде через cancel_invoice()
+    (повне повернення), а не через finalize() на вигадану суму.
+    """
+    if kwh is None:
+        return Decimal("0.00")
+
+    tariff_start = Decimal(str(tariff_uah_start)) if tariff_uah_start is not None else Decimal("0")
+    tariff_kwh = Decimal(str(tariff_uah_kwh))
+    cost = (tariff_start + tariff_kwh * Decimal(str(kwh))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    reserved = Decimal(str(reserved_uah))
+    if cost > reserved:
+        logger.error(
+            "Модель B: факт %s грн перевищує утримане %s грн — перевитрата НЕ "
+            "стягується автоматично, капуємо на утримане",
+            cost, reserved,
+        )
+        return reserved
+    return cost
+
+
+async def complete_ocpp_transaction_and_release_uah(
+    operator_id: int, transaction_id: int, kwh, meter_stop_wh, ended_at,
+    reservation_id: int, reserved_uah, invoice_id: str,
+    tariff_uah_start, tariff_uah_kwh, operator_token: str,
+) -> bool:
+    """
+    UAH-аналог repo.complete_ocpp_transaction_and_release() (модель A) —
+    викликається з on_stop_transaction (app/api/ocpp_ws.py) для резервацій
+    з payment_method='uah'.
+
+    НА ВІДМІНУ від kWh-моделі тут НЕМАЄ єдиної атомарної Postgres-
+    транзакції на ввесь ланцюг: виклик банку (HTTP) не можна безпечно
+    покласти в ту саму транзакцію, що локальний запис (docs/plan-3c-ii.md,
+    розділ 2, «джерело істини — банк, не наша БД»). Порядок:
+
+      1. repo.complete_ocpp_transaction() — той самий мʼютекс на рівні
+         сесії, що й для kWh; ретрай (сесія вже 'completed') зупиняє
+         функцію одразу.
+      2. repo.claim_reservation_for_settlement() — атомарний ЛОКАЛЬНИЙ
+         claim 'active' -> 'settling' (головний захист від подвійного
+         дзвінка в банк, розділ 2 плану, п.1).
+      3. compute_uah_settlement_amount() — чиста функція, капована сума.
+      4. Банк: finalize_invoice() (сума > 0) або cancel_invoice() (сума
+         == 0 — kwh=None або факт квантується в 0).
+      5. За успіху дзвінка в банк — record_uah_settlement('finalized').
+         Якщо банк недоступний (MonobankError) — рядок лишається
+         'settling'; це НЕ перевикидається назовні й НЕ ламає відповідь
+         OCPP станції (settle — не частина протоколу StopTransaction) —
+         крок 3 звірки (reconcile_charging_reservations.py) довершить
+         пізніше, перепитавши банк.
+
+    Повертає True, якщо ЦЕЙ виклик довів розрахунок до 'finalized'; False —
+    ретрай (сесія вже 'completed') або гонка (claim не дістався цьому
+    виклику) або банк недоступний зараз.
+    """
+    became_completed = await repo.complete_ocpp_transaction(
+        operator_id, transaction_id, kwh, meter_stop_wh, ended_at,
+    )
+    if not became_completed:
+        return False
+
+    claim = await repo.claim_reservation_for_settlement(operator_id, reservation_id)
+    if claim is None:
+        logger.warning(
+            "Модель B: резервація #%s не в статусі 'active' (гонка зі звіркою?) — "
+            "claim не дістався цьому виклику", reservation_id,
+        )
+        return False
+
+    amount_uah = compute_uah_settlement_amount(tariff_uah_start, tariff_uah_kwh, kwh, reserved_uah)
+
+    try:
+        if amount_uah > 0:
+            await finalize_invoice(operator_token, invoice_id, amount_uah)
+        else:
+            await cancel_invoice(operator_token, invoice_id)
+    except MonobankError as e:
+        logger.error(
+            "Модель B: резервація #%s — банк недоступний під час розрахунку (%s) — "
+            "рядок лишається 'settling', довершить reconcile_charging_reservations.py",
+            reservation_id, e,
+        )
+        return False
+
+    await repo.record_uah_settlement(operator_id, reservation_id, "finalized", amount_uah)
+    logger.info("💳 Модель B: резервація #%s розрахована — %s грн (утримано було %s)",
+                reservation_id, amount_uah, reserved_uah)
+    return True

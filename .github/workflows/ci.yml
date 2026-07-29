@@ -6,7 +6,9 @@ name: CI
 # Postgres). Окремий job `live-db-tests` піднімає справжній Postgres 16 для
 # інтеграційних тестів, які моки принципово не покривають
 # (test_start_ocpp_transaction_live.py — регресія на writable-CTE
-# StartTransaction) — див. PROJECT_CONTEXT.md.
+# StartTransaction; test_charging_reservations_live.py — claim_reservation_
+# for_settlement() дійсно серіалізує паралельні виклики, Промпт 3c-ii) —
+# див. PROJECT_CONTEXT.md.
 
 on:
   push:
@@ -70,4 +72,4 @@ jobs:
           OCPI_SECRET_TOKEN: ci-placeholder-token
           BOT_TOKEN: "123456:ci-placeholder-bot-token"
           GEMINI_API_KEY: ci-placeholder-gemini-key
-        run: pytest test_start_ocpp_transaction_live.py -v
+        run: pytest test_start_ocpp_transaction_live.py test_charging_reservations_live.py -v

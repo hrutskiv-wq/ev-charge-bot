@@ -105,6 +105,16 @@ class FakeOcppState:
             "id_tag": id_tag, "status": status, "operator_session_id": operator_session_id,
         }
 
+    def add_uah_reservation(self, reservation_id, operator_id, station_id, invoice_id,
+                            reserved_uah, id_tag, status="pending", operator_session_id=None):
+        """Модель B (Промпт 3c-ii) — той самий фейк-стан, гілка payment_method='uah'."""
+        self.reservations[reservation_id] = {
+            "id": reservation_id, "operator_id": operator_id, "station_id": station_id,
+            "user_id": None, "payment_method": "uah", "reserved_kwh": None,
+            "reserved_uah": reserved_uah, "invoice_id": invoice_id,
+            "id_tag": id_tag, "status": status, "operator_session_id": operator_session_id,
+        }
+
 
 @pytest.fixture
 def fake_repo(monkeypatch):
@@ -631,3 +641,111 @@ async def test_remote_stop_transaction_raises_for_a_different_operators_station(
     ocpp_ws._active_charge_points[CP_ID] = fake_cp
     with pytest.raises(ocpp_ws.ChargePointNotConnected):
         await ocpp_ws.remote_stop_transaction(OPERATOR_B, CP_ID, transaction_id=101)
+
+
+# ---------------------------------------------------------------------------
+# StopTransaction — маршрутизація до Моделі B (Промпт 3c-ii, uah)
+#
+# Сам розрахунок (compute_uah_settlement_amount/finalize/cancel) уже
+# повністю покритий test_ocpp_charging_service.py — тут перевіряється
+# ЛИШЕ те, що on_stop_transaction() правильно розпізнає payment_method=
+# 'uah' і делегує в app.services.ocpp_charging.complete_ocpp_transaction_
+# and_release_uah() (а не в kwh-шлях), і що сесія ЗАВЖДИ завершується,
+# навіть коли розрахунок неможливий (немає токена/станції).
+# ---------------------------------------------------------------------------
+
+RESERVATION_ID_UAH = 43
+
+
+def test_stop_transaction_routes_uah_reservation_to_model_b_settlement(client, provisioned, monkeypatch):
+    provisioned.add_uah_reservation(
+        RESERVATION_ID_UAH, OPERATOR_A, STATION_ID, invoice_id="inv-uah-1",
+        reserved_uah=Decimal("100.00"), id_tag="uah-tag",
+        status="active", operator_session_id=555,
+    )
+    provisioned.add_open_session(OPERATOR_A, STATION_ID, transaction_id=555, meter_start_wh=1000)
+
+    async def fake_get_station(operator_id, station_id):
+        return {"id": station_id, "operator_id": operator_id,
+                "tariff_uah_kwh": Decimal("10.00"), "tariff_uah_start": Decimal("5.00")}
+    monkeypatch.setattr(repo, "get_station", fake_get_station)
+
+    # Реальне шифрування (encryption_key фікстура вже активна через
+    # provisioned) — так само, як для OCPP auth-ключа станції нижче:
+    # ocpp_ws.py імпортує decrypt_secret через `from ... import`, тож
+    # монкіпатчити crypto.decrypt_secret безглуздо (інша прив'язка імені);
+    # простіше й чесніше зашифрувати реальний токен і дати ЙОГО розшифруватись.
+    encrypted_token = crypto.encrypt_secret("plain-token")
+
+    async def fake_get_token(operator_id):
+        return encrypted_token
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+
+    settle_calls = []
+    async def fake_settle(operator_id, transaction_id, kwh, meter_stop, ended_at, **kwargs):
+        settle_calls.append((operator_id, transaction_id, kwh, kwargs))
+        return True
+    from app.services import ocpp_charging
+    monkeypatch.setattr(ocpp_charging, "complete_ocpp_transaction_and_release_uah", fake_settle)
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StopTransaction", {
+            "meterStop": 16000, "timestamp": "2026-07-24T10:30:00Z", "transactionId": 555,
+        }))
+        resp = json.loads(ws.receive_text())
+
+    assert resp == [3, "1", {"idTagInfo": {"status": "Accepted"}}]
+    assert len(settle_calls) == 1
+    operator_id, transaction_id, kwh, kwargs = settle_calls[0]
+    assert (operator_id, transaction_id) == (OPERATOR_A, 555)
+    assert str(kwh) == "15.000"
+    assert kwargs["reservation_id"] == RESERVATION_ID_UAH
+    assert kwargs["reserved_uah"] == Decimal("100.00")
+    assert kwargs["invoice_id"] == "inv-uah-1"
+    assert kwargs["tariff_uah_kwh"] == Decimal("10.00")
+    assert kwargs["tariff_uah_start"] == Decimal("5.00")
+    assert kwargs["operator_token"] == "plain-token"
+
+
+def test_stop_transaction_uah_without_token_still_completes_session(client, provisioned, monkeypatch):
+    """
+    Немає токена еквайрингу — розрахунок неможливий, але сесія ЗАВЖДИ
+    завершується (інакше застрягла б 'charging' навіки й заблокувала б
+    наступний старт на цій станції).
+    """
+    provisioned.add_uah_reservation(
+        RESERVATION_ID_UAH, OPERATOR_A, STATION_ID, invoice_id="inv-uah-2",
+        reserved_uah=Decimal("100.00"), id_tag="uah-tag-2",
+        status="active", operator_session_id=556,
+    )
+    provisioned.add_open_session(OPERATOR_A, STATION_ID, transaction_id=556, meter_start_wh=1000)
+
+    async def fake_get_token(operator_id):
+        return None
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+
+    async def fake_get_station(operator_id, station_id):
+        return {"id": station_id, "operator_id": operator_id,
+                "tariff_uah_kwh": Decimal("10.00"), "tariff_uah_start": None}
+    monkeypatch.setattr(repo, "get_station", fake_get_station)
+
+    settle_calls = []
+    async def fake_settle(*a, **kw):
+        settle_calls.append((a, kw))
+        return True
+    from app.services import ocpp_charging
+    monkeypatch.setattr(ocpp_charging, "complete_ocpp_transaction_and_release_uah", fake_settle)
+
+    with _connect(client, CP_ID, _auth_header(CP_ID, PASSWORD)) as ws:
+        ws.send_text(_call("1", "StopTransaction", {
+            "meterStop": 16000, "timestamp": "2026-07-24T10:30:00Z", "transactionId": 556,
+        }))
+        json.loads(ws.receive_text())
+
+    assert settle_calls == [], "Без токена розрахунок не мав навіть починатись"
+    assert provisioned.sessions[556]["status"] == "completed", (
+        "Сесія мусить завершитись незалежно від того, чи вдався розрахунок"
+    )
+    assert provisioned.reservations[RESERVATION_ID_UAH]["status"] == "active", (
+        "Резервація лишається 'active' на ручний розбір — поза обсягом кроків звірки"
+    )

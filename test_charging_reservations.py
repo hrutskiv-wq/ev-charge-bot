@@ -342,3 +342,333 @@ async def test_release_reservation_hold_is_a_noop_when_already_finalized(monkeyp
 
     assert result is False
     assert fake_release_balance == []
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: kWh-функції не чіпають uah-рядки (Промпт 3c-ii, правка 1 рев'ю)
+# ---------------------------------------------------------------------------
+
+async def test_release_reservation_hold_query_is_fail_closed_to_kwh(monkeypatch, fake_release_balance):
+    """
+    Без `payment_method = 'kwh'` у WHERE ця функція дійшла б до
+    update_user_balance(user_id=NULL) для uah-рядка й впала б
+    NotNullViolation — перевіряємо сам факт присутності фільтра в SQL.
+    """
+    conn = FakeHoldReleaseConn(fetchrow_result=None)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.release_reservation_hold(OPERATOR_A, RESERVATION_ID, "expired")
+
+    query, _args = conn.calls[0]
+    assert "payment_method = 'kwh'" in query
+
+
+async def test_list_stale_pending_reservations_query_is_fail_closed_to_kwh(monkeypatch):
+    conn = FakeReservationInsertConn()  # fetch не використовується тут, лише перевіряємо SQL
+
+    class _FetchConn(FakeReservationInsertConn):
+        async def fetch(self, query, *args):
+            self._record(query, args)
+            return []
+
+    fetch_conn = _FetchConn()
+
+    async def _get_db_pool():
+        return FakePool(fetch_conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.list_stale_pending_reservations(SINCE)
+
+    query, _args = fetch_conn.calls[0]
+    assert "payment_method = 'kwh'" in query
+
+
+async def test_list_stale_active_reservations_query_is_fail_closed_to_kwh(monkeypatch):
+    class _FetchConn(FakeReservationInsertConn):
+        async def fetch(self, query, *args):
+            self._record(query, args)
+            return []
+
+    fetch_conn = _FetchConn()
+
+    async def _get_db_pool():
+        return FakePool(fetch_conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.list_stale_active_reservations(SINCE)
+
+    query, _args = fetch_conn.calls[0]
+    assert "payment_method = 'kwh'" in query
+
+
+# ---------------------------------------------------------------------------
+# Модель B (Промпт 3c-ii) — гривневий hold через Monobank
+# ---------------------------------------------------------------------------
+
+INVOICE_ID = "inv-uah-1"
+
+
+async def test_create_charging_reservation_uah_places_no_balance_hold(reservation_conn, monkeypatch):
+    """
+    ГОЛОВНА ВІДМІННІСТЬ від create_charging_reservation() (kWh): жодного
+    виклику update_user_balance() — гроші заблоковані в БАНКУ, не в нашій
+    БД (docs/plan-3c-ii.md, розділ 2).
+    """
+    balance_calls = []
+
+    async def fake_update_user_balance(**kwargs):
+        balance_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(repo, "update_user_balance", fake_update_user_balance)
+
+    reservation_id, id_tag, error = await repo.create_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), INVOICE_ID,
+    )
+
+    assert reservation_id == RESERVATION_ID
+    assert error is None
+    assert len(id_tag) == 16
+    assert balance_calls == [], "Модель B не має чіпати kWh-баланс узагалі"
+
+    query, args = reservation_conn.calls[0]
+    assert "'uah'" in query
+    assert "'awaiting_hold'" in query
+    assert args == (OPERATOR_A, STATION_ID, Decimal("100.00"), INVOICE_ID, id_tag, None)
+
+
+async def test_create_charging_reservation_uah_on_foreign_station_returns_none(monkeypatch):
+    conn = FakeReservationInsertConn(reservation_id=None)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    reservation_id, id_tag, error = await repo.create_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), INVOICE_ID,
+    )
+
+    assert (reservation_id, id_tag) == (None, None)
+    assert error == "unknown_station"
+
+
+class FakeSimpleConn:
+    """Мінімальна заглушка для мʼютексних UPDATE/SELECT одним запитом."""
+
+    def __init__(self, fetchrow_result=None, fetchval_result=None, execute_result="UPDATE 1"):
+        self.calls = []
+        self._fetchrow_result = fetchrow_result
+        self._fetchval_result = fetchval_result
+        self._execute_result = execute_result
+
+    def _record(self, query, args):
+        self.calls.append((" ".join(query.split()), args))
+
+    async def fetchrow(self, query, *args):
+        self._record(query, args)
+        return self._fetchrow_result
+
+    async def fetchval(self, query, *args):
+        self._record(query, args)
+        return self._fetchval_result
+
+    async def execute(self, query, *args):
+        self._record(query, args)
+        return self._execute_result
+
+
+async def test_get_reservation_by_invoice_id_is_scoped_to_operator(monkeypatch):
+    conn = FakeSimpleConn(fetchrow_result={"id": RESERVATION_ID, "invoice_id": INVOICE_ID})
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    result = await repo.get_reservation_by_invoice_id(OPERATOR_A, INVOICE_ID)
+
+    assert result == {"id": RESERVATION_ID, "invoice_id": INVOICE_ID}
+    query, args = conn.calls[0]
+    assert "operator_id = $1" in query and "invoice_id = $2" in query
+    assert args == (OPERATOR_A, INVOICE_ID)
+
+
+async def test_mark_reservation_hold_confirmed_is_an_idempotent_mutex(monkeypatch):
+    conn = FakeSimpleConn(execute_result="UPDATE 1")
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.mark_reservation_hold_confirmed(OPERATOR_A, RESERVATION_ID) is True
+    query, args = conn.calls[0]
+    assert "status = 'pending'" in query
+    assert "status = 'awaiting_hold'" in query
+    assert args == (OPERATOR_A, RESERVATION_ID)
+
+    conn2 = FakeSimpleConn(execute_result="UPDATE 0")
+
+    async def _get_db_pool_2():
+        return FakePool(conn2)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool_2)
+    assert await repo.mark_reservation_hold_confirmed(OPERATOR_A, RESERVATION_ID) is False
+
+
+async def test_claim_reservation_for_settlement_returns_dict_on_success(monkeypatch):
+    conn = FakeSimpleConn(fetchrow_result={
+        "reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555,
+    })
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    result = await repo.claim_reservation_for_settlement(OPERATOR_A, RESERVATION_ID)
+
+    assert result == {"reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555}
+    query, args = conn.calls[0]
+    assert "status = 'settling'" in query
+    assert "payment_method = 'uah'" in query
+    assert "status = $3" in query
+    assert args == (OPERATOR_A, RESERVATION_ID, "active")
+
+
+async def test_claim_reservation_for_settlement_accepts_expected_status_parameter(monkeypatch):
+    """
+    Другий блокер рев'ю: reconcile_charging_reservations.py, крок
+    'pending' (_reconcile_stale_pending_uah), теж мусить взяти цю саму
+    заявку — але з джерельним статусом 'pending', не 'active'.
+    """
+    conn = FakeSimpleConn(fetchrow_result={
+        "reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": None,
+    })
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    result = await repo.claim_reservation_for_settlement(
+        OPERATOR_A, RESERVATION_ID, expected_status="pending",
+    )
+
+    assert result is not None
+    query, args = conn.calls[0]
+    assert "status = $3" in query
+    assert args == (OPERATOR_A, RESERVATION_ID, "pending")
+
+
+async def test_claim_reservation_for_settlement_returns_none_when_race_lost(monkeypatch):
+    """
+    Це НЕ доказ головного захисту (docs/plan-3c-ii.md, розділ 2, п.1) — мок
+    просто повертає None, і функція чесно передає його далі; сам факт, що
+    WHERE status='active' у реальному Postgres дійсно відсіює ДРУГОГО
+    паралельного claimant'а, тут НЕ перевіряється (fetchrow_result — не
+    справжній планувальник запитів). Реальна конкурентна гарантія доведена
+    окремо, на живому PG: test_charging_reservations_live.py::
+    test_concurrent_claim_is_won_by_exactly_one_caller (рев'ю, знахідка:
+    цей тест раніше помилково називався "головним захистом").
+    """
+    conn = FakeSimpleConn(fetchrow_result=None)
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.claim_reservation_for_settlement(OPERATOR_A, RESERVATION_ID) is None
+
+
+async def test_record_uah_settlement_writes_amount_and_is_idempotent(monkeypatch):
+    conn = FakeSimpleConn(execute_result="UPDATE 1")
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    assert await repo.record_uah_settlement(OPERATOR_A, RESERVATION_ID, "finalized", Decimal("55.00")) is True
+    query, args = conn.calls[0]
+    assert "status = $3" in query
+    assert "final_amount_uah = $4" in query
+    assert "status <> $3" in query
+    assert args == (OPERATOR_A, RESERVATION_ID, "finalized", Decimal("55.00"))
+
+    conn2 = FakeSimpleConn(execute_result="UPDATE 0")
+
+    async def _get_db_pool_2():
+        return FakePool(conn2)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool_2)
+    assert await repo.record_uah_settlement(OPERATOR_A, RESERVATION_ID, "finalized", Decimal("55.00")) is False
+
+
+async def test_list_stale_awaiting_hold_reservations_query_shape(monkeypatch):
+    class _FetchConn(FakeSimpleConn):
+        async def fetch(self, query, *args):
+            self._record(query, args)
+            return []
+
+    conn = _FetchConn()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.list_stale_awaiting_hold_reservations(SINCE)
+
+    query, args = conn.calls[0]
+    assert "status = 'awaiting_hold'" in query
+    assert args == (SINCE,)
+
+
+async def test_list_stale_pending_uah_reservations_query_shape(monkeypatch):
+    class _FetchConn(FakeSimpleConn):
+        async def fetch(self, query, *args):
+            self._record(query, args)
+            return []
+
+    conn = _FetchConn()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.list_stale_pending_uah_reservations(SINCE)
+
+    query, args = conn.calls[0]
+    assert "payment_method = 'uah'" in query
+    assert "status = 'pending'" in query
+    assert args == (SINCE,)
+
+
+async def test_list_stale_settling_reservations_query_shape(monkeypatch):
+    class _FetchConn(FakeSimpleConn):
+        async def fetch(self, query, *args):
+            self._record(query, args)
+            return []
+
+    conn = _FetchConn()
+
+    async def _get_db_pool():
+        return FakePool(conn)
+
+    monkeypatch.setattr(repo, "get_db_pool", _get_db_pool)
+
+    await repo.list_stale_settling_reservations(SINCE)
+
+    query, args = conn.calls[0]
+    assert "status = 'settling'" in query
+    assert args == (SINCE,)

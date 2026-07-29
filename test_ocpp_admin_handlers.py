@@ -261,3 +261,128 @@ async def test_ocpp_stop_unexpected_exception_gives_static_answer_no_traceback_l
     assert len(message.sent) == 1
     assert message.sent[0][0].startswith("⚠️")
     assert UNIQUE_MARKER not in message.sent[0][0], "Текст винятку не має йти в чат — лише в лог"
+
+
+# ---------------------------------------------------------------------------
+# /ocpp_start_uah — Модель B (Промпт 3c-ii)
+# ---------------------------------------------------------------------------
+
+async def test_ocpp_start_uah_ignored_outside_admin_chat(monkeypatch):
+    called = []
+    async def fake_start(*a, **kw):
+        called.append((a, kw))
+        return ocpp_charging.ChargingStartUahResult(status="ok")
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage("/ocpp_start_uah 1 10 100.0", chat_id=999)
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert message.sent == []
+    assert called == []
+
+
+async def test_ocpp_start_uah_happy_path_reports_page_url_and_ux_text(monkeypatch):
+    calls = []
+    async def fake_start(operator_id, station_id, hold_amount_uah, redirect_url, webhook_url, driver_contact=None):
+        calls.append((operator_id, station_id, hold_amount_uah, driver_contact))
+        return ocpp_charging.ChargingStartUahResult(
+            status="ok", reservation_id=7, id_tag="tag123456789012",
+            page_url="https://pay.monobank.ua/xyz",
+        )
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID} 100.0")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert calls == [(OPERATOR_A, STATION_ID, Decimal("100.0"), None)]
+    assert len(message.sent) == 1
+    text = message.sent[0][0]
+    assert "#7" in text
+    assert "https://pay.monobank.ua/xyz" in text
+    assert "ЗАБЛОКУЄ" in text
+    assert "НЕ списання" in text
+
+
+async def test_ocpp_start_uah_passes_optional_driver_contact(monkeypatch):
+    calls = []
+    async def fake_start(operator_id, station_id, hold_amount_uah, redirect_url, webhook_url, driver_contact=None):
+        calls.append(driver_contact)
+        return ocpp_charging.ChargingStartUahResult(status="ok", reservation_id=1, id_tag="x", page_url="https://x")
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID} 100.0 +380501234567")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert calls == ["+380501234567"]
+
+
+async def test_ocpp_start_uah_bad_args_count_gives_friendly_error_no_side_effects(monkeypatch):
+    called = []
+    async def fake_start(*a, **kw):
+        called.append((a, kw))
+        return ocpp_charging.ChargingStartUahResult(status="ok")
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID}")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert called == []
+    assert "Використання" in message.sent[0][0]
+
+
+async def test_ocpp_start_uah_bad_number_format_gives_friendly_error_no_side_effects(monkeypatch):
+    called = []
+    async def fake_start(*a, **kw):
+        called.append((a, kw))
+        return ocpp_charging.ChargingStartUahResult(status="ok")
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah abc {STATION_ID} 100.0")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert called == []
+    assert "Биті аргументи" in message.sent[0][0]
+
+
+async def test_ocpp_start_uah_non_positive_amount_rejected_no_side_effects(monkeypatch):
+    called = []
+    async def fake_start(*a, **kw):
+        called.append((a, kw))
+        return ocpp_charging.ChargingStartUahResult(status="ok")
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID} 0")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert called == []
+    assert "додатним" in message.sent[0][0]
+
+
+@pytest.mark.parametrize("status", [
+    "unknown_station", "not_ocpp", "no_monobank_token", "bank_error",
+])
+async def test_ocpp_start_uah_reports_each_failure_status_without_crashing(monkeypatch, status):
+    async def fake_start(*a, **kw):
+        return ocpp_charging.ChargingStartUahResult(status=status)
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID} 100.0")
+    await ocpp_admin.cmd_ocpp_start_uah(message)
+
+    assert len(message.sent) == 1
+    assert message.sent[0][0].startswith("❌")
+
+
+async def test_ocpp_start_uah_unexpected_exception_gives_static_answer_no_traceback_leak(monkeypatch):
+    UNIQUE_MARKER = "monobank-connection-refused-xyz789"
+
+    async def fake_start(*a, **kw):
+        raise RuntimeError(UNIQUE_MARKER)
+    monkeypatch.setattr(ocpp_charging, "start_charging_reservation_uah", fake_start)
+
+    message = FakeMessage(f"/ocpp_start_uah {OPERATOR_A} {STATION_ID} 100.0")
+    await ocpp_admin.cmd_ocpp_start_uah(message)  # не має перевикинути назовні
+
+    assert len(message.sent) == 1
+    assert message.sent[0][0].startswith("⚠️")
+    assert UNIQUE_MARKER not in message.sent[0][0]
