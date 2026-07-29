@@ -4,7 +4,8 @@
 Навіщо: створення інвойсів і перевірка статусу відбуваються токеном
 МЕРЧАНТА-ОПЕРАТОРА, тобто протестувати їх проти живого банку без реального
 оператора з реальним рахунком неможливо. Мок дає повний прохід флоу
-локально: створити інвойс -> «оплатити» -> отримати success.
+локально: створити інвойс -> «оплатити» -> отримати success. Тепер також —
+hold (утримання) -> finalize (часткове списання) або cancel (звільнення).
 
 Запуск:
     uvicorn mock_monobank:app --port 8081
@@ -16,6 +17,15 @@
     curl -X POST http://127.0.0.1:8081/mock/pay/<invoiceId>
 Провал оплати:
     curl -X POST "http://127.0.0.1:8081/mock/pay/<invoiceId>?result=failure"
+Hold (створити інвойс із paymentType: "hold", потім оплатити тим самим
+/mock/pay — інвойс перейде в status=hold, а не success):
+    curl -X POST http://127.0.0.1:8081/mock/pay/<invoiceId>
+Фіналізація (часткове чи повне списання утриманого):
+    curl -X POST http://127.0.0.1:8081/api/merchant/invoice/finalize \\
+      -H "X-Token: ..." -d '{"invoiceId": "...", "amount": 500}'
+Скасування (звільнення hold АБО повернення вже списаного success):
+    curl -X POST http://127.0.0.1:8081/api/merchant/invoice/cancel \\
+      -H "X-Token: ..." -d '{"invoiceId": "..."}'
 
 Це НЕ продакшн-код: жодної перевірки токена по суті, стан у пам'яті
 процесу. Мета — відтворити контракт API, а не банк.
@@ -32,8 +42,31 @@
 rrn, bank, tranId, country, terminal, maskedPan, approvalCode,
 paymentMethod, paymentSystem), а не справжні банківські дані з проду.
 
-НЕ ПЕРЕВІРЕНО: форма відповіді для статусів failure/expired/reversed —
-живих зразків цих статусів поки немає, тому `paymentInfo`/`finalAmount`/
+ЗВІРЕНО З РЕАЛЬНИМ ЖИВИМ HOLD-СМОУКОМ (28–29.07.2026, власна картка → власний
+мерчант, дві оплати по 20 грн) — це був гейт Моделі B (3c-ii): «cancel на
+нефіналізованому hold не підтверджений документацією». Гейт ПРОЙДЕНО,
+підтверджено з обох боків (картка + виписка мерчанта), деталі → SESSION_STATE.
+Форми нижче — ЖИВІ, окрім прямо позначеного винятку:
+  * статус `hold` — поля `finalAmount` НЕМАЄ ВЗАГАЛІ (не 0, не null — ключа
+    немає в тілі відповіді);
+  * статус `success` після ЧАСТКОВОЇ фіналізації — `amount` лишається
+    початковим УТРИМАННЯМ, `finalAmount` = фактично СПИСАНЕ; `fee`
+    перерахована з фактично списаного (у смоуку: 26 коп. на утриманих 2000
+    -> 7 коп. на списаних 500); `rrn`/`tranId` ІНШІ, ніж на етапі hold;
+    `approvalCode` той самий;
+  * статус `reversed` після cancel нефіналізованого holdу — з'являється
+    `cancelList` (масив), `finalAmount: 0`;
+  * відповідь на сам `invoice/cancel` — `{"status": "success",
+    "createdDate": ..., "modifiedDate": ...}` — ЖИВА.
+  * відповідь на `invoice/finalize` — У СМОУКУ НЕ ЗАФІКСОВАНА (тіло не
+    збережено). Взято З ДОКУМЕНТАЦІЇ БАНКУ (`{"status": "success"}`), а НЕ
+    з живого прогону — позначено окремо в коді нижче. Звірити, коли
+    трапиться перший живий фіналайз із збереженим тілом відповіді.
+Значення (rrn/approvalCode/tranId/terminal/maskedPan) — і тут вигадані
+заглушки, НЕ справжні реквізити з проду (та сама конвенція, що вище).
+
+НЕ ПЕРЕВІРЕНО: форма відповіді для статусів failure/expired — живих
+зразків цих статусів поки немає, тому `paymentInfo`/`finalAmount`/
 `payMethod` мок для них НЕ додає (консервативно, щоб не видавати
 непідтверджене здогадування за факт). Звірити, коли трапиться перший
 живий провал оплати.
@@ -41,6 +74,7 @@ paymentMethod, paymentSystem), а не справжні банківські д�
 import logging
 import secrets
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
@@ -72,6 +106,41 @@ _FAKE_PAYMENT_INFO = {
     "country": "804",
 }
 
+# Ілюстративна ставка комісії для hold/finalize — НЕ офіційна тарифна сітка
+# банку (та публічно не документована як формула, залежить від картки й
+# методу оплати). Збігається з двома живими точками смоуку 28-29.07.2026
+# (26 коп. на утриманих 2000, 7 коп. на списаних 500 -> 1.3% в обох), але
+# мета тут лише показати НАПРЯМОК: комісія рахується від фактично
+# списаного (finalAmount), а не від утриманого (amount).
+_FAKE_FEE_RATE = Decimal("0.013")
+
+
+def _fake_fee_kopecks(amount_kopecks: int) -> int:
+    return int(
+        (Decimal(amount_kopecks) * _FAKE_FEE_RATE).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
+def _fake_payment_info(rrn_suffix: str, fee_kopecks: int) -> dict:
+    """
+    Форма як у банку, значення — вигадані заглушки (не реальні реквізити).
+    `rrn`/`tranId` навмисно РІЗНІ між hold і фіналізацією (як і в живому
+    смоуку 28-29.07.2026), `approvalCode` лишається тим самим — так само,
+    як спостерігалось наживо.
+    """
+    return {
+        "maskedPan": "444111******6969",
+        "approvalCode": "000000",
+        "rrn": f"00000000000{rrn_suffix}",
+        "tranId": f"000000000{rrn_suffix}",
+        "terminal": "MI000000",
+        "bank": "Mock Bank",
+        "paymentSystem": "visa",
+        "paymentMethod": "monobank",
+        "fee": fee_kopecks,
+        "country": "804",
+    }
+
 
 @app.post("/api/merchant/invoice/create")
 async def create_invoice(request: Request, x_token: str = Header(None)):
@@ -98,8 +167,14 @@ async def create_invoice(request: Request, x_token: str = Header(None)):
         # токен зберігаємо лише щоб перевірити, що статус питають тим самим
         # мерчантом, який створив інвойс — як у справжньому банку
         "_token": x_token,
+        # paymentType визначає, чи «оплата» веде в success (звичайний
+        # дебет), чи в hold (утримання, потребує finalize/cancel) — не
+        # повертається у invoice/status, тому підкреслення в імені, як і
+        # _token вище (той самий фільтр приховує обидва).
+        "_payment_type": body.get("paymentType", "debit"),
     }
-    logging.info("🧾 Створено інвойс %s на %s коп.", invoice_id, amount)
+    logging.info("🧾 Створено інвойс %s на %s коп. (paymentType=%s)",
+                 invoice_id, amount, _invoices[invoice_id]["_payment_type"])
     return {
         "invoiceId": invoice_id,
         "pageUrl": f"http://127.0.0.1:8081/mock/page/{invoice_id}",
@@ -144,8 +219,20 @@ async def mock_pay(invoice_id: str, result: str = "success"):
     invoice = _invoices.get(invoice_id)
     if invoice is None:
         raise HTTPException(status_code=404, detail="invoice not found")
-    invoice["status"] = result
     invoice["modifiedDate"] = _now_iso()
+
+    if result == "success" and invoice.get("_payment_type") == "hold":
+        # ЖИВИЙ СМОУК 28-29.07.2026: на етапі hold поля finalAmount у
+        # відповіді банку НЕМАЄ ВЗАГАЛІ — не додаємо його навіть як 0/null.
+        invoice["status"] = "hold"
+        invoice["payMethod"] = "monobank"
+        invoice["paymentInfo"] = _fake_payment_info(
+            rrn_suffix="1", fee_kopecks=_fake_fee_kopecks(invoice["amount"])
+        )
+        logging.info("🔒 Інвойс %s переведено в hold (утримано %s коп.)", invoice_id, invoice["amount"])
+        return {"invoiceId": invoice_id, "status": "hold"}
+
+    invoice["status"] = result
     if result == "success":
         # Поля нижче підтверджені живим платежем лише для success — див.
         # докстрінг модуля. Для інших статусів навмисно не додаємо.
@@ -154,6 +241,109 @@ async def mock_pay(invoice_id: str, result: str = "success"):
         invoice["paymentInfo"] = dict(_FAKE_PAYMENT_INFO)
     logging.info("💳 Інвойс %s переведено в статус %s", invoice_id, result)
     return {"invoiceId": invoice_id, "status": result}
+
+
+@app.post("/api/merchant/invoice/finalize")
+async def finalize_invoice(request: Request, x_token: str = Header(None)):
+    """
+    Часткове чи повне списання нефіналізованого hold.
+
+    ВІДПОВІДЬ ЦЬОГО ЕНДПОІНТА НЕ ПІДТВЕРДЖЕНА ЖИВИМ ПРОГОНОМ — у смоуку
+    28-29.07.2026 тіло відповіді не було збережено. `{"status": "success"}`
+    нижче взято З ДОКУМЕНТАЦІЇ банку, а НЕ з живого запиту. Форма
+    результуючого invoice/status (amount/finalAmount/fee/rrn/tranId) —
+    ЖИВА, звірена смоуком (див. докстрінг модуля).
+    """
+    body = await request.json()
+    invoice_id = body.get("invoiceId")
+    amount = body.get("amount")
+
+    invoice = _invoices.get(invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="invoice not found")
+    if invoice["_token"] != x_token:
+        raise HTTPException(status_code=403, detail="foreign invoice")
+    if invoice["status"] != "hold":
+        raise HTTPException(
+            status_code=400,
+            detail=f"invoice status is {invoice['status']}, expected hold",
+        )
+    # ПРИПУЩЕННЯ, НЕ ЖИВИЙ ФАКТ: живий смоук 28-29.07.2026 фіналізував лише
+    # МЕНШУ за утримання суму (2000 -> 500) — over-capture (finalize на
+    # суму БІЛЬШУ за hold) наживо не пробували. Заборона нижче — консервативний
+    # здогад "банк так не дозволить", а не підтверджена поведінка. Див.
+    # беклог docs/SESSION_STATE.md: "перевірити over-capture живим смоуком".
+    if not isinstance(amount, int) or amount <= 0 or amount > invoice["amount"]:
+        raise HTTPException(
+            status_code=400,
+            detail="amount має бути цілим у копійках, не більшим за утримане",
+        )
+
+    invoice["status"] = "success"
+    invoice["finalAmount"] = amount
+    invoice["modifiedDate"] = _now_iso()
+    # amount лишається початковим УТРИМАННЯМ (не перезаписуємо) — так само,
+    # як спостерігалось наживо: hold=2000 -> finalize(500) -> amount
+    # лишився 2000, finalAmount став 500.
+    invoice["paymentInfo"] = _fake_payment_info(
+        rrn_suffix="2", fee_kopecks=_fake_fee_kopecks(amount)
+    )
+    logging.info(
+        "✅ Інвойс %s фіналізовано на %s коп. (було утримано %s коп.)",
+        invoice_id, amount, invoice["amount"],
+    )
+    return {"status": "success"}
+
+
+@app.post("/api/merchant/invoice/cancel")
+async def cancel_invoice(request: Request, x_token: str = Header(None)):
+    """
+    Скасування — працює і на success (повернення вже списаного), і на
+    НЕфіналізованому hold (звільнення утриманого без жодного списання).
+
+    ЖИВИЙ СМОУК 28-29.07.2026: cancel на нефіналізованому hold СПРАЦЮВАВ
+    (підтверджено карткою — «Скасування. eVolt UA +20 ₴», без комісії) —
+    це і був головний невідомий гейта Моделі B (3c-ii), документація банку
+    описує цей метод лише для успішної оплати. Уся форма нижче — ЖИВА.
+
+    СВІДОМЕ СПРОЩЕННЯ МОКА (не властивість банку): документація банку описує
+    опційне поле `amount` у тілі запиту для ЧАСТКОВОГО скасування — мок його
+    ігнорує й завжди скасовує ПОВНІСТЮ. Для Моделі B поки не потрібне
+    (у смоуку 28-29.07.2026 cancel викликався без `amount`, лише на повне
+    скасування); додати підтримку, якщо колись знадобиться частковий cancel.
+    """
+    body = await request.json()
+    invoice_id = body.get("invoiceId")
+
+    invoice = _invoices.get(invoice_id)
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="invoice not found")
+    if invoice["_token"] != x_token:
+        raise HTTPException(status_code=403, detail="foreign invoice")
+    if invoice["status"] not in ("success", "hold"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot cancel invoice in status {invoice['status']}",
+        )
+
+    previous_status = invoice["status"]
+    cancelled_amount = invoice["finalAmount"] if previous_status == "success" else invoice["amount"]
+    now = _now_iso()
+    invoice.setdefault("cancelList", []).append({
+        "status": "success",
+        "amount": cancelled_amount,
+        "ccy": invoice.get("ccy") or 980,
+        "createdDate": now,
+        "modifiedDate": now,
+        "approvalCode": "000000",
+        "rrn": "000000000003",
+    })
+    invoice["status"] = "reversed"
+    invoice["finalAmount"] = 0
+    invoice["modifiedDate"] = now
+    logging.info("↩️ Інвойс %s скасовано (був %s, скасовано %s коп.)",
+                 invoice_id, previous_status, cancelled_amount)
+    return {"status": "success", "createdDate": now, "modifiedDate": now}
 
 
 @app.get("/mock/page/{invoice_id}")
