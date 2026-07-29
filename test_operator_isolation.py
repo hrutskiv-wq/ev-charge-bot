@@ -154,6 +154,11 @@ TENANT_SCOPED_CALLS = [
     ("activate_reservation", lambda op_id: repo.activate_reservation(op_id, 5, 999), "operator_id"),
     ("set_reservation_status", lambda op_id: repo.set_reservation_status(op_id, 5, "finalized"), "operator_id"),
     ("release_reservation_hold", lambda op_id: repo.release_reservation_hold(op_id, 5, "cancelled"), "operator_id"),
+    ("create_charging_reservation_uah", lambda op_id: repo.create_charging_reservation_uah(op_id, 10, Decimal("100.00"), "inv-uah-1"), "operator_id"),
+    ("get_reservation_by_invoice_id", lambda op_id: repo.get_reservation_by_invoice_id(op_id, "inv-uah-1"), "operator_id"),
+    ("mark_reservation_hold_confirmed", lambda op_id: repo.mark_reservation_hold_confirmed(op_id, 5), "operator_id"),
+    ("claim_reservation_for_settlement", lambda op_id: repo.claim_reservation_for_settlement(op_id, 5), "operator_id"),
+    ("record_uah_settlement", lambda op_id: repo.record_uah_settlement(op_id, 5, "finalized", Decimal("10.00")), "operator_id"),
     ("create_operator_payment", lambda op_id: repo.create_operator_payment(op_id, "inv-1", 100), "insert"),
     ("get_operator_payment_by_invoice", lambda op_id: repo.get_operator_payment_by_invoice(op_id, "inv-1"), "operator_id"),
     ("get_operator_payment", lambda op_id: repo.get_operator_payment(op_id, 5), "operator_id"),
@@ -853,6 +858,7 @@ _MIGRATION_FILES = [
     _ROOT / "migrations" / "versions" / "0015_hold_release_transaction_types.py",
     _ROOT / "migrations" / "versions" / "0016_charging_reservations.py",
     _ROOT / "migrations" / "versions" / "0017_operator_self_service.py",
+    _ROOT / "migrations" / "versions" / "0018_charging_reservations_uah.py",
 ]
 _REPO_FILE = _ROOT / "app" / "database" / "operators_repo.py"
 
@@ -943,10 +949,48 @@ def test_migration_and_idempotent_bootstrap_declare_same_altered_columns():
     migration_altered = _declared_alter_columns(_migrations_source())
     repo_altered = _declared_alter_columns(_REPO_FILE.read_text(encoding="utf-8"))
     assert migration_altered == repo_altered
-    assert len(migration_altered) == 9, (
+    assert len(migration_altered) == 13, (
         "Очікувались 6 полів OCPP (Промпти 3a+3b) + 3 поля самообслуговуваного "
-        "онбордингу (monobank_token_verified_at/activated_at/is_public, міграція 0017)"
+        "онбордингу (monobank_token_verified_at/activated_at/is_public, міграція 0017) "
+        "+ 4 поля моделі B (reserved_uah/invoice_id/final_amount_uah/driver_contact, "
+        "міграція 0018)"
     )
+
+
+def test_charging_reservations_uah_check_constraints_match_migration_and_bootstrap():
+    """
+    CHECK-обмеження моделі B (Промпт 3c-ii, міграція 0018) — enum-розширення
+    payment_method/status і дискримінована payment_shape-умова — жоден
+    generic drift-тест вище їх не парсить (declare_same_altered_columns
+    ловить лише ADD COLUMN, declare_same_indexes — лише CREATE INDEX). Той
+    самий клас розбіжності "є в міграції, немає в бутстрапі" (урок 'refund',
+    PROJECT_CONTEXT.md) тут закритий явним посимвольним звірянням.
+    """
+    migration_source = _migrations_source()
+    repo_source = _REPO_FILE.read_text(encoding="utf-8")
+
+    single_line_fragments = [
+        "CHECK (payment_method IN ('kwh', 'uah'));",
+        "CHECK (status IN ('awaiting_hold', 'pending', 'active', 'settling', 'finalized', 'cancelled', 'expired'));",
+        "ALTER TABLE charging_reservations ALTER COLUMN reserved_kwh DROP NOT NULL;",
+        "ALTER TABLE charging_reservations ALTER COLUMN user_id DROP NOT NULL;",
+    ]
+    for fragment in single_line_fragments:
+        assert fragment in migration_source, f"Відсутнє в migrations/versions/0018: {fragment}"
+        assert fragment in repo_source, f"Відсутнє в init_operator_tables(): {fragment}"
+
+    # Дискримінована умова — багаторядкова, звіряємо після нормалізації
+    # пробілів (відступи в migrations/versions/0018 і в init_operator_
+    # tables() різні, сам текст має бути однаковим).
+    shape_check_fragment = (
+        "(payment_method = 'kwh' AND reserved_kwh IS NOT NULL AND user_id IS NOT NULL "
+        "AND reserved_uah IS NULL AND invoice_id IS NULL) OR (payment_method = 'uah' "
+        "AND reserved_uah IS NOT NULL AND invoice_id IS NOT NULL AND reserved_kwh IS NULL)"
+    )
+    normalized_migration = " ".join(migration_source.split())
+    normalized_repo = " ".join(repo_source.split())
+    assert shape_check_fragment in normalized_migration, "Дискримінована умова відсутня/розійшлась у migrations/versions/0018"
+    assert shape_check_fragment in normalized_repo, "Дискримінована умова відсутня/розійшлась у init_operator_tables()"
 
 
 def test_commission_pct_default_matches_migration_bootstrap_and_python_param():

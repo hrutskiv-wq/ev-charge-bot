@@ -23,6 +23,7 @@ ChargePointNotConnected) теж звільняє hold рівно раз і пе�
 Запуск: pytest test_ocpp_charging_service.py -v
 """
 import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -37,6 +38,7 @@ USER_ID = 555
 RESERVATION_ID = 42
 ID_TAG = "reservation-tag16"
 CP_ID = "CP-1"
+SINCE = datetime(2026, 7, 24, tzinfo=timezone.utc)
 
 
 def _station(ocpp=True):
@@ -487,3 +489,330 @@ async def test_cli_wrapper_handles_unknown_status_gracefully(monkeypatch, capsys
 
     assert result == (None, None)
     assert "some_future_status" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Модель B (Промпт 3c-ii) — гривневий hold через Monobank
+# ---------------------------------------------------------------------------
+
+INVOICE_ID = "inv-uah-1"
+OPERATOR_TOKEN = "decrypted-operator-token"
+
+
+# --- compute_uah_settlement_amount() — чиста функція ---
+
+def test_compute_uah_settlement_amount_basic_formula():
+    amount = ocpp_charging.compute_uah_settlement_amount(
+        tariff_uah_start=Decimal("5.00"), tariff_uah_kwh=Decimal("10.00"),
+        kwh=Decimal("5.000"), reserved_uah=Decimal("100.00"),
+    )
+    assert amount == Decimal("55.00")  # 5.00 + 10.00 * 5.000
+
+
+def test_compute_uah_settlement_amount_treats_missing_start_fee_as_zero():
+    amount = ocpp_charging.compute_uah_settlement_amount(
+        tariff_uah_start=None, tariff_uah_kwh=Decimal("10.00"),
+        kwh=Decimal("2.000"), reserved_uah=Decimal("100.00"),
+    )
+    assert amount == Decimal("20.00")
+
+
+def test_compute_uah_settlement_amount_none_kwh_is_zero():
+    """kwh=None (абсурдна дельта, 3b) -> вартість 0 -> викликач піде через cancel_invoice(), не finalize()."""
+    amount = ocpp_charging.compute_uah_settlement_amount(
+        tariff_uah_start=Decimal("5.00"), tariff_uah_kwh=Decimal("10.00"),
+        kwh=None, reserved_uah=Decimal("100.00"),
+    )
+    assert amount == Decimal("0.00")
+
+
+def test_compute_uah_settlement_amount_caps_at_reserved(caplog):
+    """Q4/варіант 1: перевитрату понад hold не стягуємо — капуємо на утримане."""
+    with caplog.at_level("ERROR", logger="app.services.ocpp_charging"):
+        amount = ocpp_charging.compute_uah_settlement_amount(
+            tariff_uah_start=Decimal("0"), tariff_uah_kwh=Decimal("10.00"),
+            kwh=Decimal("50.000"), reserved_uah=Decimal("20.00"),
+        )
+    assert amount == Decimal("20.00")
+    assert "перевитрата" in caplog.text
+
+
+# --- start_charging_reservation_uah() ---
+
+def _uah_station(ocpp=True, name="Тестова станція"):
+    return {"id": STATION_ID, "operator_id": OPERATOR_A,
+            "ocpp_charge_point_id": CP_ID if ocpp else None, "name": name}
+
+
+async def test_start_uah_happy_path_creates_hold_invoice_and_reservation(monkeypatch):
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_uah_station()))
+
+    async def fake_get_token(*a, **kw):
+        return "encrypted-token"
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+    monkeypatch.setattr(ocpp_charging, "decrypt_secret", lambda enc: OPERATOR_TOKEN)
+
+    create_invoice_calls = []
+    async def fake_create_invoice(token, **kwargs):
+        create_invoice_calls.append((token, kwargs))
+        return {"invoiceId": INVOICE_ID, "pageUrl": "https://pay.monobank.ua/xyz"}
+    monkeypatch.setattr(ocpp_charging, "create_invoice", fake_create_invoice)
+
+    async def fake_create_reservation_uah(*a, **kw):
+        return RESERVATION_ID, ID_TAG, None
+    monkeypatch.setattr(repo, "create_charging_reservation_uah", fake_create_reservation_uah)
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"),
+        redirect_url="https://evolt.ua/", webhook_url="https://evolt.ua/webhook/charging-hold/1",
+    )
+
+    assert result.status == "ok"
+    assert result.reservation_id == RESERVATION_ID
+    assert result.id_tag == ID_TAG
+    assert result.page_url == "https://pay.monobank.ua/xyz"
+
+    assert len(create_invoice_calls) == 1
+    token, kwargs = create_invoice_calls[0]
+    assert token == OPERATOR_TOKEN
+    assert kwargs["payment_type"] == "hold"
+    assert kwargs["amount_uah"] == Decimal("100.00")
+
+
+async def test_start_uah_unknown_station(monkeypatch):
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(None))
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), "https://evolt.ua/", "https://evolt.ua/webhook",
+    )
+
+    assert result.status == "unknown_station"
+
+
+async def test_start_uah_not_ocpp_station(monkeypatch):
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_uah_station(ocpp=False)))
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), "https://evolt.ua/", "https://evolt.ua/webhook",
+    )
+
+    assert result.status == "not_ocpp"
+
+
+async def test_start_uah_no_monobank_token_missing(monkeypatch):
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_uah_station()))
+
+    async def fake_get_token(*a, **kw):
+        return None
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), "https://evolt.ua/", "https://evolt.ua/webhook",
+    )
+
+    assert result.status == "no_monobank_token"
+
+
+async def test_start_uah_no_monobank_token_when_decrypt_fails(monkeypatch):
+    from app.core.crypto import EncryptionKeyMissing
+
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_uah_station()))
+
+    async def fake_get_token(*a, **kw):
+        return "encrypted-token"
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+
+    def fake_decrypt(enc):
+        raise EncryptionKeyMissing("no key")
+    monkeypatch.setattr(ocpp_charging, "decrypt_secret", fake_decrypt)
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), "https://evolt.ua/", "https://evolt.ua/webhook",
+    )
+
+    assert result.status == "no_monobank_token"
+
+
+async def test_start_uah_bank_error_when_invoice_creation_fails(monkeypatch):
+    from app.services.monobank_acquiring import MonobankError
+
+    monkeypatch.setattr(repo, "get_station", _fake_get_station(_uah_station()))
+
+    async def fake_get_token(*a, **kw):
+        return "encrypted-token"
+    monkeypatch.setattr(repo, "get_operator_monobank_token_encrypted", fake_get_token)
+    monkeypatch.setattr(ocpp_charging, "decrypt_secret", lambda enc: OPERATOR_TOKEN)
+
+    async def fake_create_invoice(*a, **kw):
+        raise MonobankError("bank down")
+    monkeypatch.setattr(ocpp_charging, "create_invoice", fake_create_invoice)
+
+    result = await ocpp_charging.start_charging_reservation_uah(
+        OPERATOR_A, STATION_ID, Decimal("100.00"), "https://evolt.ua/", "https://evolt.ua/webhook",
+    )
+
+    assert result.status == "bank_error"
+
+
+# --- complete_ocpp_transaction_and_release_uah() ---
+
+async def test_complete_uah_retry_stops_immediately_when_session_already_completed(monkeypatch):
+    async def fake_complete(*a, **kw):
+        return False
+    monkeypatch.setattr(repo, "complete_ocpp_transaction", fake_complete)
+
+    claim_calls = []
+    async def fake_claim(*a, **kw):
+        claim_calls.append((a, kw))
+        return {"reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555}
+    monkeypatch.setattr(repo, "claim_reservation_for_settlement", fake_claim)
+
+    result = await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+        OPERATOR_A, transaction_id=555, kwh=Decimal("5.000"), meter_stop_wh=6000,
+        ended_at=SINCE, reservation_id=RESERVATION_ID, reserved_uah=Decimal("100.00"),
+        invoice_id=INVOICE_ID, tariff_uah_start=None, tariff_uah_kwh=Decimal("10.00"),
+        operator_token=OPERATOR_TOKEN,
+    )
+
+    assert result is False
+    assert claim_calls == [], "Ретрай не мав дійти до claim узагалі"
+
+
+async def test_complete_uah_race_lost_claim_returns_false(monkeypatch):
+    async def fake_complete(*a, **kw):
+        return True
+    monkeypatch.setattr(repo, "complete_ocpp_transaction", fake_complete)
+
+    async def fake_claim(*a, **kw):
+        return None
+    monkeypatch.setattr(repo, "claim_reservation_for_settlement", fake_claim)
+
+    finalize_calls = []
+    async def fake_finalize(*a, **kw):
+        finalize_calls.append((a, kw))
+        return {"status": "success"}
+    monkeypatch.setattr(ocpp_charging, "finalize_invoice", fake_finalize)
+
+    result = await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+        OPERATOR_A, transaction_id=555, kwh=Decimal("5.000"), meter_stop_wh=6000,
+        ended_at=SINCE, reservation_id=RESERVATION_ID, reserved_uah=Decimal("100.00"),
+        invoice_id=INVOICE_ID, tariff_uah_start=None, tariff_uah_kwh=Decimal("10.00"),
+        operator_token=OPERATOR_TOKEN,
+    )
+
+    assert result is False
+    assert finalize_calls == [], "Claim програно (гонка) — банк дзвонити не мали"
+
+
+async def test_complete_uah_finalizes_when_cost_is_positive(monkeypatch):
+    async def fake_complete(*a, **kw):
+        return True
+    monkeypatch.setattr(repo, "complete_ocpp_transaction", fake_complete)
+
+    async def fake_claim(*a, **kw):
+        return {"reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555}
+    monkeypatch.setattr(repo, "claim_reservation_for_settlement", fake_claim)
+
+    finalize_calls = []
+    async def fake_finalize(token, invoice_id, amount_uah):
+        finalize_calls.append((token, invoice_id, amount_uah))
+        return {"status": "success"}
+    monkeypatch.setattr(ocpp_charging, "finalize_invoice", fake_finalize)
+
+    cancel_calls = []
+    async def fake_cancel(*a, **kw):
+        cancel_calls.append((a, kw))
+        return {"status": "success"}
+    monkeypatch.setattr(ocpp_charging, "cancel_invoice", fake_cancel)
+
+    record_calls = []
+    async def fake_record(*a, **kw):
+        record_calls.append((a, kw))
+        return True
+    monkeypatch.setattr(repo, "record_uah_settlement", fake_record)
+
+    result = await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+        OPERATOR_A, transaction_id=555, kwh=Decimal("5.000"), meter_stop_wh=6000,
+        ended_at=SINCE, reservation_id=RESERVATION_ID, reserved_uah=Decimal("100.00"),
+        invoice_id=INVOICE_ID, tariff_uah_start=Decimal("5.00"), tariff_uah_kwh=Decimal("10.00"),
+        operator_token=OPERATOR_TOKEN,
+    )
+
+    assert result is True
+    assert finalize_calls == [(OPERATOR_TOKEN, INVOICE_ID, Decimal("55.00"))]
+    assert cancel_calls == []
+    assert record_calls == [((OPERATOR_A, RESERVATION_ID, "finalized", Decimal("55.00")), {})]
+
+
+async def test_complete_uah_cancels_when_cost_is_zero(monkeypatch):
+    async def fake_complete(*a, **kw):
+        return True
+    monkeypatch.setattr(repo, "complete_ocpp_transaction", fake_complete)
+
+    async def fake_claim(*a, **kw):
+        return {"reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555}
+    monkeypatch.setattr(repo, "claim_reservation_for_settlement", fake_claim)
+
+    finalize_calls = []
+    async def fake_finalize(*a, **kw):
+        finalize_calls.append((a, kw))
+        return {"status": "success"}
+    monkeypatch.setattr(ocpp_charging, "finalize_invoice", fake_finalize)
+
+    cancel_calls = []
+    async def fake_cancel(token, invoice_id):
+        cancel_calls.append((token, invoice_id))
+        return {"status": "success"}
+    monkeypatch.setattr(ocpp_charging, "cancel_invoice", fake_cancel)
+
+    async def fake_record(*a, **kw):
+        return True
+    monkeypatch.setattr(repo, "record_uah_settlement", fake_record)
+
+    result = await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+        OPERATOR_A, transaction_id=555, kwh=None, meter_stop_wh=6000,
+        ended_at=SINCE, reservation_id=RESERVATION_ID, reserved_uah=Decimal("100.00"),
+        invoice_id=INVOICE_ID, tariff_uah_start=Decimal("5.00"), tariff_uah_kwh=Decimal("10.00"),
+        operator_token=OPERATOR_TOKEN,
+    )
+
+    assert result is True
+    assert finalize_calls == []
+    assert cancel_calls == [(OPERATOR_TOKEN, INVOICE_ID)]
+
+
+async def test_complete_uah_bank_unavailable_leaves_settling_and_returns_false(monkeypatch):
+    """
+    Банк недоступний під час розрахунку — рядок лишається 'settling'
+    (record_uah_settlement НЕ викликається), крок 3 звірки довершить пізніше.
+    Виняток НЕ перевикидається — settle не має ламати відповідь StopTransaction.
+    """
+    from app.services.monobank_acquiring import MonobankError
+
+    async def fake_complete(*a, **kw):
+        return True
+    monkeypatch.setattr(repo, "complete_ocpp_transaction", fake_complete)
+
+    async def fake_claim(*a, **kw):
+        return {"reserved_uah": Decimal("100.00"), "invoice_id": INVOICE_ID, "operator_session_id": 555}
+    monkeypatch.setattr(repo, "claim_reservation_for_settlement", fake_claim)
+
+    async def fake_finalize(*a, **kw):
+        raise MonobankError("bank timeout")
+    monkeypatch.setattr(ocpp_charging, "finalize_invoice", fake_finalize)
+
+    record_calls = []
+    async def fake_record(*a, **kw):
+        record_calls.append((a, kw))
+        return True
+    monkeypatch.setattr(repo, "record_uah_settlement", fake_record)
+
+    result = await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+        OPERATOR_A, transaction_id=555, kwh=Decimal("5.000"), meter_stop_wh=6000,
+        ended_at=SINCE, reservation_id=RESERVATION_ID, reserved_uah=Decimal("100.00"),
+        invoice_id=INVOICE_ID, tariff_uah_start=Decimal("5.00"), tariff_uah_kwh=Decimal("10.00"),
+        operator_token=OPERATOR_TOKEN,
+    )
+
+    assert result is False
+    assert record_calls == [], "Рядок має лишитись 'settling' — крок 3 звірки довершить"

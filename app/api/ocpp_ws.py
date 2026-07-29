@@ -293,11 +293,18 @@ class ChargePoint(OcppChargePoint):
         else:
             kwh = (delta_wh / Decimal(1000)).quantize(Decimal("0.001"))
 
-        # Резервація (Промпт 3c-i) прив'язується до сесії лише при активації
-        # (див. _try_activate_reservation) — якщо її нема або вона не 'active',
-        # завершуємо сесію так само, як і в 3b (без hold/release).
+        # Резервація (Промпт 3c-i/3c-ii) прив'язується до сесії лише при
+        # активації (див. _try_activate_reservation) — якщо її нема або
+        # вона не 'active', завершуємо сесію так само, як і в 3b (без
+        # hold/release чи розрахунку з банком). payment_method розводить
+        # модель A (kWh-баланс, атомарно) від моделі B (грн через
+        # Monobank, окремий метод — settle не можна покласти в ту саму
+        # Postgres-транзакцію, що completion сесії, docs/plan-3c-ii.md
+        # розділ 2).
         reservation = await repo.get_reservation_by_session_id(self.operator_id, session["id"])
-        if reservation is not None and reservation["status"] == "active":
+        if reservation is not None and reservation["status"] == "active" and reservation["payment_method"] == "uah":
+            await self._settle_uah_reservation(reservation, transaction_id, kwh, meter_stop, ended_at)
+        elif reservation is not None and reservation["status"] == "active":
             await repo.complete_ocpp_transaction_and_release(
                 self.operator_id, transaction_id, kwh, meter_stop, ended_at,
                 reservation_id=reservation["id"], reserved_kwh=reservation["reserved_kwh"],
@@ -313,6 +320,60 @@ class ChargePoint(OcppChargePoint):
             logger.info("🔌 OCPP StopTransaction: станція %s, сесія #%s, %s кВт·год",
                         self.id, session["id"], kwh)
         return call_result.StopTransaction(id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted))
+
+    async def _settle_uah_reservation(self, reservation, transaction_id, kwh, meter_stop, ended_at) -> None:
+        """
+        Модель B (Промпт 3c-ii) — розрахунок через Monobank finalize/cancel.
+        Ліниво імпортує app.services.ocpp_charging (усередині функції, НЕ
+        на рівні модуля): той модуль сам імпортує remote_start_transaction/
+        remote_stop_transaction/ChargePointNotConnected ЗВІДСИ (app.api.
+        ocpp_ws) — імпорт нагорі файлу дав би циклічну залежність.
+
+        Сесія ЗАВЖДИ завершується (repo.complete_ocpp_transaction), навіть
+        якщо сам розрахунок неможливий (немає токена оператора чи станції
+        не знайдено — обидва практично недосяжні, композитний FK з ON
+        DELETE CASCADE не дав би дійти сюди без станції, захист про всяк
+        випадок): інакше сесія застрягла б 'charging' навіки й заблокувала
+        б наступний старт на цій станції (частковий унікальний індекс
+        uq_operator_sessions_one_active_ocpp_per_station). Резервація тоді
+        лишається 'active' — на ручний розбір; це відома, вузька межа поза
+        обсягом кроків звірки (docs/plan-3c-ii.md розділ 5), які починають
+        стежити лише з 'settling' (після успішного локального claim).
+        """
+        from app.services import ocpp_charging
+
+        token_encrypted = await repo.get_operator_monobank_token_encrypted(self.operator_id)
+        operator_token = None
+        if token_encrypted:
+            try:
+                operator_token = decrypt_secret(token_encrypted)
+            except (EncryptionKeyMissing, ValueError) as e:
+                logger.error(
+                    "OCPP StopTransaction: резервація #%s (uah) — не вдалося розшифрувати "
+                    "токен оператора %s: %s", reservation["id"], self.operator_id, e,
+                )
+
+        station = await repo.get_station(self.operator_id, self.station_id)
+
+        if operator_token is None or station is None:
+            await repo.complete_ocpp_transaction(
+                self.operator_id, transaction_id, kwh=kwh,
+                meter_stop_wh=meter_stop, ended_at=ended_at,
+            )
+            logger.error(
+                "OCPP StopTransaction: резервація #%s (uah) — розрахунок неможливий "
+                "(немає токена еквайрингу чи станції), сесія завершена, резервація "
+                "лишається 'active' на ручний розбір", reservation["id"],
+            )
+            return
+
+        await ocpp_charging.complete_ocpp_transaction_and_release_uah(
+            self.operator_id, transaction_id, kwh, meter_stop, ended_at,
+            reservation_id=reservation["id"], reserved_uah=reservation["reserved_uah"],
+            invoice_id=reservation["invoice_id"],
+            tariff_uah_start=station["tariff_uah_start"], tariff_uah_kwh=station["tariff_uah_kwh"],
+            operator_token=operator_token,
+        )
 
     @on(Action.meter_values)
     async def on_meter_values(self, connector_id, meter_value, transaction_id=None, **kwargs):

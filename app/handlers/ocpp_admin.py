@@ -29,6 +29,7 @@ FSM-кроку. Реєструються ПЕРЕД user_router (app/main.py) �
 test_ocpp_admin_router.py.
 """
 import logging
+import os
 from decimal import Decimal, InvalidOperation
 
 from aiogram import Router
@@ -41,6 +42,12 @@ from app.services import ocpp_charging
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+# Той самий фолбек-ланцюжок, що driver_qr.py: банку потрібен ЗОВНІШНЬО
+# доступний URL для redirectUrl/webHookUrl інвойсу, тож localhost не годиться.
+PUBLIC_BASE_URL = (
+    os.getenv("PUBLIC_BASE_URL") or os.getenv("EMSP_BASE_URL") or "https://evolt.ua"
+).rstrip("/")
 
 
 _START_STATUS_MESSAGES = {
@@ -56,6 +63,14 @@ _STOP_STATUS_MESSAGES = {
     "no_active_session": "ℹ️ На станції #{station_id} немає активної OCPP-сесії",
     "not_connected": "❌ Станція зараз не підключена до цього процесу (transactionId={transaction_id})",
     "rejected": "❌ Станція відхилила RemoteStopTransaction (transactionId={transaction_id})",
+}
+
+# Модель B (Промпт 3c-ii) — гривневий hold через Monobank.
+_START_UAH_STATUS_MESSAGES = {
+    "unknown_station": "❌ Станція #{station_id} не належить оператору #{operator_id}",
+    "not_ocpp": "❌ Станція #{station_id} не в режимі OCPP",
+    "no_monobank_token": "❌ У оператора #{operator_id} не налаштовано (чи не вдалося розшифрувати) токен еквайрингу Monobank",
+    "bank_error": "❌ Банк не створив hold-інвойс — спробуй ще раз за хвилину",
 }
 
 
@@ -178,3 +193,82 @@ async def cmd_ocpp_stop(message: Message):
         operator_id=operator_id, station_id=station_id, transaction_id=result.transaction_id,
         status=result.status,
     ))
+
+
+@router.message(Command("ocpp_start_uah"), StateFilter("*"))
+async def cmd_ocpp_start_uah(message: Message):
+    """
+    Модель B (Промпт 3c-ii): створює hold-інвойс у банку + локальну
+    резервацію 'awaiting_hold'. НА ВІДМІНУ від /ocpp_start — тут НЕМАЄ
+    синхронного RemoteStart: оплата водієм асинхронна (відкриває page_url
+    і платить карткою окремо), тож RemoteStart відбудеться пізніше,
+    вебхуком (app/api/charging_hold_webhook.py), коли банк підтвердить
+    hold. Ця команда лише видає адміну посилання на оплату й канонічний
+    текст-попередження, щоб переслати водієві — водійського UI в цьому
+    бандлі немає (docs/plan-3c-ii.md, «Свідомі межі»).
+    """
+    if not _is_admin_chat(message):
+        return
+
+    args = (message.text or "").split()[1:]
+    if len(args) not in (3, 4):
+        await message.answer(
+            "Використання: /ocpp_start_uah <operator_id> <station_id> <hold_amount_uah> [driver_contact]"
+        )
+        return
+
+    try:
+        operator_id = int(args[0])
+        station_id = int(args[1])
+        hold_amount_uah = Decimal(args[2])
+    except (ValueError, InvalidOperation):
+        await message.answer(
+            "❌ Биті аргументи: operator_id/station_id мають бути цілими числами, "
+            "hold_amount_uah — числом (напр. 20.0)",
+        )
+        return
+
+    if hold_amount_uah <= 0:
+        await message.answer("❌ hold_amount_uah має бути додатним")
+        return
+
+    driver_contact = args[3] if len(args) == 4 else None
+
+    logger.info("💳 /ocpp_start_uah від адмін-чату %s: operator=%s station=%s hold=%s грн",
+                message.chat.id, operator_id, station_id, hold_amount_uah)
+
+    webhook_url = f"{PUBLIC_BASE_URL}/webhook/charging-hold/{operator_id}"
+    # Немає водійського UI/квитанції в цьому бандлі (свідома межа) —
+    # редіректимо на головну; водій уже отримає підтвердження оплати від
+    # самого банку (SMS/пуш Monobank), а старт зарядки прийде окремо, коли
+    # спрацює вебхук.
+    redirect_url = f"{PUBLIC_BASE_URL}/"
+
+    try:
+        result = await ocpp_charging.start_charging_reservation_uah(
+            operator_id, station_id, hold_amount_uah, redirect_url, webhook_url,
+            driver_contact=driver_contact,
+        )
+    except Exception:
+        logger.exception(
+            "🔥 /ocpp_start_uah: неочікуваний збій сервісу (operator=%s station=%s)",
+            operator_id, station_id,
+        )
+        await message.answer("⚠️ Внутрішня помилка. Перевір лог і спробуй ще раз.")
+        return
+
+    if result.status == "ok":
+        await message.answer(
+            f"✅ Резервація #{result.reservation_id}: hold-інвойс на {hold_amount_uah} грн створено.\n\n"
+            f"Посилання для оплати (перешли водієві):\n{result.page_url}\n\n"
+            "Текст для водія:\n"
+            f"💳 Оплата гарантії {hold_amount_uah} грн ЗАБЛОКУЄ цю суму на вашій картці — "
+            "це ще НЕ списання. Спишеться лише фактично спожита електроенергія за тарифом "
+            f"станції (максимум {hold_amount_uah} грн). Різниця повернеться на вашу картку "
+            "АВТОМАТИЧНО протягом кількох ГОДИН після завершення зарядки.\n\n"
+            "Зарядка стартує сама, щойно банк підтвердить утримання коштів."
+        )
+        return
+
+    template = _START_UAH_STATUS_MESSAGES.get(result.status, "❌ Невідомий статус: {status}")
+    await message.answer(template.format(operator_id=operator_id, station_id=station_id, status=result.status))

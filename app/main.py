@@ -25,6 +25,7 @@ from app.handlers.operator_billing import router as operator_billing_router
 from app.handlers.ocpp_admin import router as ocpp_admin_router
 from app.api.operator_webhook import operator_webhook_router
 from app.api.wallet_webhook import wallet_webhook_router
+from app.api.charging_hold_webhook import charging_hold_webhook_router
 from app.api.ocpp_ws import ocpp_router
 from app.api.driver_qr import driver_router
 from app.core.crypto import warn_if_key_missing
@@ -106,6 +107,7 @@ app.add_middleware(
 app.include_router(api_cdr_router)
 app.include_router(operator_webhook_router)
 app.include_router(wallet_webhook_router)
+app.include_router(charging_hold_webhook_router)
 app.include_router(ocpp_router)
 app.include_router(driver_router)
 

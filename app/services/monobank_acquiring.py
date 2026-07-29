@@ -30,6 +30,8 @@ BASE_URL = os.getenv("MONOBANK_ACQUIRING_BASE_URL", "https://api.monobank.ua").r
 CREATE_INVOICE_PATH = "/api/merchant/invoice/create"
 INVOICE_STATUS_PATH = "/api/merchant/invoice/status"
 MERCHANT_DETAILS_PATH = "/api/merchant/details"
+FINALIZE_INVOICE_PATH = "/api/merchant/invoice/finalize"
+CANCEL_INVOICE_PATH = "/api/merchant/invoice/cancel"
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -63,7 +65,7 @@ def kopecks_to_uah(amount_kopecks: int) -> Decimal:
 
 async def create_invoice(operator_token: str, amount_uah, reference: str,
                          redirect_url: str, webhook_url: str,
-                         destination: str = None) -> dict:
+                         destination: str = None, payment_type: str = "debit") -> dict:
     """
     Створює інвойс у мерчанта ОПЕРАТОРА.
 
@@ -71,6 +73,15 @@ async def create_invoice(operator_token: str, amount_uah, reference: str,
     повертає його назад незмінним. Використовується для звірки, але НЕ як
     підстава довіряти webhook: статус ми в будь-якому разі перепитуємо в
     банку (див. app/api/operator_webhook.py).
+
+    payment_type: "debit" (звичайна оплата, замовчування) або "hold"
+    (Модель B, Промпт 3c-ii — гроші БЛОКУЮТЬСЯ на картці водія, а не
+    списуються одразу; подальше списання/повернення — finalize_invoice()/
+    cancel_invoice() нижче, звірено живим смоуком 28-29.07.2026, див.
+    docs/SESSION_STATE.md). Поле `paymentType` додається в тіло запиту
+    ЛИШЕ коли воно НЕ "debit" — щоб наявні debit-виклики (app/api/
+    driver_qr.py) лишались байт-в-байт тим самим payload, що й до цієї
+    зміни.
 
     Повертає dict банку: {'invoiceId': ..., 'pageUrl': ...}.
     """
@@ -85,6 +96,8 @@ async def create_invoice(operator_token: str, amount_uah, reference: str,
         "webHookUrl": webhook_url,
         "validity": INVOICE_TTL_SECONDS,
     }
+    if payment_type != "debit":
+        payload["paymentType"] = payment_type
 
     try:
         async with httpx.AsyncClient() as client:
@@ -135,6 +148,69 @@ async def get_invoice_status(operator_token: str, invoice_id: str) -> dict:
     if resp.status_code != 200:
         raise MonobankError(
             f"Monobank не віддав статус інвойсу {invoice_id} (HTTP {resp.status_code}): {resp.text}"
+        )
+    return resp.json()
+
+
+async def finalize_invoice(operator_token: str, invoice_id: str, amount_uah) -> dict:
+    """
+    Модель B (Промпт 3c-ii): часткове чи повне списання нефіналізованого
+    hold. amount_uah — ФАКТИЧНО спожита вартість (finalAmount), НЕ
+    утримана сума (amount) — і має бути не більшою за неї.
+
+    ПРИПУЩЕННЯ, НЕ ЖИВИЙ ФАКТ (докстрінг mock_monobank.py, беклог
+    docs/SESSION_STATE.md "перевірити over-capture"): чи банк справді
+    відхиляє finalize на суму БІЛЬШУ за утримання, живим смоуком не
+    перевірялось — 28-29.07.2026 фіналізували лише МЕНШУ за hold суму.
+
+    Відповідь банку на сам виклик (`{"status": "success"}` за нашим моком)
+    у смоуку 28-29.07.2026 НЕ зафіксована (тіло не збережено) — узята З
+    ДОКУМЕНТАЦІЇ банку. Форма результуючого invoice/status (amount/
+    finalAmount/fee/rrn/tranId) — ЖИВА, звірена смоуком.
+    """
+    payload = {"invoiceId": invoice_id, "amount": uah_to_kopecks(amount_uah)}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}{FINALIZE_INVOICE_PATH}",
+                json=payload,
+                headers={"X-Token": operator_token},
+                timeout=DEFAULT_TIMEOUT,
+            )
+    except httpx.HTTPError as e:
+        raise MonobankError(f"Monobank недоступний при фіналізації інвойсу {invoice_id}: {e}") from e
+
+    if resp.status_code != 200:
+        raise MonobankError(
+            f"Monobank відхилив фіналізацію інвойсу {invoice_id} (HTTP {resp.status_code}): {resp.text}"
+        )
+    return resp.json()
+
+
+async def cancel_invoice(operator_token: str, invoice_id: str) -> dict:
+    """
+    Модель B (Промпт 3c-ii): скасування — працює і на `success` (повернення
+    вже списаного), і на НЕфіналізованому `hold` (звільнення утриманого без
+    жодного списання). Друге і було головним невідомим гейта Моделі B,
+    підтверджене живим смоуком 28-29.07.2026 (docs/SESSION_STATE.md):
+    cancel на нефіналізованому hold СПРАЦЮВАВ, підтверджено з обох боків
+    (картка «Скасування +20 ₴» + виписка мерчанта).
+    """
+    payload = {"invoiceId": invoice_id}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}{CANCEL_INVOICE_PATH}",
+                json=payload,
+                headers={"X-Token": operator_token},
+                timeout=DEFAULT_TIMEOUT,
+            )
+    except httpx.HTTPError as e:
+        raise MonobankError(f"Monobank недоступний при скасуванні інвойсу {invoice_id}: {e}") from e
+
+    if resp.status_code != 200:
+        raise MonobankError(
+            f"Monobank відхилив скасування інвойсу {invoice_id} (HTTP {resp.status_code}): {resp.text}"
         )
     return resp.json()
 
