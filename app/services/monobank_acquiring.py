@@ -158,15 +158,22 @@ async def finalize_invoice(operator_token: str, invoice_id: str, amount_uah) -> 
     hold. amount_uah — ФАКТИЧНО спожита вартість (finalAmount), НЕ
     утримана сума (amount) — і має бути не більшою за неї.
 
-    ПРИПУЩЕННЯ, НЕ ЖИВИЙ ФАКТ (докстрінг mock_monobank.py, беклог
-    docs/SESSION_STATE.md "перевірити over-capture"): чи банк справді
-    відхиляє finalize на суму БІЛЬШУ за утримання, живим смоуком не
-    перевірялось — 28-29.07.2026 фіналізували лише МЕНШУ за hold суму.
+    ПІДТВЕРДЖЕНО ЖИВИМ СМОУКОМ 30.07.2026: банк дійсно відхиляє finalize на
+    суму БІЛЬШУ за утримання (HTTP 400, errCode "1001", errText
+    "finalization amount exceeds hold amount") — раніше це було
+    консервативне припущення (28-29.07.2026 фіналізували лише МЕНШУ за
+    hold суму). Повторний finalize того самого інвойсу банк теж
+    відхиляє — той самий errCode "1001", errText "order on hold not
+    found".
 
-    Відповідь банку на сам виклик (`{"status": "success"}` за нашим моком)
-    у смоуку 28-29.07.2026 НЕ зафіксована (тіло не збережено) — узята З
-    ДОКУМЕНТАЦІЇ банку. Форма результуючого invoice/status (amount/
-    finalAmount/fee/rrn/tranId) — ЖИВА, звірена смоуком.
+    Відповідь банку на сам виклик (`{"status": "success"}`) — ПІДТВЕРДЖЕНО
+    ЖИВИМ СМОУКОМ 30.07.2026 (раніше взято з документації банку без живого
+    підтвердження). Форма результуючого invoice/status (amount/
+    finalAmount/fee/rrn/tranId) — ЖИВА, звірена смоуком. Одразу після
+    finalize invoice/status короткочасно повертає ТРАНЗИТНИЙ
+    `status: "processing"` з `finalAmount`, що дорівнює ПОВНІЙ утриманій
+    сумі (не фактично списаній) — коректний `finalAmount` з'являється
+    лише разом зі `status: "success"`.
     """
     payload = {"invoiceId": invoice_id, "amount": uah_to_kopecks(amount_uah)}
     try:

@@ -103,11 +103,9 @@ def test_finalize_fee_recomputed_from_final_amount_not_held_amount():
 
 def test_finalize_rejects_amount_greater_than_held():
     """
-    Тестує ПРИПУЩЕННЯ мока, не живий факт: смоук 28-29.07.2026 фіналізував
-    лише МЕНШУ за утримання суму (2000 -> 500) — over-capture (finalize на
-    суму БІЛЬШУ за hold) наживо не перевірявся. Це консервативний здогад
-    "банк так не дозволить", який ще належить підтвердити чи спростувати
-    (беклог docs/SESSION_STATE.md).
+    Мок повторює ПІДТВЕРДЖЕНУ ЖИВИМ СМОУКОМ 30.07.2026 поведінку банку:
+    over-capture (finalize понад hold) банк дійсно відхиляє — HTTP 400,
+    errCode "1001", errText "finalization amount exceeds hold amount".
     """
     invoice_id = _create_invoice(amount=2000, payment_type="hold")
     client.post(f"/mock/pay/{invoice_id}")

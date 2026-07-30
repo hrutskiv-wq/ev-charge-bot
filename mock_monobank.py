@@ -58,12 +58,34 @@ paymentMethod, paymentSystem), а не справжні банківські д�
     `cancelList` (масив), `finalAmount: 0`;
   * відповідь на сам `invoice/cancel` — `{"status": "success",
     "createdDate": ..., "modifiedDate": ...}` — ЖИВА.
-  * відповідь на `invoice/finalize` — У СМОУКУ НЕ ЗАФІКСОВАНА (тіло не
-    збережено). Взято З ДОКУМЕНТАЦІЇ БАНКУ (`{"status": "success"}`), а НЕ
-    з живого прогону — позначено окремо в коді нижче. Звірити, коли
-    трапиться перший живий фіналайз із збереженим тілом відповіді.
+  * відповідь на `invoice/finalize` — `{"status": "success"}` — ПІДТВЕРДЖЕНО
+    ЖИВИМ СМОУКОМ 30.07.2026 (раніше було взято з документації банку без
+    живого підтвердження).
 Значення (rrn/approvalCode/tranId/terminal/maskedPan) — і тут вигадані
 заглушки, НЕ справжні реквізити з проду (та сама конвенція, що вище).
+
+ЖИВИЙ СМОУК 30.07.2026 (наскрізний — через реальний вебхук і production-код,
+не лише цей мок) додав нові підтверджені факти:
+  * банк шле вебхуки і на проміжних станах `created`/`processing`
+    hold-інвойсу, не лише на фінальний `hold` — і навіть повторно, шторм
+    ≥3 дублікатів `hold`-вебхука за ~250 мс на одну оплату (захист — наш
+    власний мʼютекс `mark_reservation_hold_confirmed`, не покладання на
+    банк);
+  * одразу після `finalize` `invoice/status` короткочасно повертає
+    ТРАНЗИТНИЙ `status: "processing"` з `finalAmount`, що дорівнює ПОВНІЙ
+    утриманій сумі (не фактично списаній) — коректний `finalAmount`
+    з'являється лише разом зі `status: "success"`. Полю `finalAmount` не
+    можна вірити, поки статус не `success`;
+  * over-capture (finalize понад hold) банк ВІДХИЛЯЄ — HTTP 400,
+    `{"errCode": "1001", "errText": "finalization amount exceeds hold
+    amount"}`, hold лишається цілим — тепер ФАКТ, не консервативний здогад
+    (див. `finalize_invoice()` нижче);
+  * повторний `finalize` того самого інвойсу банк теж ВІДХИЛЯЄ — HTTP 400,
+    `{"errCode": "1001", "errText": "order on hold not found"}` (той самий
+    `errCode`, що й over-capture — розрізняти можна лише за `errText`).
+    Подвійного списання немає, але це аргумент на користь власного
+    `'settling'`-мʼютекса (`claim_reservation_for_settlement()`), а не
+    покладання на цю поведінку банку.
 
 НЕ ПЕРЕВІРЕНО: форма відповіді для статусів failure/expired — живих
 зразків цих статусів поки немає, тому `paymentInfo`/`finalAmount`/
@@ -248,11 +270,10 @@ async def finalize_invoice(request: Request, x_token: str = Header(None)):
     """
     Часткове чи повне списання нефіналізованого hold.
 
-    ВІДПОВІДЬ ЦЬОГО ЕНДПОІНТА НЕ ПІДТВЕРДЖЕНА ЖИВИМ ПРОГОНОМ — у смоуку
-    28-29.07.2026 тіло відповіді не було збережено. `{"status": "success"}`
-    нижче взято З ДОКУМЕНТАЦІЇ банку, а НЕ з живого запиту. Форма
-    результуючого invoice/status (amount/finalAmount/fee/rrn/tranId) —
-    ЖИВА, звірена смоуком (див. докстрінг модуля).
+    Відповідь `{"status": "success"}` — ПІДТВЕРДЖЕНО ЖИВИМ СМОУКОМ
+    30.07.2026 (раніше було взято з документації банку без живого
+    підтвердження). Форма результуючого invoice/status
+    (amount/finalAmount/fee/rrn/tranId) — теж ЖИВА (див. докстрінг модуля).
     """
     body = await request.json()
     invoice_id = body.get("invoiceId")
@@ -263,21 +284,27 @@ async def finalize_invoice(request: Request, x_token: str = Header(None)):
         raise HTTPException(status_code=404, detail="invoice not found")
     if invoice["_token"] != x_token:
         raise HTTPException(status_code=403, detail="foreign invoice")
+    # ПІДТВЕРДЖЕНО ЖИВИМ СМОУКОМ 30.07.2026: finalize не на статусі hold
+    # (у т.ч. повторний finalize того самого інвойсу) банк відхиляє тим
+    # самим errCode, що й over-capture нижче — розрізнити можна лише за
+    # errText.
     if invoice["status"] != "hold":
-        raise HTTPException(
-            status_code=400,
-            detail=f"invoice status is {invoice['status']}, expected hold",
-        )
-    # ПРИПУЩЕННЯ, НЕ ЖИВИЙ ФАКТ: живий смоук 28-29.07.2026 фіналізував лише
-    # МЕНШУ за утримання суму (2000 -> 500) — over-capture (finalize на
-    # суму БІЛЬШУ за hold) наживо не пробували. Заборона нижче — консервативний
-    # здогад "банк так не дозволить", а не підтверджена поведінка. Див.
-    # беклог docs/SESSION_STATE.md: "перевірити over-capture живим смоуком".
-    if not isinstance(amount, int) or amount <= 0 or amount > invoice["amount"]:
-        raise HTTPException(
-            status_code=400,
-            detail="amount має бути цілим у копійках, не більшим за утримане",
-        )
+        raise HTTPException(status_code=400, detail={
+            "errCode": "1001",
+            "errText": "order on hold not found",
+        })
+    # ПІДТВЕРДЖЕНО ЖИВИМ СМОУКОМ 30.07.2026: over-capture (finalize на суму
+    # БІЛЬШУ за hold) банк дійсно відхиляє — HTTP 400, errCode "1001".
+    if not isinstance(amount, int) or amount <= 0:
+        raise HTTPException(status_code=400, detail={
+            "errCode": "1001",
+            "errText": "amount має бути цілим додатним числом копійок",
+        })
+    if amount > invoice["amount"]:
+        raise HTTPException(status_code=400, detail={
+            "errCode": "1001",
+            "errText": "finalization amount exceeds hold amount",
+        })
 
     invoice["status"] = "success"
     invoice["finalAmount"] = amount
