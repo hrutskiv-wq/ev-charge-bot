@@ -661,7 +661,13 @@ def _parse_coordinates(text: str):
 
 async def _prompt_connector_step(message: Message, state: FSMContext):
     await state.set_state(StationWizard.waiting_for_connector)
-    await message.answer("Тип конектора:", reply_markup=get_connector_presets_keyboard())
+    await message.answer(
+        "Тип конектора:\n\n"
+        "⚠️ Одна станція = один конектор. Якщо на зарядці кілька конекторів — "
+        "додайте кожен окремою станцією. Режим OCPP підтримує один конектор "
+        "на фізичну зарядку.",
+        reply_markup=get_connector_presets_keyboard(),
+    )
 
 
 @router.message(StateFilter(StationWizard.waiting_for_location), F.location)

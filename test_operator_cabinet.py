@@ -866,6 +866,25 @@ def test_parse_coordinates_accepts_valid_pair():
     assert ob._parse_coordinates("49.8397, 24.0297") == (49.8397, 24.0297)
 
 
+async def test_station_wizard_connector_step_warns_about_one_connector_per_station(rs):
+    """
+    Дешеве пом'якшення мультиконекторного ризику (беклог SESSION_STATE.md,
+    знахідка живого смоуку самообслуговуваного онбордингу 2026-07-28):
+    майстер станції попереджає ДО вибору конектора, що OCPP-режим підтримує
+    рівно один конектор на фізичну зарядку. Текст, не логіка — стан і
+    клавіатура не змінюються (регресія перевірена сусідніми тестами).
+    """
+    state = FakeFSMContext()
+    location_message = FakeMessage(location=FakeLocation(49.8397, 24.0297))
+
+    await ob.station_wizard_location_shared(location_message, state)
+
+    assert state.state == ob.StationWizard.waiting_for_connector
+    warning_text = location_message.sent[-1][0]
+    assert "один конектор" in warning_text
+    assert "OCPP" in warning_text
+
+
 async def test_station_wizard_connector_other_keeps_state_until_text(rs):
     state = FakeFSMContext()
     await state.set_state(ob.StationWizard.waiting_for_connector)
