@@ -389,12 +389,21 @@ async def test_telegram_push_failure_does_not_crash_reconciliation(billing, monk
 # 5. Модель B, крок 1: 'awaiting_hold' застарілі
 # ---------------------------------------------------------------------------
 
-async def test_awaiting_hold_expired_when_bank_never_saw_it(billing):
-    """Банк так і не дійшов до 'hold' (усе ще processing) — безпечно позначаємо expired."""
+async def test_awaiting_hold_expired_when_bank_reports_terminal_failure(billing):
+    """
+    Банк дійшов до ЯВНО ТЕРМІНАЛЬНОГО 'failure' (оплата не пройшла) —
+    безпечно позначаємо expired.
+
+    Раніше цей тест звірявся на `bank_status="processing"` і сам кодував
+    баг, який виправляє цей бандл: 'processing' — реальний ТРАНЗИТНИЙ стан
+    на шляху до 'hold' (живий факт (з), SESSION_STATE.md, 2026-07-30), не
+    термінальний — тепер це окремий сценарій, див.
+    test_awaiting_hold_processing_and_created_are_transient_not_expired нижче.
+    """
     old_enough = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES + 5)
     billing.add_uah_reservation(101, OPERATOR_A, "inv-101", Decimal("100.00"),
                                 status="awaiting_hold", created_at=old_enough)
-    billing.set_bank_status("inv-101", "processing")
+    billing.set_bank_status("inv-101", "failure")
     billing.set_operator_token(OPERATOR_A)
 
     exit_code = await _run()
@@ -402,6 +411,125 @@ async def test_awaiting_hold_expired_when_bank_never_saw_it(billing):
     assert billing.reservations[101]["status"] == "expired"
     assert billing.cancel_calls == [], "Банк ніколи не тримав гроші — cancel_invoice не потрібен"
     assert exit_code == 1
+
+
+async def test_awaiting_hold_expired_when_bank_reversed_after_own_auto_cancel(billing):
+    """
+    Знахідка рев'ю плану Opus: банк САМ автоскасував (напр. 9-денний
+    таймаут hold, на який наш вебхук/алерт свого часу не відреагував) —
+    'reversed' теж термінальний для 'awaiting_hold'-рядка. Без цієї гілки
+    рядок випав би з видимості НАЗАВЖДИ: наступний прогін фільтрує лише
+    статус 'awaiting_hold', а транзитна гілка (нижче) мовчки пропускала б
+    його щоразу знову.
+    """
+    old_enough = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES + 5)
+    billing.add_uah_reservation(106, OPERATOR_A, "inv-106", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.set_bank_status("inv-106", "reversed")
+    billing.set_operator_token(OPERATOR_A)
+
+    exit_code = await _run()
+
+    assert billing.reservations[106]["status"] == "expired"
+    assert billing.cancel_calls == []
+    assert exit_code == 1
+
+
+async def test_awaiting_hold_alerts_when_bank_already_succeeded(billing):
+    """
+    Знахідка рев'ю плану Opus: банк уже СПИСАВ кошти (success), а рядок і
+    досі 'awaiting_hold' — найгучніший можливий сценарій цього кроку. Не
+    можна ні мовчки пропустити (гроші реально рухались), ні звести до
+    'expired' (це приховало б сам факт списання) — лише алерт, рядок
+    НЕДОТОРКАНИЙ, банк цим кроком нічого не мутує.
+    """
+    old_enough = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES + 5)
+    billing.add_uah_reservation(107, OPERATOR_A, "inv-107", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.set_bank_status("inv-107", "success", final_amount_kopecks=3500)
+    billing.set_operator_token(OPERATOR_A)
+
+    exit_code = await _run()
+
+    assert billing.reservations[107]["status"] == "awaiting_hold", "Рядок має лишитись НЕДОТОРКАНИМ"
+    assert billing.cancel_calls == []
+    assert billing.finalize_calls == []
+    assert exit_code == 1, "Алерт — теж сигнал моніторингу"
+
+
+async def test_awaiting_hold_success_and_hold_alerts_have_distinct_reasons(billing):
+    """
+    'hold' і 'success' обидва йдуть у гілку алерту, але з РІЗНИМ reason:
+    "банк тримає, RemoteStart не відбувся" — не те саме, що "банк уже
+    списав кошти повз наш облік". Перевіряю напряму через stats (run()
+    повертає лише exit_code, не сам об'єкт статистики).
+    """
+    cutoff = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES)
+    old_enough = cutoff - timedelta(minutes=5)
+    billing.add_uah_reservation(108, OPERATOR_A, "inv-108-hold", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.add_uah_reservation(109, OPERATOR_A, "inv-109-success", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.set_bank_status("inv-108-hold", "hold")
+    billing.set_bank_status("inv-109-success", "success", final_amount_kopecks=3500)
+    billing.set_operator_token(OPERATOR_A)
+
+    stats = reconcile.ReconcileStats()
+    await reconcile._reconcile_stale_awaiting_hold(cutoff, stats)
+
+    reasons = {a["reservation_id"]: a["reason"] for a in stats.alerts}
+    assert len(stats.alerts) == 2
+    assert reasons[108] != reasons[109]
+    assert "success" in reasons[109] or "спис" in reasons[109]
+
+
+async def test_awaiting_hold_processing_and_created_are_transient_not_expired(billing):
+    """
+    ГОЛОВНА ГАРАНТІЯ правки 1 (живий факт (з), SESSION_STATE.md 2026-07-30):
+    'processing'/'created' — реальний транзитний стан НА ШЛЯХУ до 'hold',
+    не глухий кут. Раніше звірка позначала такий рядок 'expired' одразу —
+    якщо оплата водія доходила до 'hold' вже ПІСЛЯ цього, вебхук шукав
+    рядок за статусом 'awaiting_hold' і вже не знаходив його: гроші водія
+    висіли б до 9-денного автоскасування банку без жодного нашого сліду.
+    Тепер рядок лишається недоторканим, лише лічильник для видимості.
+    """
+    cutoff = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES)
+    old_enough = cutoff - timedelta(minutes=5)
+    billing.add_uah_reservation(110, OPERATOR_A, "inv-110-processing", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.add_uah_reservation(111, OPERATOR_A, "inv-111-created", Decimal("50.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.set_bank_status("inv-110-processing", "processing")
+    billing.set_bank_status("inv-111-created", "created")
+    billing.set_operator_token(OPERATOR_A)
+
+    stats = reconcile.ReconcileStats()
+    await reconcile._reconcile_stale_awaiting_hold(cutoff, stats)
+
+    assert billing.reservations[110]["status"] == "awaiting_hold"
+    assert billing.reservations[111]["status"] == "awaiting_hold"
+    assert billing.cancel_calls == []
+    assert billing.finalize_calls == []
+    assert stats.released == []
+    assert stats.alerts == []
+    assert stats.awaiting_hold_transient == 2
+
+
+async def test_awaiting_hold_transient_state_does_not_affect_exit_code(billing):
+    """
+    Транзитний стан — НЕ сигнал моніторингу (на відміну від alerts/
+    released): прогін, де це єдина знахідка, має завершитись exit_code 0.
+    """
+    old_enough = NOW - timedelta(minutes=reconcile.AWAITING_HOLD_STALE_MINUTES + 5)
+    billing.add_uah_reservation(112, OPERATOR_A, "inv-112", Decimal("100.00"),
+                                status="awaiting_hold", created_at=old_enough)
+    billing.set_bank_status("inv-112", "processing")
+    billing.set_operator_token(OPERATOR_A)
+
+    exit_code = await _run()
+
+    assert billing.reservations[112]["status"] == "awaiting_hold"
+    assert exit_code == 0
 
 
 async def test_awaiting_hold_only_alerts_when_bank_confirms_hold_never_touches_ocpp(billing):
@@ -767,6 +895,50 @@ async def test_settling_syncs_without_recalling_bank_when_already_success(billin
     assert billing.reservations[304]["final_amount_uah"] == Decimal("30.00")
 
 
+async def test_settling_unexpected_bank_status_recorded_in_alerts(billing):
+    """
+    Знахідка живого смоуку 2026-07-30: раніше неочікуваний стан банку тут
+    писав лише logger.error — не потрапляв ні в stats.alerts, ні в
+    Telegram-підсумок, ні в exit code. Той самий клас невидимості, що вже
+    задокументоване капування перевитрати (SESSION_STATE.md). Перевіряю
+    напряму через stats — run() повертає лише exit_code.
+    """
+    old_enough = NOW - timedelta(seconds=reconcile.SETTLING_STALE_SECONDS + 30)
+    billing.add_uah_reservation(306, OPERATOR_A, "inv-306", Decimal("100.00"),
+                                status="settling", created_at=old_enough, updated_at=old_enough,
+                                operator_session_id=559, station_id=10)
+    billing.set_bank_status("inv-306", "processing")  # не мав би тут з'явитись, але код не виключає
+    billing.set_operator_token(OPERATOR_A)
+
+    stats = reconcile.ReconcileStats()
+    cutoff = NOW - timedelta(seconds=reconcile.SETTLING_STALE_SECONDS)
+    await reconcile._reconcile_stale_settling(cutoff, stats)
+
+    assert billing.reservations[306]["status"] == "settling", "Рядок недоторканий — не вигадуємо суму"
+    assert billing.finalize_calls == []
+    assert billing.cancel_calls == []
+    assert stats.released == []
+    assert len(stats.alerts) == 1
+    assert stats.alerts[0]["reservation_id"] == 306
+    assert stats.alerts[0]["invoice_id"] == "inv-306"
+    assert "processing" in stats.alerts[0]["reason"]
+
+
+async def test_settling_unexpected_bank_status_yields_exit_code_one(billing):
+    """Той самий сценарій через повний run() — контракт cron/exit code, не лише внутрішній stats."""
+    old_enough = NOW - timedelta(seconds=reconcile.SETTLING_STALE_SECONDS + 30)
+    billing.add_uah_reservation(307, OPERATOR_A, "inv-307", Decimal("100.00"),
+                                status="settling", created_at=old_enough, updated_at=old_enough,
+                                operator_session_id=560, station_id=10)
+    billing.set_bank_status("inv-307", "processing")
+    billing.set_operator_token(OPERATOR_A)
+
+    exit_code = await _run()
+
+    assert billing.reservations[307]["status"] == "settling"
+    assert exit_code == 1
+
+
 async def test_settling_not_yet_old_enough_is_left_alone(billing):
     fresh = NOW - timedelta(seconds=10)
     billing.add_uah_reservation(305, OPERATOR_A, "inv-305", Decimal("100.00"),
@@ -817,3 +989,38 @@ async def test_alerts_are_included_in_telegram_summary(billing, monkeypatch):
     assert len(sent) == 1
     assert "РУЧНОГО розбору" in sent[0]["text"]
     assert "inv-401" in sent[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# 10. Формулювання підсумку (_format_line) — правка 3
+# ---------------------------------------------------------------------------
+
+def test_format_line_stale_awaiting_hold_says_bank_never_held_money():
+    """
+    Знахідка живого смоуку 2026-07-30: "звільнено/розраховано" описувало б
+    дію, якої не було — банк тут НІКОЛИ не тримав гроші. Окреме чесне
+    формулювання, із сумою (рев'ю плану Opus).
+    """
+    line = reconcile._format_line({
+        "type": "stale_awaiting_hold", "reservation_id": 101,
+        "operator_id": OPERATOR_A, "reserved_uah": Decimal("100.00"),
+    })
+    assert "протух неоплаченим" in line
+    assert "банк коштів не утримував" in line
+    assert "100.00" in line
+    assert "звільнено/розраховано" not in line
+
+
+def test_format_line_other_types_unchanged():
+    """Регресія: решта типів (kwh і uah, де гроші/кВт·год дійсно рухались) форматуються як раніше."""
+    kwh_line = reconcile._format_line({
+        "type": "stale_pending", "reservation_id": 1, "operator_id": OPERATOR_A,
+        "user_id": 777, "reserved_kwh": Decimal("20.000"),
+    })
+    assert "звільнено/розраховано 20.000 кВт·год" in kwh_line
+
+    uah_line = reconcile._format_line({
+        "type": "stale_settling", "reservation_id": 301, "operator_id": OPERATOR_A,
+        "reserved_uah": Decimal("100.00"),
+    })
+    assert "звільнено/розраховано 100.00 грн" in uah_line

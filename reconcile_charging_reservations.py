@@ -17,12 +17,18 @@ uah-кроки (Промпт 3c-ii, докладно — docs/plan-3c-ii.md, р�
   1. 'awaiting_hold' застарілі за --awaiting-hold-minutes — інвойс
      створено, банк ще не підтвердив hold (або підтвердив, а вебхук про це
      не почув). СПЕРШУ перепитуємо банк (get_invoice_status) — ніколи не
-     довіряємо локальному статусу: якщо банк каже 'hold', RemoteStart із
-     ЦЬОГО процесу (окремого від живого uvicorn з /ocpp) НЕБЕЗПЕЧНИЙ (той
-     самий клас бага, що "3c-i незапускний на проді", докладно — «Інваріант
-     процесу» в docs/plan-3c-ii.md) — тому лише АЛЕРТ на ручний розбір,
-     рядок лишається недоторканим. Якщо банк каже щось інше — hold ніколи
-     не відбувся, безпечно позначаємо 'expired' локально.
+     довіряємо локальному статусу. ЧОТИРИ гілки за станом банку (уточнено
+     після живого смоуку 2026-07-30, факти (з) і рев'ю плану цього кроку):
+     'hold' — RemoteStart із ЦЬОГО процесу (окремого від живого uvicorn з
+     /ocpp) НЕБЕЗПЕЧНИЙ (той самий клас бага, що "3c-i незапускний на
+     проді", докладно — «Інваріант процесу» в docs/plan-3c-ii.md) — лише
+     АЛЕРТ, рядок недоторканий. 'success' — гроші вже списані повз наш
+     облік — теж лише АЛЕРТ (свій reason), рядок недоторканий. 'expired'/
+     'failure'/'reversed' — банк грошей не тримає, термінально — безпечно
+     позначаємо 'expired' локально. Будь-що інше ('created'/'processing'/
+     незнайоме) — РЕАЛЬНИЙ транзитний стан на шляху до 'hold' (не глухий
+     кут) — рядок НЕ ЧІПАТИ, повернемось наступного прогону (лічильник
+     ReconcileStats.awaiting_hold_transient, лише видимість у консолі).
   2. 'pending' застарілі — RemoteStart надіслано, StartTransaction не
      прийшов. СПЕРШУ перепитуємо банк: якщо ще 'hold' — атомарна ЛОКАЛЬНА
      заявка claim_reservation_for_settlement(expected_status='pending')
@@ -133,6 +139,11 @@ class ReconcileStats:
         self.races = 0      # release_reservation_hold() повернув False — паралельний StopTransaction устиг першим
         # Промпт 3c-ii: аномалії без безпечної автоматичної дії — лише алерт.
         self.alerts = []    # [{reservation_id, operator_id, invoice_id, reason}, ...]
+        # Знахідка живого смоуку 2026-07-30 (факт (з)): 'created'/'processing'
+        # — реальний ТРАНЗИТНИЙ стан на шляху до 'hold', не глухий кут. Рядок
+        # НЕ чіпаємо цього прогону — лічильник лише для видимості в консолі,
+        # не сигнал "зверни увагу" (на відміну від races/alerts).
+        self.awaiting_hold_transient = 0
 
 
 async def _get_operator_token(operator_id: int):
@@ -175,7 +186,19 @@ async def _expire_stale(rows, item_type: str, stats: ReconcileStats):
 # ---------------------------------------------------------------------------
 
 async def _reconcile_stale_awaiting_hold(older_than, stats: ReconcileStats):
-    """Крок 1: 'awaiting_hold' застарілі."""
+    """
+    Крок 1: 'awaiting_hold' застарілі.
+
+    ЧОТИРИ гілки за станом банку (виправлено після живого смоуку 2026-07-30
+    і знахідки читання коду того ж дня — раніше було дві, потім три, обидві
+    ревізії лишали дірку):
+      'hold'/'success'    → алерт, рядок НЕДОТОРКАНИЙ (ручний розбір).
+      'expired'/'failure'/'reversed' → термінально, банк грошей не тримає —
+                             безпечно позначаємо 'expired' локально.
+      будь-що інше (created/processing/незнайоме) → ТРАНЗИТНИЙ стан на
+                             шляху до 'hold' (живий факт (з), 2026-07-30) —
+                             рядок НЕ ЧІПАТИ, повернемось наступного прогону.
+    """
     rows = await repo.list_stale_awaiting_hold_reservations(older_than)
     for row in rows:
         stats.checked += 1
@@ -202,13 +225,44 @@ async def _reconcile_stale_awaiting_hold(older_than, stats: ReconcileStats):
             })
             continue
 
-        # Банк ніколи не тримав гроші (усе ще created/processing, або сам
-        # інвойс уже expired/failure) — безпечно позначаємо локально.
-        await repo.set_reservation_status(row["operator_id"], row["id"], "expired")
-        stats.released.append({
-            "type": "stale_awaiting_hold", "reservation_id": row["id"],
-            "operator_id": row["operator_id"], "reserved_uah": row["reserved_uah"],
-        })
+        if bank_status == "success":
+            # НАЙГУЧНІШИЙ сценарій цього кроку (знахідка рев'ю плану Opus):
+            # гроші вже СПИСАНІ — хтось зфіналізував цей інвойс повз наш
+            # локальний облік, поки рядок ще числився 'awaiting_hold'.
+            # Не можна ні мовчки пропустити (гроші реально рухались), ні
+            # звести до 'expired' (це приховало б сам факт списання) —
+            # лише гучний алерт, окремий reason від 'hold'.
+            stats.alerts.append({
+                "reservation_id": row["id"], "operator_id": row["operator_id"],
+                "invoice_id": row["invoice_id"],
+                "reason": "банк уже списав кошти (success), а рядок і досі 'awaiting_hold' — "
+                          "ручний розбір, можлива розбіжність обліку",
+            })
+            continue
+
+        if bank_status in ("expired", "failure", "reversed"):
+            # Термінально: банк грошей не тримає. 'reversed' додано після
+            # рев'ю плану Opus — це реальний фінал для 'awaiting_hold'-рядка
+            # (напр. банк підтвердив hold, наш вебхук/алерт це прогледів,
+            # і за 9 днів банк сам автоскасував hold) — без цієї гілки такий
+            # рядок випав би з видимості НАЗАВЖДИ (фільтр списку бере лише
+            # 'awaiting_hold', а транзитна гілка нижче пропускає мовчки
+            # щоразу знову).
+            await repo.set_reservation_status(row["operator_id"], row["id"], "expired")
+            stats.released.append({
+                "type": "stale_awaiting_hold", "reservation_id": row["id"],
+                "operator_id": row["operator_id"], "reserved_uah": row["reserved_uah"],
+            })
+            continue
+
+        # Транзитний стан (created/processing/незнайомий) — банк ще на
+        # шляху до hold, рядок НЕ ЧІПАТИ. Просте мовчання (без continue-
+        # логіки, це вже останній рядок у циклі), лише видимість у консолі.
+        logger.info(
+            "Звірка: резервація #%s (awaiting_hold) — банк ще '%s' (транзитний стан), "
+            "пропускаю до наступного прогону", row["id"], bank_status,
+        )
+        stats.awaiting_hold_transient += 1
 
 
 async def _reconcile_stale_pending_uah(older_than, stats: ReconcileStats):
@@ -412,11 +466,20 @@ async def _reconcile_stale_settling(cutoff, stats: ReconcileStats):
             await repo.record_uah_settlement(row["operator_id"], row["id"], "finalized", Decimal("0"))
         else:
             # Неочікуваний стан для рядка, що вже мав дійти до hold —
-            # гучний лог, не вигадуємо суму.
+            # гучний лог, не вигадуємо суму. Знахідка живого смоуку
+            # 2026-07-30: раніше це не потрапляло в stats.alerts, тож не
+            # було видно ні в Telegram-підсумку, ні в exit code — той самий
+            # клас невидимості, що вже задокументоване капування
+            # перевитрати (SESSION_STATE.md).
             logger.error(
                 "Звірка: резервація #%s (settling) — банк у неочікуваному стані '%s', "
                 "потрібен ручний розбір", row["id"], bank_status,
             )
+            stats.alerts.append({
+                "reservation_id": row["id"], "operator_id": row["operator_id"],
+                "invoice_id": row["invoice_id"],
+                "reason": f"звірка 'settling': банк у неочікуваному стані '{bank_status}' — ручний розбір",
+            })
             continue
 
         stats.released.append({
@@ -426,11 +489,19 @@ async def _reconcile_stale_settling(cutoff, stats: ReconcileStats):
 
 
 def _format_line(item: dict) -> str:
+    who = f", водій {item['user_id']}" if item.get("user_id") is not None else ""
+    if item["type"] == "stale_awaiting_hold":
+        # Окреме чесне формулювання (знахідка живого смоуку 2026-07-30):
+        # банк тут НІКОЛИ не тримав гроші — "звільнено/розраховано" нижче
+        # описувало б дію, якої не було.
+        return (f"   [{item['type']}] резервація #{item['reservation_id']} "
+                f"(оператор #{item['operator_id']}{who}) — "
+                f"інвойс на {item['reserved_uah']} грн протух неоплаченим, "
+                f"банк коштів не утримував")
     if item.get("reserved_uah") is not None:
         amount = f"{item['reserved_uah']} грн"
     else:
         amount = f"{item['reserved_kwh']} кВт·год"
-    who = f", водій {item['user_id']}" if item.get("user_id") is not None else ""
     return (f"   [{item['type']}] резервація #{item['reservation_id']} "
             f"(оператор #{item['operator_id']}{who}) — звільнено/розраховано {amount}")
 
@@ -451,6 +522,9 @@ def _print_summary(stats: ReconcileStats):
         print("✅ Застряглих резервацій не знайдено.")
     if stats.races:
         print(f"\nℹ️ {stats.races} — паралельний StopTransaction устиг першим (не проблема).")
+    if stats.awaiting_hold_transient:
+        print(f"\nℹ️ {stats.awaiting_hold_transient} — awaiting_hold ще в транзитному стані банку "
+              f"(created/processing), перевіримо наступного прогону.")
     if stats.alerts:
         print(f"\n⚠️ Потребують РУЧНОГО розбору: {len(stats.alerts)}")
         for item in stats.alerts:
