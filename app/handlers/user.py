@@ -29,6 +29,7 @@ from app.core.crypto import EncryptionKeyMissing, decrypt_secret
 from app.services.monobank_acquiring import MonobankError, create_invoice
 from app.services.ocm_service import find_three_nearest_stations
 from app.services.station_speed import classify_station_speed
+from app.services import tomtom_service
 
 # Публічний URL сервісу для посилання на оплату QR (та сама логіка, що й
 # app/api/driver_qr.py та app/handlers/operator_billing.py).
@@ -39,6 +40,13 @@ PUBLIC_BASE_URL = (
 # Радіус пошуку станцій White-Label операторів навколо водія (Промпт 4c).
 # OCM обмежений через свій API-параметр distance, тут — свій радіус.
 OPERATOR_SEARCH_RADIUS_KM = 30
+
+# TomTom — живий інфошар (не БД, не кеш — app/services/tomtom_service.py).
+# Невеликий ліміт свідомо: кожна показана станція може дати ще один
+# додатковий виклик за live-статусом, тож розмір видачі напряму впливає на
+# добову квоту TomTom.
+TOMTOM_SEARCH_RADIUS_KM = 15
+TOMTOM_SEARCH_LIMIT = 5
 
 # --- Купівля kWh-пакетів (buy-side гаманця) через Monobank-еквайринг ---
 #
@@ -155,17 +163,30 @@ async def manual_id_entry(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_station_id)
     await message.answer("Введіть ID зарядної станції (наприклад: `OCM-307584`):")
 
-def _merge_search_results(ocm_stations, operator_stations):
+def _merge_search_results(ocm_stations, operator_stations, tomtom_stations=None):
     """
-    Обʼєднує видачу OCM і White-Label операторських станцій (Промпт 4c) в
-    один список, відсортований за відстанню. Чиста функція — без Telegram і
-    без БД, щоб «змішана видача OCM+оператор» тестувалась без моків бота.
+    Обʼєднує видачу OCM, TomTom (живий інфошар) і White-Label операторських
+    станцій (Промпт 4c) в один список, відсортований за відстанню. Чиста
+    функція — без Telegram і без БД, щоб «змішана видача» тестувалась без
+    моків бота.
 
-    Кожен елемент: {"source": "ocm"|"operator", "distance_km": float, "station": <dict>}.
-    OCM без відстані (малоймовірно, але API цього формально не гарантує)
-    відсувається в кінець, а не ламає сортування.
+    Кожен елемент: {"source": "ocm"|"operator"|"tomtom", "distance_km": float, "station": <dict>}.
+    Станції без відстані відсуваються в кінець, а не ламають сортування.
+    Список для сортування будується в порядку пріоритету джерел (оператор —
+    шар дії, тоді TomTom, тоді OCM); сортування стабільне, тож при РІВНІЙ
+    відстані цей порядок зберігається — операторські станції лишаються
+    першими серед рівновіддалених.
     """
     items = []
+    for st in operator_stations or []:
+        items.append({"source": "operator", "distance_km": float(st["distance_km"]), "station": st})
+    for st in tomtom_stations or []:
+        distance = st.get("distance_km")
+        items.append({
+            "source": "tomtom",
+            "distance_km": float(distance) if distance is not None else float("inf"),
+            "station": st,
+        })
     for st in ocm_stations or []:
         distance = st.get("distance")
         items.append({
@@ -173,8 +194,6 @@ def _merge_search_results(ocm_stations, operator_stations):
             "distance_km": float(distance) if distance is not None else float("inf"),
             "station": st,
         })
-    for st in operator_stations or []:
-        items.append({"source": "operator", "distance_km": float(st["distance_km"]), "station": st})
     items.sort(key=lambda item: item["distance_km"])
     return items
 
@@ -223,14 +242,82 @@ def _format_ocm_station_card(idx: int, station: dict) -> str:
     )
 
 
+def _format_tomtom_status_line(availability) -> str | None:
+    """Короткий рядок «вільно X/Y» з нормалізованого get_availability(). None,
+    якщо статус не тягнули (квота/помилка/немає id) або конекторів 0."""
+    if not availability:
+        return None
+    total_available = sum(c.get("available", 0) for c in availability)
+    total = sum(
+        c.get("available", 0) + c.get("occupied", 0) + c.get("out_of_service", 0)
+        for c in availability
+    )
+    if total == 0:
+        return None
+    return f"🟢 Вільно зараз: <b>{total_available}/{total}</b>"
+
+
+def _format_tomtom_station_card(idx: int, station: dict) -> str:
+    """
+    Картка станції з живого інфошару TomTom — інформаційна (без QR/оплати
+    через бота, водій платить на місці). Обов'язковий видимий підпис
+    «© TomTom» — умова ліцензії на показ цих даних.
+    """
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    name = html.escape(station.get("name") or "Без назви")
+    address = html.escape(station.get("address") or "Адреса не вказана")
+    lines = [
+        f"{prefix}<b>Станція #{idx}: {name}</b>",
+        f"📍 {address}",
+    ]
+    distance = station.get("distance_km")
+    if distance is not None:
+        lines.append(f"📏 Відстань: <b>{distance:.2f} км</b>")
+    if station.get("power_kw"):
+        lines.append(f"⚙️ Потужність: {station['power_kw']} кВт")
+    if station.get("connector_type"):
+        lines.append(f"🔌 Конектор: {html.escape(station['connector_type'])}")
+    status_line = _format_tomtom_status_line(station.get("availability"))
+    if status_line:
+        lines.append(status_line)
+    lines.append("ℹ️ Інформаційна станція — оплата на місці, не через бот")
+    lines.append(f"<i>{tomtom_service.ATTRIBUTION_TEXT}</i>")
+    return "\n".join(lines)
+
+
+async def _attach_tomtom_status(stations):
+    """Дотягує live-статус ОДНИМ додатковим TomTom-викликом на станцію —
+    і лише для станцій із переданого списку (уже обмеженого лімітом
+    пошуку), а не для всіх колись знайдених TomTom-станцій."""
+    for station in stations:
+        availability_id = station.get("charging_availability_id")
+        if availability_id:
+            station["availability"] = await tomtom_service.get_availability(availability_id)
+    return stations
+
+
 @router.message(F.location, StateFilter("*"))
 async def handle_location(message: types.Message, state: FSMContext):
     await message.answer("🔍 **Шукаємо станції поруч...**")
     lat, lon = message.location.latitude, message.location.longitude
 
-    ocm_stations = await find_three_nearest_stations(lat, lon) or []
     operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
-    combined = _merge_search_results(ocm_stations, operator_stations)
+
+    # None від TomTom = шар недоступний ПРЯМО ЗАРАЗ (немає ключа / вичерпано
+    # добову квоту / мережева помилка) — і лише тоді фолбек на OCM. Порожній
+    # список — це успішна відповідь "станцій немає", фолбек не потрібен.
+    tomtom_raw = await tomtom_service.search_stations_near(
+        lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
+    )
+    if tomtom_raw is None:
+        ocm_stations = await find_three_nearest_stations(lat, lon) or []
+        tomtom_stations = []
+    else:
+        ocm_stations = []
+        tomtom_stations = await _attach_tomtom_status(tomtom_raw)
+
+    combined = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
 
     if not combined:
         await message.answer("❌ Станцій поблизу не знайдено.")
@@ -247,6 +334,11 @@ async def handle_location(message: types.Message, state: FSMContext):
         station = item["station"]
         if item["source"] == "operator":
             await message.answer(_format_operator_station_card(idx, station), parse_mode="HTML")
+        elif item["source"] == "tomtom":
+            await message.answer(
+                _format_tomtom_station_card(idx, station), parse_mode="HTML",
+                reply_markup=get_single_station_keyboard(station["lat"], station["lon"]),
+            )
         else:
             await message.answer(
                 _format_ocm_station_card(idx, station), parse_mode="Markdown",
