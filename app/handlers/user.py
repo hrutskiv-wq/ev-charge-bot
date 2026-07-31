@@ -16,7 +16,7 @@ from app.core.loader import bot, ai_client
 
 from app.keyboards.reply import (
     get_main_menu, get_charge_menu, get_tariffs_keyboard,
-    get_single_station_keyboard, get_connectors_keyboard
+    get_single_station_keyboard, get_search_results_keyboard, get_connectors_keyboard
 )
 
 import app.database.connection as db_conn
@@ -27,7 +27,7 @@ from app.database.connection import (
 from app.database import operators_repo as op_repo
 from app.core.crypto import EncryptionKeyMissing, decrypt_secret
 from app.services.monobank_acquiring import MonobankError, create_invoice
-from app.services.ocm_service import find_three_nearest_stations
+from app.services.ocm_service import find_three_nearest_stations, ATTRIBUTION_TEXT as OCM_ATTRIBUTION_TEXT
 from app.services.station_speed import classify_station_speed
 from app.services.geo import haversine_km
 from app.services import tomtom_service
@@ -46,22 +46,54 @@ OPERATOR_SEARCH_RADIUS_KM = 30
 # TOMTOM_SEARCH_LIMIT — розмір ОДНІЄЇ відповіді nearbySearch, не кількість
 # HTTP-викликів (той самий один запит незалежно від значення) — піднятий
 # до 10, щоб після дедупу з OCM (_dedupe_by_proximity нижче) лишалось із
-# чого вибирати топ-5. Реальний бюджет квоти TomTom обмежує МАКСИМАЛЬНА
-# кількість станцій, що йдуть у видачу (MAX_STATIONS_SHOWN) — саме стільки
-# додаткових викликів get_availability() робиться щонайбільше.
+# чого вибирати квоту (_select_by_quota). Реальний бюджет квоти TomTom
+# обмежує МАКСИМАЛЬНА кількість станцій, що йдуть у видачу
+# (MAX_STATIONS_TOTAL) — саме стільки додаткових викликів get_availability()
+# робиться щонайбільше.
 TOMTOM_SEARCH_RADIUS_KM = 15
 TOMTOM_SEARCH_LIMIT = 10
 
-# Після об'єднання OCM+TomTom+оператор і дедупу — не більше стількох
-# станцій у видачі водію (той самий ліміт, що раніше неявно давав OCM
-# maxresults=3 + невеликий TomTom-список). Live-статус TomTom (окремий
-# виклик на станцію) тягнеться ЛИШЕ для станцій у межах цього ліміту.
-MAX_STATIONS_SHOWN = 5
+# OCM жорстко обмежував пул трьома станціями (DEFAULT_MAXRESULTS у
+# ocm_service.py) — з трьох не набрати 4 DC у квоту нижче. Ширший пул
+# кандидатів, з якого вже відбирає _select_by_quota; сам параметр
+# продубльований у ключі кешу OCM (ocm_service.py::location_key_builder),
+# інакше різні maxresults для тих самих координат ділили б один кеш.
+OCM_SEARCH_MAXRESULTS = 10
 
 # Дві станції з РІЗНИХ джерел (OCM/TomTom/оператор) ближче цієї відстані
 # одна від одної вважаються однією фізичною зарядною станцією, що просто
 # потрапила в нашу видачу з кількох каталогів одразу.
 DEDUPE_DISTANCE_KM = 0.1
+
+# --- Квота видачі (живий смоук 31.07.2026) ---
+#
+# Сортування суто за відстанню (старий підхід — простий зріз [:N]) витісняло
+# швидкі DC-станції сусідніми повільними AC. _select_by_quota нижче відбирає
+# замість зрізу: оператор -> DC -> AC, кожен блок за відстанню в межах своєї
+# квоти. Діє в ОБОХ режимах рендеру (SEARCH_SINGLE_MESSAGE нижче) — це відбір
+# станцій, а не спосіб їх показу.
+MAX_OPERATOR_SHOWN = 2
+MAX_DC_SHOWN = 4
+MAX_STATIONS_TOTAL = 6
+
+# Поріг для _is_dc_station — той самий поріг, що FAST_POWER_THRESHOLD_KW у
+# app/services/station_speed.py, число продубльоване навмисно:
+# classify_station_speed вирішує ЩО ПОКАЗАТИ (бейдж картки), а
+# _is_dc_station — ЩО ВІДІБРАТИ в квоту; тримати їх незалежними один від
+# одного безпечніше, ніж імпортувати внутрішню константу чужого модуля,
+# бо зміна бейджа не повинна мовчки міняти відбір квоти, і навпаки.
+DC_POWER_THRESHOLD_KW = 50
+# Ті самі хінти, що FAST_CONNECTOR_HINTS у station_speed.py — свідомо саме
+# "GB/T DC" (той запис, що вже є в кодовій базі), щоб один і той самий
+# фізичний тип конектора не отримав дві різні текстові форми.
+DC_CONNECTOR_HINTS = ("CCS", "CHAdeMO", "GB/T DC")
+
+# ПРАВКА 7: прапорець рендеру видачі — той самий прецедент, що
+# TELEGRAM_PAYMENTS_ENABLED нижче. Будь-яке значення, крім "false" (без
+# урахування регістру, включно з незаданим env), — новий рендер (одне
+# HTML-повідомлення). "false" — старий рендер (окрема картка на станцію,
+# як зараз на проді) без деплою нового коду, лише зміна env — відкат-запобіжник.
+SEARCH_SINGLE_MESSAGE = os.getenv("SEARCH_SINGLE_MESSAGE", "true").strip().lower() != "false"
 
 # --- Купівля kWh-пакетів (buy-side гаманця) через Monobank-еквайринг ---
 #
@@ -294,6 +326,101 @@ def _dedupe_by_proximity(items):
     return kept
 
 
+def _is_dc_station(station: dict) -> bool:
+    """
+    Предикат ДЛЯ ВІДБОРУ квоти (_select_by_quota) — окремий від
+    classify_station_speed (app/services/station_speed.py), яка вирішує ЩО
+    ПОКАЗАТИ на картці (бейдж), а не що відібрати в квоту; та функція тут
+    НЕ чіпається.
+
+    DC, якщо виконано БУДЬ-ЩО з:
+    - у якогось конектора станції TomTom-специфічний `current_type == "DC"`
+      (station["connectors"] — список словників лише в нормалізації TomTom,
+      app/services/tomtom_service.py; для OCM/оператора це поле або рядок,
+      або взагалі відсутнє — isinstance-перевірка нижче тому обов'язкова,
+      інакше рядок OCM ітерувався б по символах);
+    - `power_kw` станції >= DC_POWER_THRESHOLD_KW;
+    - `connector_type` станції містить один із DC_CONNECTOR_HINTS.
+
+    Станція без жодних із цих даних — AC за замовчуванням (не вгадуємо).
+    """
+    connectors = station.get("connectors")
+    if isinstance(connectors, list):
+        for connector in connectors:
+            if isinstance(connector, dict) and connector.get("current_type") == "DC":
+                return True
+
+    power = station.get("power_kw")
+    if power is not None:
+        try:
+            if float(power) >= DC_POWER_THRESHOLD_KW:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    connector_type = station.get("connector_type")
+    if connector_type:
+        lowered = connector_type.lower()
+        if any(hint.lower() in lowered for hint in DC_CONNECTOR_HINTS):
+            return True
+
+    return False
+
+
+def _select_by_quota(items):
+    """
+    Відбір у видачу за квотою (живий смоук 31.07.2026) ЗАМІСТЬ зрізу [:N] за
+    відстанню — простий зріз витісняв швидкі DC-станції сусідніми
+    повільними AC. `items` — вихід `_dedupe_by_proximity` (уже
+    відсортований за `distance_km`), результат зберігає це впорядкування
+    В МЕЖАХ КОЖНОГО БЛОКУ.
+
+    1) операторські станції — завжди першими, максимум MAX_OPERATOR_SHOWN;
+    2) далі DC (_is_dc_station) за відстанню, доки не набереться MAX_DC_SHOWN
+       (обмежено рештою загальної квоти);
+    3) далі AC за відстанню, доки загалом не набереться MAX_STATIONS_TOTAL.
+
+    Якщо DC у пулі менше за MAX_DC_SHOWN — решту вільної квоти добирають AC;
+    якщо AC теж не вистачає заповнити те, що лишилось, — квоту добирають
+    DC понад MAX_DC_SHOWN. Мета — видача не повинна ставати біднішою, ніж
+    дозволяє реальний пул кандидатів, навіть коли один із типів рідкісний.
+
+    Порядок результату: [оператори] + [DC] + [AC] — НЕ пересортовується за
+    відстанню вкінці, інакше далека операторська станція могла б
+    "провалитись" за ближчі DC/AC, хоча має лишатись першою. НАСЛІДОК:
+    усередині DC-блоку й AC-блоку порядок за відстанню зберігається, але
+    МІЖ блоками — ні, тому DC-станція може стояти вище в списку за AC-
+    станцію, яка формально ближча до водія. Це свідомий вибір на користь
+    швидких станцій (сама причина цього бандла), а не побічний ефект.
+    """
+    operators = [it for it in items if it["source"] == "operator"][:MAX_OPERATOR_SHOWN]
+    dc = [it for it in items if it["source"] != "operator" and _is_dc_station(it["station"])]
+    ac = [it for it in items if it["source"] != "operator" and not _is_dc_station(it["station"])]
+
+    budget = MAX_STATIONS_TOTAL - len(operators)
+
+    dc_take = min(len(dc), MAX_DC_SHOWN, budget)
+    selected_dc = dc[:dc_take]
+    budget -= dc_take
+
+    ac_take = min(len(ac), budget)
+    selected_ac = ac[:ac_take]
+    budget -= ac_take
+
+    if budget > 0:
+        # AC не вистачило заповнити квоту -> добираємо DC понад MAX_DC_SHOWN.
+        extra_dc = dc[dc_take:dc_take + budget]
+        selected_dc += extra_dc
+        budget -= len(extra_dc)
+
+    if budget > 0:
+        # DC теж вичерпані (рідкісний випадок: обидва пули малі) -> лишок AC.
+        extra_ac = ac[ac_take:ac_take + budget]
+        selected_ac += extra_ac
+
+    return operators + selected_dc + selected_ac
+
+
 def _format_operator_station_card(idx: int, station: dict) -> str:
     """
     Картка станції оператора: бейдж, відстань, потужність/конектор, тариф і
@@ -385,8 +512,8 @@ def _format_tomtom_station_card(idx: int, station: dict) -> str:
 async def _attach_tomtom_status(shown_items):
     """Дотягує live-статус ОДНИМ додатковим TomTom-викликом на станцію — і
     лише для TomTom-станцій, що реально потрапили у ФІНАЛЬНУ видачу (після
-    злиття, дедупу й обмеження MAX_STATIONS_SHOWN), а не для всіх станцій,
-    які взагалі повернув nearbySearch."""
+    злиття, дедупу й відбору _select_by_quota, MAX_STATIONS_TOTAL станцій
+    щонайбільше), а не для всіх станцій, які взагалі повернув nearbySearch."""
     for item in shown_items:
         if item["source"] != "tomtom":
             continue
@@ -394,6 +521,177 @@ async def _attach_tomtom_status(shown_items):
         if availability_id:
             item["station"]["availability"] = await tomtom_service.get_availability(availability_id)
     return shown_items
+
+
+# ---------------------------------------------------------------------------
+# ОДНЕ повідомлення замість N карток (SEARCH_SINGLE_MESSAGE, дефолт-режим).
+# Старі _format_*_station_card / _format_tomtom_status_line вище лишаються
+# НЕДОТОРКАНИМИ — вони обслуговують старий рендер за SEARCH_SINGLE_MESSAGE
+# =false, прапорець-відкат без деплою.
+# ---------------------------------------------------------------------------
+
+MAX_FIELD_LEN = 60  # запобіжник ліміту Telegram 4096 символів на все повідомлення
+
+
+def _truncate(text, max_len: int = MAX_FIELD_LEN) -> str:
+    """Обрізає СИРИЙ текст (до html.escape) — щоб обрізання не розкраяло
+    HTML-сутність на кшталт "&amp;" навпіл."""
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _format_operator_result_entry(idx: int, station: dict) -> str:
+    """Один запис пронумерованої видачі — операторська станція. Оплата —
+    кнопкою "⚡ Оплатити" в get_search_results_keyboard, не текстом-URL
+    (як було в старому _format_operator_station_card)."""
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    name = html.escape(_truncate(station["name"]))
+
+    lines = [f"{idx}. {prefix}<b>{name}</b>"]
+
+    meta = []
+    if station.get("address"):
+        meta.append(f"📍 {html.escape(_truncate(station['address']))}")
+    meta.append(f"📏 {station['distance_km']:.2f} км")
+    lines.append(" · ".join(meta))
+
+    details = []
+    if station.get("power_kw"):
+        details.append(f"⚙️ {station['power_kw']} кВт")
+    if station.get("connector_type"):
+        details.append(f"🔌 {html.escape(station['connector_type'])}")
+    details.append(f"💰 {station['tariff_uah_kwh']} грн/кВт·год")
+    lines.append(" · ".join(details))
+
+    return "\n".join(lines)
+
+
+def _format_tomtom_result_entry(idx: int, station: dict) -> str:
+    """Один запис пронумерованої видачі — станція TomTom (інформаційна,
+    без кнопки оплати — водій платить на місці, у клавіатурі лише карти)."""
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    name = html.escape(_truncate(station.get("name") or "Без назви"))
+
+    lines = [f"{idx}. {prefix}<b>{name}</b>"]
+
+    meta = []
+    if station.get("address"):
+        meta.append(f"📍 {html.escape(_truncate(station['address']))}")
+    distance = station.get("distance_km")
+    if distance is not None:
+        meta.append(f"📏 {distance:.2f} км")
+    if meta:
+        lines.append(" · ".join(meta))
+
+    details = []
+    if station.get("power_kw"):
+        details.append(f"⚙️ {station['power_kw']} кВт")
+    if station.get("connector_type"):
+        details.append(f"🔌 {html.escape(station['connector_type'])}")
+    status_line = _format_tomtom_status_line(station.get("availability"))
+    if status_line:
+        # Компактна форма для однорядкового блоку деталей запису; повний
+        # варіант "🟢 Вільно зараз: X/Y" лишається у старому per-card рендері.
+        details.append(status_line.replace("Вільно зараз: ", ""))
+    if details:
+        lines.append(" · ".join(details))
+
+    return "\n".join(lines)
+
+
+def _format_ocm_result_entry(idx: int, station: dict) -> str:
+    """Один запис пронумерованої видачі — станція OCM. Рядок з ID лишається
+    — флоу "надішліть ID" (waiting_for_station_id) не чіпається цим бандлом."""
+    badge = classify_station_speed(station.get("power_kw"), station.get("connector_type"))
+    prefix = f"{badge} " if badge else ""
+    name = html.escape(_truncate(station.get("name")))
+
+    lines = [f"{idx}. {prefix}<b>{name}</b>"]
+
+    meta = []
+    if station.get("address"):
+        meta.append(f"📍 {html.escape(_truncate(station['address']))}")
+    meta.append(f"📏 {station['distance']:.2f} км")
+    lines.append(" · ".join(meta))
+
+    if station.get("connectors"):
+        lines.append(f"🔌 {html.escape(_truncate(station['connectors'], 80))}")
+
+    lines.append(f"👉 ID: <code>{html.escape(station['id'])}</code>")
+    return "\n".join(lines)
+
+
+def _format_search_result_entry(idx: int, item: dict) -> str:
+    source = item["source"]
+    if source == "operator":
+        return _format_operator_result_entry(idx, item["station"])
+    if source == "tomtom":
+        return _format_tomtom_result_entry(idx, item["station"])
+    return _format_ocm_result_entry(idx, item["station"])
+
+
+def _build_attribution_footer(combined) -> str | None:
+    """
+    ОДИН підвал наприкінці повідомлення — умова ліцензій TomTom і Open
+    Charge Map, не косметика. Перелічує ЛИШЕ джерела, реально присутні в
+    ЦІЙ видачі: операторська видача власна (жодної зовнішньої ліцензії),
+    тому їй підпис не потрібен.
+    """
+    sources_present = {item["source"] for item in combined}
+    parts = []
+    if "tomtom" in sources_present:
+        parts.append(tomtom_service.ATTRIBUTION_TEXT)
+    if "ocm" in sources_present:
+        parts.append(OCM_ATTRIBUTION_TEXT)
+    if not parts:
+        return None
+    return "<i>Джерела даних: " + " · ".join(parts) + "</i>"
+
+
+def _format_search_results_message(combined) -> str:
+    """
+    ОДНЕ HTML-повідомлення замість N окремих карток — раніше цикл
+    message.answer() на кожну станцію означав до MAX_STATIONS_TOTAL окремих
+    повідомлень на один пошук, задовго гортати в чаті. Перший рядок —
+    той самий лічильник "🎯 Знайдено N станцій поруч:", що був окремим
+    повідомленням у старому рендері (SEARCH_SINGLE_MESSAGE=false), тепер
+    перший рядок ЦЬОГО повідомлення. Далі пронумеровані записи по 3-4
+    рядки (`_format_search_result_entry`), один спільний підвал з
+    атрибуцією наприкінці.
+    """
+    header = f"🎯 **Знайдено {len(combined)} станцій поруч:**"
+    entries = "\n\n".join(
+        _format_search_result_entry(idx, item) for idx, item in enumerate(combined, 1)
+    )
+    footer = _build_attribution_footer(combined)
+    parts = [header, entries]
+    if footer:
+        parts.append(footer)
+    return "\n\n".join(parts)
+
+
+def _build_keyboard_items(combined):
+    """Готує вхід для get_search_results_keyboard (app/keyboards/reply.py) —
+    координати через _station_coords (уже враховує lng-ключ операторських
+    станцій) і, для операторських, URL оплати. Станцію без розпізнаних
+    координат пропускаємо — без них немає що покласти в кнопки карт."""
+    items = []
+    for idx, item in enumerate(combined, 1):
+        coords = _station_coords(item["station"])
+        if coords is None:
+            continue
+        lat, lon = coords
+        pay_url = None
+        if item["source"] == "operator":
+            pay_url = f"{PUBLIC_BASE_URL}/s/{item['station']['qr_slug']}"
+        items.append({"idx": idx, "lat": lat, "lon": lon, "pay_url": pay_url})
+    return items
 
 
 @router.message(F.location, StateFilter("*"))
@@ -404,19 +702,22 @@ async def handle_location(message: types.Message, state: FSMContext):
     # Джерела ОБ'ЄДНУЮТЬСЯ, а не заміщують одне одного (рев'ю живого смоуку
     # 31.07.2026: коли TomTom відповідав успішно, OCM не запитувався
     # взагалі — швидкі DC-станції, знані лише OCM, зникали з видачі). OCM
-    # тепер запитується завжди; TomTom, що технічно недоступний (None —
-    # немає ключа/вичерпана квота/помилка), просто дає порожній шар без
-    # окремого фолбеку — дублікатів об'єднання не створює, дедуп нижче все
+    # тепер запитується завжди, з ширшим пулом (OCM_SEARCH_MAXRESULTS), щоб
+    # квоті нижче було з чого відбирати; TomTom, що технічно недоступний
+    # (None — немає ключа/вичерпана квота/помилка), просто дає порожній шар
+    # без окремого фолбеку — дублікатів об'єднання не створює, дедуп все
     # одно прибирає збіги.
     operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
-    ocm_stations = await find_three_nearest_stations(lat, lon) or []
+    ocm_stations = await find_three_nearest_stations(lat, lon, maxresults=OCM_SEARCH_MAXRESULTS) or []
     tomtom_stations = await tomtom_service.search_stations_near(
         lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
     ) or []
 
     merged = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
     deduped = _dedupe_by_proximity(merged)
-    combined = deduped[:MAX_STATIONS_SHOWN]
+    # Квота (оператор -> DC -> AC) діє в ОБОХ режимах рендеру нижче — це
+    # відбір станцій, а не спосіб їх показу (SEARCH_SINGLE_MESSAGE).
+    combined = _select_by_quota(deduped)
 
     if not combined:
         await message.answer("❌ Станцій поблизу не знайдено.")
@@ -429,6 +730,15 @@ async def handle_location(message: types.Message, state: FSMContext):
     if any(item["source"] == "ocm" for item in combined):
         await state.set_state(BotStates.waiting_for_station_id)
 
+    if SEARCH_SINGLE_MESSAGE:
+        text = _format_search_results_message(combined)
+        keyboard = get_search_results_keyboard(_build_keyboard_items(combined))
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    # SEARCH_SINGLE_MESSAGE=false — старий рендер, окрема картка на
+    # станцію (прапорець-відкат без деплою, ПРАВКА 7). Формати карток і
+    # get_single_station_keyboard НЕ чіпались цим бандлом.
     await message.answer(f"🎯 **Знайдено {len(combined)} станцій поруч:**")
 
     for idx, item in enumerate(combined, 1):

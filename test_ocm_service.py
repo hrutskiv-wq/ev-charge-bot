@@ -131,3 +131,32 @@ async def test_error_result_is_not_cached_for_five_minutes():
     # а не реальний результат другого (успішного) виклику.
     assert second_result is not None
     assert len(second_result) == 1
+
+
+async def test_cache_key_distinguishes_maxresults():
+    """
+    Регресія (бандл feature/search-results-single-message, ПРАВКА 3):
+    location_key_builder МУСИТЬ включати maxresults у ключ кешу — інакше
+    виклик з maxresults=10 (ширший пул для квоти DC/AC у водійському
+    пошуку) міг би віддати кешовану відповідь виклику з дефолтним
+    maxresults=3 для тих самих координат, і навпаки.
+    """
+    poi_small = {**SAMPLE_POI, "ID": 111}
+    poi_large = {**SAMPLE_POI, "ID": 222}
+
+    lat, lon = 50.888, 30.888
+
+    small_client = _make_mock_client(json_data=[poi_small])
+    with patch("app.services.ocm_service.httpx.AsyncClient", return_value=small_client), \
+         patch("app.services.ocm_service.save_station_to_local_db", new=AsyncMock()):
+        result_small = await find_three_nearest_stations(lat, lon, maxresults=3)
+
+    large_client = _make_mock_client(json_data=[poi_small, poi_large])
+    with patch("app.services.ocm_service.httpx.AsyncClient", return_value=large_client), \
+         patch("app.services.ocm_service.save_station_to_local_db", new=AsyncMock()):
+        result_large = await find_three_nearest_stations(lat, lon, maxresults=10)
+
+    # Якби ключ кешу НЕ враховував maxresults — другий виклик повернув би
+    # кешовану відповідь ПЕРШОГО (1 станція), а не власну (2 станції).
+    assert len(result_small) == 1
+    assert len(result_large) == 2

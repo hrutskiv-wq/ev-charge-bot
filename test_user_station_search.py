@@ -339,6 +339,261 @@ def test_dedupe_does_not_compare_stations_from_the_same_source():
 
 
 # ---------------------------------------------------------------------------
+# _is_dc_station (бандл feature/search-results-single-message, ПРАВКА 1) —
+# окремий предикат для ВІДБОРУ квоти, не для бейджа картки —
+# classify_station_speed лишається недоторканою.
+# ---------------------------------------------------------------------------
+
+def test_is_dc_station_true_for_tomtom_current_type_dc():
+    station = {
+        "power_kw": None, "connector_type": None,
+        "connectors": [{"connector_type": "Type 2", "power_kw": None, "current_type": "DC"}],
+    }
+    assert user_handlers._is_dc_station(station) is True
+
+
+def test_is_dc_station_true_for_high_power():
+    station = {"power_kw": 50, "connector_type": None, "connectors": None}
+    assert user_handlers._is_dc_station(station) is True
+
+
+def test_is_dc_station_false_for_power_just_below_threshold():
+    station = {"power_kw": 49.9, "connector_type": None, "connectors": None}
+    assert user_handlers._is_dc_station(station) is False
+
+
+def test_is_dc_station_true_for_connector_hint():
+    for hint_text in ("CCS (Type 2)", "CHAdeMO", "GB/T DC"):
+        station = {"power_kw": None, "connector_type": hint_text, "connectors": None}
+        assert user_handlers._is_dc_station(station) is True, hint_text
+
+
+def test_is_dc_station_false_without_any_signal():
+    """Станція без потужності, конектора чи TomTom-конекторів — AC за
+    замовчуванням, не вгадуємо "швидка"."""
+    station = {"power_kw": None, "connector_type": "Type 2", "connectors": None}
+    assert user_handlers._is_dc_station(station) is False
+
+
+def test_is_dc_station_ignores_non_list_connectors_field():
+    """OCM-станції несуть 'connectors' як РЯДОК ("CCS (240 кВт) x2"), не
+    список словників, як TomTom — без isinstance-перевірки рядок
+    ітерувався б по символах, і .get() на символі впав би AttributeError."""
+    station = {"power_kw": None, "connector_type": None, "connectors": "CCS (240 кВт) x2"}
+    assert user_handlers._is_dc_station(station) is False
+
+
+# ---------------------------------------------------------------------------
+# _select_by_quota (ПРАВКА 2) — відбір оператор -> DC -> AC замість зрізу
+# [:N] за відстанню.
+# ---------------------------------------------------------------------------
+
+def _quota_item(source, distance_km, is_dc):
+    """Мінімальний елемент _merge_search_results для тестів квоти — is_dc
+    виражається напряму через power_kw (>=50 -> DC), щоб не змішувати
+    перевірку квоти з перевіркою самого _is_dc_station (та вже перевірена
+    окремо вище своїми тестами)."""
+    power_kw = 100 if is_dc else 10
+    return {
+        "source": source, "distance_km": distance_km,
+        "station": {"power_kw": power_kw, "connector_type": None, "connectors": None},
+    }
+
+
+def test_select_by_quota_6dc_6ac_picks_4dc_2ac():
+    items = (
+        [_quota_item("ocm", i, True) for i in range(1, 7)]      # 6 DC
+        + [_quota_item("ocm", i, False) for i in range(7, 13)]  # 6 AC
+    )
+    result = user_handlers._select_by_quota(items)
+
+    dc_count = sum(1 for it in result if user_handlers._is_dc_station(it["station"]))
+    assert dc_count == 4
+    assert len(result) - dc_count == 2
+    assert len(result) == 6
+
+
+def test_select_by_quota_backfills_ac_when_dc_scarce():
+    items = (
+        [_quota_item("ocm", 1, True), _quota_item("ocm", 2, True)]  # лише 2 DC
+        + [_quota_item("ocm", i, False) for i in range(3, 9)]       # 6 AC
+    )
+    result = user_handlers._select_by_quota(items)
+
+    dc_count = sum(1 for it in result if user_handlers._is_dc_station(it["station"]))
+    assert dc_count == 2
+    assert len(result) - dc_count == 4
+    assert len(result) == 6
+
+
+def test_select_by_quota_ac_only_fills_all_six():
+    items = [_quota_item("ocm", i, False) for i in range(1, 8)]  # 7 AC, 0 DC
+    result = user_handlers._select_by_quota(items)
+
+    assert len(result) == 6
+    assert all(not user_handlers._is_dc_station(it["station"]) for it in result)
+
+
+def test_select_by_quota_backfills_dc_when_ac_scarce():
+    """Симетричний випадок ("і навпаки" зі специфікації правки): AC не
+    вистачає заповнити квоту -> решту добирають DC понад MAX_DC_SHOWN."""
+    items = (
+        [_quota_item("ocm", i, True) for i in range(1, 8)]  # 7 DC
+        + [_quota_item("ocm", 8, False)]                     # лише 1 AC
+    )
+    result = user_handlers._select_by_quota(items)
+
+    dc_count = sum(1 for it in result if user_handlers._is_dc_station(it["station"]))
+    assert len(result) == 6
+    assert len(result) - dc_count == 1
+    assert dc_count == 5
+
+
+def test_select_by_quota_operator_first_capped_at_two():
+    items = (
+        [_quota_item("operator", i, True) for i in range(1, 4)]  # 3 оператори в пулі
+        + [_quota_item("ocm", i, True) for i in range(4, 10)]
+    )
+    result = user_handlers._select_by_quota(items)
+
+    operators = [it for it in result if it["source"] == "operator"]
+    assert len(operators) == 2
+    assert [it["source"] for it in result[:2]] == ["operator", "operator"]
+
+
+def test_select_by_quota_ceiling_is_six_total():
+    items = (
+        [_quota_item("operator", 0.1, True), _quota_item("operator", 0.2, True)]
+        + [_quota_item("ocm", i, True) for i in range(1, 10)]
+        + [_quota_item("tomtom", i, False) for i in range(10, 20)]
+    )
+    result = user_handlers._select_by_quota(items)
+
+    assert len(result) == user_handlers.MAX_STATIONS_TOTAL
+
+
+# ---------------------------------------------------------------------------
+# ОДНЕ повідомлення видачі — _format_search_results_message (ПРАВКА 4)
+# ---------------------------------------------------------------------------
+
+def test_format_search_results_message_includes_results_count_header():
+    """Рев'ю: лічильник, що раніше був окремим повідомленням ("🎯 Знайдено
+    N станцій поруч:"), тепер перший рядок цього ЖЕ повідомлення."""
+    combined = user_handlers._merge_search_results(
+        [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}], [], [],
+    )
+    text = user_handlers._format_search_results_message(combined)
+
+    assert text.startswith("🎯 **Знайдено 1 станцій поруч:**")
+
+
+def test_format_search_results_message_numbers_entries_and_keeps_ocm_id():
+    combined = user_handlers._merge_search_results(
+        [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}], [], [],
+    )
+    text = user_handlers._format_search_results_message(combined)
+
+    assert "1. " in text
+    assert "OCM-999" in text  # флоу "надішліть ID" не чіпається цим бандлом
+
+
+def test_format_search_results_message_escapes_html_in_operator_name():
+    malicious = {
+        **OPERATOR_STATION, "name": "Готель <script>x</script>",
+        "lat": _BASE_LAT, "lng": _BASE_LON, "distance_km": 1.0,
+    }
+    combined = [{"source": "operator", "distance_km": 1.0, "station": malicious}]
+
+    text = user_handlers._format_search_results_message(combined)
+
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+
+
+def test_attribution_footer_present_when_tomtom_in_results():
+    combined = [{"source": "tomtom", "distance_km": 1.0, "station": TOMTOM_STATION}]
+    text = user_handlers._format_search_results_message(combined)
+    assert "© TomTom" in text
+
+
+def test_attribution_footer_present_when_ocm_in_results():
+    combined = user_handlers._merge_search_results([OCM_STATION], [], [])
+    text = user_handlers._format_search_results_message(combined)
+    assert user_handlers.OCM_ATTRIBUTION_TEXT in text
+
+
+def test_attribution_footer_absent_for_operator_only_results():
+    """Операторська видача — власна, без зовнішньої ліцензії, тому підпис
+    не потрібен узагалі (ні TomTom, ні OCM)."""
+    operator = {**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON}
+    combined = user_handlers._merge_search_results([], [operator], [])
+    text = user_handlers._format_search_results_message(combined)
+    assert "© TomTom" not in text
+    assert user_handlers.OCM_ATTRIBUTION_TEXT not in text
+
+
+def test_truncate_shortens_long_text_with_ellipsis():
+    result = user_handlers._truncate("А" * 100, max_len=10)
+    assert len(result) == 10
+    assert result.endswith("…")
+
+
+def test_truncate_keeps_short_text_unchanged():
+    assert user_handlers._truncate("Готель Едем", max_len=60) == "Готель Едем"
+
+
+def test_build_keyboard_items_sets_pay_url_for_operator_only():
+    combined = [
+        {"source": "operator", "distance_km": 0.5,
+         "station": {**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON}},
+        {"source": "tomtom", "distance_km": 1.0,
+         "station": {**TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON}},
+    ]
+    items = user_handlers._build_keyboard_items(combined)
+
+    assert items[0]["pay_url"] == f"{user_handlers.PUBLIC_BASE_URL}/s/abc123"
+    assert items[1]["pay_url"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_search_results_keyboard (app/keyboards/reply.py, ПРАВКА 5)
+# ---------------------------------------------------------------------------
+
+from app.keyboards.reply import get_search_results_keyboard  # noqa: E402
+
+
+def test_search_results_keyboard_has_one_row_per_station_with_own_coords():
+    items = [
+        {"idx": 1, "lat": 49.80, "lon": 23.90, "pay_url": None},
+        {"idx": 2, "lat": 49.81, "lon": 23.91, "pay_url": None},
+    ]
+    markup = get_search_results_keyboard(items)
+
+    assert len(markup.inline_keyboard) == 2
+    row1, row2 = markup.inline_keyboard
+    assert "q=49.8,23.9" in row1[0].url
+    assert "ll=49.8,23.9" in row1[1].url
+    assert "q=49.81,23.91" in row2[0].url
+    assert "ll=49.81,23.91" in row2[1].url
+
+
+def test_search_results_keyboard_operator_row_has_pay_button():
+    items = [{"idx": 1, "lat": 49.80, "lon": 23.90, "pay_url": "https://evolt.ua/s/abc123"}]
+    markup = get_search_results_keyboard(items)
+
+    row = markup.inline_keyboard[0]
+    assert len(row) == 3
+    assert row[2].url == "https://evolt.ua/s/abc123"
+    assert "Оплатити" in row[2].text
+
+
+def test_search_results_keyboard_non_operator_row_has_two_buttons_only():
+    items = [{"idx": 1, "lat": 49.80, "lon": 23.90, "pay_url": None}]
+    markup = get_search_results_keyboard(items)
+    assert len(markup.inline_keyboard[0]) == 2
+
+
+# ---------------------------------------------------------------------------
 # handle_location — злиття OCM+TomTom+оператор, дедуп, ліміт (без Telegram/
 # БД, лише мокнуті сервіси; той самий підхід прямого виклику хендлера, що в
 # test_ocpp_admin_handlers.py)
@@ -443,11 +698,19 @@ async def test_handle_location_dedupes_near_duplicate_across_sources(monkeypatch
 
     await user_handlers.handle_location(message, state)
 
-    sent_texts = [text for text, _ in message.sent]
-    assert sent_texts[1] == "🎯 **Знайдено 1 станцій поруч:**"
+    # sent[0] — "Шукаємо...", sent[1] — ОДНЕ повідомлення з видачею
+    # (SEARCH_SINGLE_MESSAGE, дефолт): дублікат схлопнувся в один запис.
+    text = message.sent[1][0]
+    assert "1. " in text
+    assert "2. " not in text
 
 
-async def test_handle_location_limits_shown_stations_to_five(monkeypatch):
+async def test_handle_location_quota_caps_total_at_six(monkeypatch):
+    """Стеля видачі — MAX_STATIONS_TOTAL=6 через _select_by_quota, не
+    простий зріз за відстанню. Усі 7 кандидатів тут DC (успадковують
+    power_kw>=50 з шаблонів OCM_STATION/TOMTOM_STATION) — перевіряє саме
+    стелю; сам розподіл DC/AC перевірений окремо юніт-тестами
+    _select_by_quota вище."""
     async def fake_ocm(*a, **kw):
         return [_far_station(OCM_STATION, "ocm", i, i) for i in range(1, 4)]  # 1,2,3 км
 
@@ -470,15 +733,16 @@ async def test_handle_location_limits_shown_stations_to_five(monkeypatch):
 
     await user_handlers.handle_location(message, state)
 
-    sent_texts = [text for text, _ in message.sent]
-    assert sent_texts[1] == "🎯 **Знайдено 5 станцій поруч:**"
+    text = message.sent[1][0]
+    assert "6. " in text
+    assert "7. " not in text
 
 
 async def test_handle_location_fetches_availability_only_for_shown_tomtom_stations(monkeypatch):
-    """TOMTOM_SEARCH_LIMIT=10 навмисно ширший за MAX_STATIONS_SHOWN=5, щоб
-    після злиття/дедупу було з чого обирати — але live-статус має тягнутись
-    ЛИШЕ для станцій, що реально потрапили у фінальну видачу, не для всіх
-    10 сирих результатів nearbySearch."""
+    """TOMTOM_SEARCH_LIMIT=10 навмисно ширший за MAX_STATIONS_TOTAL=6, щоб
+    після злиття/дедупу/квоти було з чого обирати — але live-статус має
+    тягнутись ЛИШЕ для станцій, що реально потрапили у фінальну видачу, не
+    для всіх 7 сирих результатів nearbySearch."""
     async def fake_ocm(*a, **kw):
         return []
 
@@ -504,7 +768,7 @@ async def test_handle_location_fetches_availability_only_for_shown_tomtom_statio
 
     await user_handlers.handle_location(message, state)
 
-    assert len(availability_calls) == user_handlers.MAX_STATIONS_SHOWN
+    assert len(availability_calls) == user_handlers.MAX_STATIONS_TOTAL
 
 
 async def test_handle_location_operator_stations_appear_first_when_closest(monkeypatch):
@@ -528,7 +792,78 @@ async def test_handle_location_operator_stations_appear_first_when_closest(monke
 
     await user_handlers.handle_location(message, state)
 
+    # sent[1] — ОДНЕ повідомлення з видачею; text.split("\n\n")[0] — рядок-
+    # лічильник "🎯 Знайдено N...", [1] — перший запис. Він має бути
+    # операторським, незалежно від того, що TomTom формально ближчий за
+    # _select_by_quota — операторський блок завжди перший.
+    text = message.sent[1][0]
+    first_entry = text.split("\n\n")[1]
+    assert "Готель Едем" in first_entry
+
+
+# ---------------------------------------------------------------------------
+# ПРАВКА 7 — SEARCH_SINGLE_MESSAGE (прапорець-відкат без деплою)
+# ---------------------------------------------------------------------------
+
+async def test_handle_location_sends_exactly_one_results_message_by_default(monkeypatch):
+    """Регресія на саму мету бандла: видача станцій — РІВНО одне
+    повідомлення (плюс "Шукаємо..."), не окрема картка на кожну."""
+    async def fake_ocm(*a, **kw):
+        return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
+
+    async def fake_tomtom_search(*a, **kw):
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT + 1.0, "lon": _BASE_LON, "distance_km": 5.0}]
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return [{**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON + 1.0, "distance_km": 0.3}]
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    assert len(message.sent) == 2  # "🔍 Шукаємо..." + одне повідомлення з видачею
+
+
+async def test_handle_location_falls_back_to_per_station_messages_when_flag_disabled(monkeypatch):
+    """ПРАВКА 7: SEARCH_SINGLE_MESSAGE=false — старий рендер (окрема
+    картка на станцію), прапорець-відкат без деплою нового коду. Квота
+    (тут 2 станції) лишається тою самою — різниться лише спосіб показу."""
+    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", False)
+
+    async def fake_ocm(*a, **kw):
+        return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
+
+    async def fake_tomtom_search(*a, **kw):
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT + 1.0, "lon": _BASE_LON, "distance_km": 5.0}]
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return []
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    # "Шукаємо..." + "Знайдено 2 станцій..." + картка OCM + картка TomTom.
+    assert len(message.sent) == 4
     sent_texts = [text for text, _ in message.sent]
-    # Друге повідомлення (після "Шукаємо..."/"Знайдено N") — перша картка станції.
-    first_card = sent_texts[2]
-    assert "Готель Едем" in first_card
+    assert sent_texts[1] == "🎯 **Знайдено 2 станцій поруч:**"
+    assert any("Зубра HyperCharger" in text for text in sent_texts)
+    assert any("© TomTom" in text for text in sent_texts)

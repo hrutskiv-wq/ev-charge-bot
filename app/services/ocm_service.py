@@ -7,10 +7,26 @@ from app.database.connection import save_station_to_local_db
 
 OCM_KEY = os.getenv("OCM_KEY")
 
-def location_key_builder(func, user_lat, user_lon, *args, **kwargs):
+# Що OCM реально дає, якщо викликач взагалі не задав maxresults — зберігає
+# поведінку до бандла feature/search-results-single-message.
+DEFAULT_MAXRESULTS = 3
+
+ATTRIBUTION_TEXT = "© Open Charge Map"
+
+
+def location_key_builder(func, user_lat, user_lon, maxresults=DEFAULT_MAXRESULTS, *args, **kwargs):
+    """
+    maxresults МУСИТЬ входити в ключ кешу (бандл feature/search-results-
+    single-message: handle_location тепер запитує ширший пул — maxresults=10
+    — щоб було з чого відбирати 4 DC-станції в квоту). Без цього виклик з
+    maxresults=10 міг би віддати кешовану відповідь виклику з дефолтним
+    maxresults=3 для тих самих координат (чи навпаки) — координати
+    заокруглюються до 3 знаків і лишаються тим самим ключем незалежно від
+    того, скільки станцій реально запитувалось.
+    """
     rounded_lat = round(user_lat, 3)
     rounded_lon = round(user_lon, 3)
-    return f"{func.__module__}:{func.__name__}:{rounded_lat}:{rounded_lon}"
+    return f"{func.__module__}:{func.__name__}:{rounded_lat}:{rounded_lon}:{maxresults}"
 
 @cached(
     ttl=300,
@@ -22,16 +38,16 @@ def location_key_builder(func, user_lat, user_lon, *args, **kwargs):
     # відновлювалось за секунди. Кешуємо лише реальні (успішні) результати.
     skip_cache_func=lambda result: result is None,
 )
-async def find_three_nearest_stations(user_lat, user_lon):
+async def find_three_nearest_stations(user_lat, user_lon, maxresults=DEFAULT_MAXRESULTS):
     url = "https://api.openchargemap.io/v3/poi/"
-    
+
     params = {
         "output": "json",
         "latitude": user_lat,
         "longitude": user_lon,
         "distance": 50,
         "distanceunit": "KM",
-        "maxresults": 3
+        "maxresults": maxresults
     }
     
     headers = {
