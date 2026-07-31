@@ -50,7 +50,16 @@ OPERATOR_SEARCH_RADIUS_KM = 30
 # обмежує МАКСИМАЛЬНА кількість станцій, що йдуть у видачу
 # (MAX_STATIONS_TOTAL) — саме стільки додаткових викликів get_availability()
 # робиться щонайбільше.
+#
+# Адаптивний радіус (живий смоук 31.07.2026 за містом): TomTom на 15 км
+# бачив 0 станцій, тоді як OCM на своїх 50 км бачив дві за 42-47 км — за
+# межею основного радіуса TomTom водій лишався ЗОВСІМ без живого шару.
+# handle_location повторює запит із TOMTOM_FALLBACK_RADIUS_KM, але ЛИШЕ
+# коли перший запит повернув [] (порожньо, шар технічно доступний) — на
+# None (шар недоступний: немає ключа/вичерпана квота/помилка) повтору
+# немає, бо він лише подвоїть відмову й спалить квоту.
 TOMTOM_SEARCH_RADIUS_KM = 15
+TOMTOM_FALLBACK_RADIUS_KM = 30
 TOMTOM_SEARCH_LIMIT = 10
 
 # OCM жорстко обмежував пул трьома станціями (DEFAULT_MAXRESULTS у
@@ -88,12 +97,14 @@ DC_POWER_THRESHOLD_KW = 50
 # фізичний тип конектора не отримав дві різні текстові форми.
 DC_CONNECTOR_HINTS = ("CCS", "CHAdeMO", "GB/T DC")
 
-# ПРАВКА 7: прапорець рендеру видачі — той самий прецедент, що
-# TELEGRAM_PAYMENTS_ENABLED нижче. Будь-яке значення, крім "false" (без
-# урахування регістру, включно з незаданим env), — новий рендер (одне
-# HTML-повідомлення). "false" — старий рендер (окрема картка на станцію,
-# як зараз на проді) без деплою нового коду, лише зміна env — відкат-запобіжник.
-SEARCH_SINGLE_MESSAGE = os.getenv("SEARCH_SINGLE_MESSAGE", "true").strip().lower() != "false"
+# Прапорець рендеру видачі — той самий прецедент, що TELEGRAM_PAYMENTS_ENABLED
+# нижче. Дефолт ЗМІНЕНО на FALSE (рішення власника 31.07.2026, живий смоук
+# за містом): окремі картки на станцію лишаються основним рендером;
+# одноповідомленнєвий вмикається явно значенням "true" (без урахування
+# регістру), незадана/будь-яка інша змінна — старий рендер. Якщо до
+# 07.08.2026 одноповідомленнєвий режим не знадобиться — видалити його
+# рендер разом із прапорцем (див. docs/SESSION_STATE.md, беклог).
+SEARCH_SINGLE_MESSAGE = os.getenv("SEARCH_SINGLE_MESSAGE", "false").strip().lower() == "true"
 
 # --- Купівля kWh-пакетів (buy-side гаманця) через Monobank-еквайринг ---
 #
@@ -694,6 +705,29 @@ def _build_keyboard_items(combined):
     return items
 
 
+async def _search_tomtom_stations(lat, lon):
+    """
+    TomTom-пошук з адаптивним радіусом (живий смоук 31.07.2026 за містом):
+    TOMTOM_SEARCH_RADIUS_KM=15 не бачив ЖОДНОЇ станції там, де OCM (радіус
+    50 км) бачив дві за 42-47 км — водій лишався зовсім без живого шару.
+
+    Повторний запит із TOMTOM_FALLBACK_RADIUS_KM — ЛИШЕ коли перший
+    повернув `[]` (порожньо, шар технічно доступний, просто нічого не
+    знайшов у вузькому радіусі). На `None` (шар недоступний: немає ключа /
+    вичерпана добова квота / мережева помилка) повтору НЕМАЄ — другий
+    виклик на недоступному шарі лише подвоїть ту саму відмову й даремно
+    спалить добову квоту TomTom.
+    """
+    stations = await tomtom_service.search_stations_near(
+        lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
+    )
+    if stations == []:
+        stations = await tomtom_service.search_stations_near(
+            lat, lon, TOMTOM_FALLBACK_RADIUS_KM, TOMTOM_SEARCH_LIMIT
+        )
+    return stations or []
+
+
 @router.message(F.location, StateFilter("*"))
 async def handle_location(message: types.Message, state: FSMContext):
     await message.answer("🔍 **Шукаємо станції поруч...**")
@@ -709,9 +743,7 @@ async def handle_location(message: types.Message, state: FSMContext):
     # одно прибирає збіги.
     operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
     ocm_stations = await find_three_nearest_stations(lat, lon, maxresults=OCM_SEARCH_MAXRESULTS) or []
-    tomtom_stations = await tomtom_service.search_stations_near(
-        lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
-    ) or []
+    tomtom_stations = await _search_tomtom_stations(lat, lon)
 
     merged = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
     deduped = _dedupe_by_proximity(merged)
