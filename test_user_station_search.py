@@ -676,6 +676,11 @@ async def test_handle_location_queries_ocm_even_when_tomtom_returns_results(monk
 
 
 async def test_handle_location_dedupes_near_duplicate_across_sources(monkeypatch):
+    """Дедуп перевіряється через ВМІСТ повідомлення — вмикаємо
+    SEARCH_SINGLE_MESSAGE явно, бо дефолт (окремі картки, бандл
+    feature/adaptive-radius-and-cards) не дає одного тексту для перевірки."""
+    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", True)
+
     async def fake_ocm(*a, **kw):
         return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
 
@@ -710,7 +715,10 @@ async def test_handle_location_quota_caps_total_at_six(monkeypatch):
     простий зріз за відстанню. Усі 7 кандидатів тут DC (успадковують
     power_kw>=50 з шаблонів OCM_STATION/TOMTOM_STATION) — перевіряє саме
     стелю; сам розподіл DC/AC перевірений окремо юніт-тестами
-    _select_by_quota вище."""
+    _select_by_quota вище. SEARCH_SINGLE_MESSAGE увімкнено явно — вміст
+    перевіряється в ОДНОМУ повідомленні, дефолт тепер окремі картки."""
+    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", True)
+
     async def fake_ocm(*a, **kw):
         return [_far_station(OCM_STATION, "ocm", i, i) for i in range(1, 4)]  # 1,2,3 км
 
@@ -773,7 +781,11 @@ async def test_handle_location_fetches_availability_only_for_shown_tomtom_statio
 
 async def test_handle_location_operator_stations_appear_first_when_closest(monkeypatch):
     """Регресія: операторський шар дії лишається у видачі й коректно
-    сортується разом із TomTom-джерелом."""
+    сортується разом із TomTom-джерелом. SEARCH_SINGLE_MESSAGE увімкнено
+    явно — порядок перевіряється всередині ОДНОГО тексту, дефолт тепер
+    окремі картки."""
+    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", True)
+
     async def fake_ocm(*a, **kw):
         return []
 
@@ -805,40 +817,12 @@ async def test_handle_location_operator_stations_appear_first_when_closest(monke
 # ПРАВКА 7 — SEARCH_SINGLE_MESSAGE (прапорець-відкат без деплою)
 # ---------------------------------------------------------------------------
 
-async def test_handle_location_sends_exactly_one_results_message_by_default(monkeypatch):
-    """Регресія на саму мету бандла: видача станцій — РІВНО одне
-    повідомлення (плюс "Шукаємо..."), не окрема картка на кожну."""
-    async def fake_ocm(*a, **kw):
-        return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
-
-    async def fake_tomtom_search(*a, **kw):
-        return [{**TOMTOM_STATION, "lat": _BASE_LAT + 1.0, "lon": _BASE_LON, "distance_km": 5.0}]
-
-    async def fake_get_availability(availability_id):
-        return None
-
-    async def fake_operator_stations(*a, **kw):
-        return [{**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON + 1.0, "distance_km": 0.3}]
-
-    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
-    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
-    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
-    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
-
-    message = _FakeMessage(_BASE_LAT, _BASE_LON)
-    state = _FakeState()
-
-    await user_handlers.handle_location(message, state)
-
-    assert len(message.sent) == 2  # "🔍 Шукаємо..." + одне повідомлення з видачею
-
-
-async def test_handle_location_falls_back_to_per_station_messages_when_flag_disabled(monkeypatch):
-    """ПРАВКА 7: SEARCH_SINGLE_MESSAGE=false — старий рендер (окрема
-    картка на станцію), прапорець-відкат без деплою нового коду. Квота
-    (тут 2 станції) лишається тою самою — різниться лише спосіб показу."""
-    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", False)
-
+async def test_handle_location_sends_n_separate_messages_by_default(monkeypatch):
+    """Бандл feature/adaptive-radius-and-cards: дефолт ЗМІНЕНО на окремі
+    картки (рішення власника 31.07.2026) — без змінної SEARCH_SINGLE_MESSAGE
+    в оточенні (як у цьому тестовому середовищі) видача йде старим
+    рендером. Прапорець НЕ монкіпатчиться навмисно — перевіряє реальний
+    дефолт, обчислений при імпорті модуля, а не підмінене значення."""
     async def fake_ocm(*a, **kw):
         return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
 
@@ -867,3 +851,88 @@ async def test_handle_location_falls_back_to_per_station_messages_when_flag_disa
     assert sent_texts[1] == "🎯 **Знайдено 2 станцій поруч:**"
     assert any("Зубра HyperCharger" in text for text in sent_texts)
     assert any("© TomTom" in text for text in sent_texts)
+
+
+async def test_handle_location_sends_exactly_one_message_when_flag_enabled(monkeypatch):
+    """SEARCH_SINGLE_MESSAGE=true (явно ввімкнено) — одноповідомленнєвий
+    рендер лишається доступним за прапорцем (не видалений цим бандлом)."""
+    monkeypatch.setattr(user_handlers, "SEARCH_SINGLE_MESSAGE", True)
+
+    async def fake_ocm(*a, **kw):
+        return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
+
+    async def fake_tomtom_search(*a, **kw):
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT + 1.0, "lon": _BASE_LON, "distance_km": 5.0}]
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return [{**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON + 1.0, "distance_km": 0.3}]
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    assert len(message.sent) == 2  # "🔍 Шукаємо..." + одне повідомлення з видачею
+
+
+# ---------------------------------------------------------------------------
+# Адаптивний радіус TomTom (_search_tomtom_stations, живий смоук 31.07.2026
+# за містом)
+# ---------------------------------------------------------------------------
+
+async def test_search_tomtom_stations_retries_with_fallback_radius_on_empty(monkeypatch):
+    calls = []
+
+    async def fake_search(lat, lon, radius_km, limit):
+        calls.append(radius_km)
+        if radius_km == user_handlers.TOMTOM_SEARCH_RADIUS_KM:
+            return []
+        return [dict(TOMTOM_STATION)]
+
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_search)
+
+    result = await user_handlers._search_tomtom_stations(_BASE_LAT, _BASE_LON)
+
+    assert calls == [user_handlers.TOMTOM_SEARCH_RADIUS_KM, user_handlers.TOMTOM_FALLBACK_RADIUS_KM]
+    assert len(result) == 1
+
+
+async def test_search_tomtom_stations_no_retry_when_first_call_non_empty(monkeypatch):
+    calls = []
+
+    async def fake_search(lat, lon, radius_km, limit):
+        calls.append(radius_km)
+        return [dict(TOMTOM_STATION)]
+
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_search)
+
+    result = await user_handlers._search_tomtom_stations(_BASE_LAT, _BASE_LON)
+
+    assert calls == [user_handlers.TOMTOM_SEARCH_RADIUS_KM]
+    assert len(result) == 1
+
+
+async def test_search_tomtom_stations_no_retry_on_none(monkeypatch):
+    """None = шар недоступний (немає ключа/вичерпана квота/помилка) —
+    повтору НЕМАЄ, інакше другий виклик лише подвоїть відмову й спалить
+    добову квоту TomTom."""
+    calls = []
+
+    async def fake_search(lat, lon, radius_km, limit):
+        calls.append(radius_km)
+        return None
+
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_search)
+
+    result = await user_handlers._search_tomtom_stations(_BASE_LAT, _BASE_LON)
+
+    assert calls == [user_handlers.TOMTOM_SEARCH_RADIUS_KM]
+    assert result == []
