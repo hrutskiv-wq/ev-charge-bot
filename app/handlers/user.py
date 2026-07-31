@@ -304,18 +304,20 @@ async def handle_location(message: types.Message, state: FSMContext):
 
     operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
 
-    # None від TomTom = шар недоступний ПРЯМО ЗАРАЗ (немає ключа / вичерпано
-    # добову квоту / мережева помилка) — і лише тоді фолбек на OCM. Порожній
-    # список — це успішна відповідь "станцій немає", фолбек не потрібен.
     tomtom_raw = await tomtom_service.search_stations_near(
         lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
     )
-    if tomtom_raw is None:
-        ocm_stations = await find_three_nearest_stations(lat, lon) or []
-        tomtom_stations = []
-    else:
+    # Фолбек на OCM і при None (шар недоступний: немає ключа / вичерпано
+    # квоту / помилка), і при [] (запит успішний, але порожній) — покриття
+    # TomTom поза Львовом (де перевірявся ключ) не виміряне, тож порожня
+    # відповідь не гарантує "станцій справді немає". Дублікатів це не
+    # створює: tomtom_stations тоді теж порожній.
+    if tomtom_raw:
         ocm_stations = []
         tomtom_stations = await _attach_tomtom_status(tomtom_raw)
+    else:
+        ocm_stations = await find_three_nearest_stations(lat, lon) or []
+        tomtom_stations = []
 
     combined = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
 

@@ -26,6 +26,12 @@ TOMTOM_CATEGORY_EV_CHARGING = 7309
 # Тверда стеля акаунта TomTom — 2500 запитів/добу. Бюджет свідомо нижчий за
 # стелю: баг у циклі (напр. availability без ліміту на кожну знайдену
 # станцію) мусить упертися в запобіжник задовго до реальної стелі рахунку.
+#
+# УВАГА, реальна арифметика (рев'ю Opus 31.07.2026): один handle_location()
+# — це 1 виклик search_stations_near() + до TOMTOM_SEARCH_LIMIT викликів
+# get_availability() (app/handlers/user.py, по одному на кожну показану
+# станцію, TOMTOM_SEARCH_LIMIT=5 станом на зараз) = до 6 звернень за один
+# пошук водія. Тобто бюджет 2000 — це ~330 пошуків водіїв на добу, НЕ 2000.
 TOMTOM_DAILY_BUDGET = 2000
 
 ATTRIBUTION_TEXT = "© TomTom"
@@ -94,19 +100,33 @@ def _normalize_search_result(result):
     if lat is None or lon is None:
         return None
 
-    charging_park = poi.get("chargingPark") or {}
+    # chargingPark — поле ВЕРХНЬОГО рівня result, НЕ всередині poi (форма
+    # звірена з живою відповіддю TomTom 31.07.2026: poi.chargingPark завжди
+    # порожній; result.chargingPark.connectors несе реальні дані конекторів).
+    charging_park = result.get("chargingPark") or {}
     connectors = []
     best_power_kw = None
     best_connector_type = None
+    best_is_dc = False
     for c in charging_park.get("connectors") or []:
         label = _connector_label(c.get("connectorType"))
         power = c.get("ratedPowerKW")
-        connectors.append({"connector_type": label, "power_kw": power})
+        # currentType (AC1/AC3/DC) — прямий сигнал TomTom, надійніший за
+        # вгадування зі списку хінтів у classify_station_speed; використовуємо
+        # його лише для вибору, ЯКИЙ конектор представляє станцію, коли
+        # потужність невідома. Сама classify_station_speed не чіпається —
+        # потужність лишається головним критерієм там.
+        current_type = c.get("currentType")
+        is_dc = current_type == "DC"
+        connectors.append({"connector_type": label, "power_kw": power, "current_type": current_type})
+
         if power and (best_power_kw is None or power > best_power_kw):
             best_power_kw = power
             best_connector_type = label
-        elif best_connector_type is None:
+            best_is_dc = is_dc
+        elif best_power_kw is None and (best_connector_type is None or (is_dc and not best_is_dc)):
             best_connector_type = label
+            best_is_dc = is_dc
 
     dist_m = result.get("dist")
     distance_km = (dist_m / 1000) if dist_m is not None else None
@@ -153,11 +173,18 @@ async def search_stations_near(lat, lon, radius_km=15, limit=5):
 
     Повертає:
     - `None`, якщо шар недоступний ПРЯМО ЗАРАЗ (немає ключа, вичерпано
-      добову квоту, мережева помилка чи не-200 від TomTom) — саме тоді і
-      лише тоді виклик має фолбечитись на OCM;
-    - `[]`, якщо запит успішний, але станцій у радіусі не знайдено — це не
-      помилка, фолбек на OCM тут НЕ потрібен;
+      добову квоту, мережева помилка чи не-200 від TomTom);
+    - `[]`, якщо запит успішний, але станцій у радіусі не знайдено — технічно
+      НЕ помилка, але покриття TomTom поза Львовом (де перевірявся ключ) не
+      виміряне, тому виклик (`app/handlers/user.py::handle_location`)
+      свідомо фолбечиться на OCM і в цьому випадку теж — щоб порожня
+      відповідь TomTom не показувала водієві "нічого немає" там, де OCM щось
+      таки має;
     - непорожній список нормалізованих станцій інакше.
+
+    Розрізнення `None`/`[]` лишається для логування й дотримання добової
+    квоти (лише `None` рахується як "шар недоступний" у логах-попередженнях
+    вище), навіть якщо виклик на практиці фолбечить на OCM в обох випадках.
     """
     if not is_enabled():
         return None
@@ -223,7 +250,9 @@ async def get_availability(charging_availability_id):
         return None
 
     url = "https://api.tomtom.com/search/2/chargingAvailability.json"
-    params = {"key": TOMTOM_API_KEY, "chargingAvailabilityId": charging_availability_id}
+    # Параметр зветься "chargingAvailability", НЕ "chargingAvailabilityId" —
+    # перевірено живим запитом 31.07.2026 (з "Id" TomTom відповідає 400).
+    params = {"key": TOMTOM_API_KEY, "chargingAvailability": charging_availability_id}
 
     try:
         async with httpx.AsyncClient() as client:
