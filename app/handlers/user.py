@@ -29,6 +29,7 @@ from app.core.crypto import EncryptionKeyMissing, decrypt_secret
 from app.services.monobank_acquiring import MonobankError, create_invoice
 from app.services.ocm_service import find_three_nearest_stations
 from app.services.station_speed import classify_station_speed
+from app.services.geo import haversine_km
 from app.services import tomtom_service
 
 # Публічний URL сервісу для посилання на оплату QR (та сама логіка, що й
@@ -42,11 +43,25 @@ PUBLIC_BASE_URL = (
 OPERATOR_SEARCH_RADIUS_KM = 30
 
 # TomTom — живий інфошар (не БД, не кеш — app/services/tomtom_service.py).
-# Невеликий ліміт свідомо: кожна показана станція може дати ще один
-# додатковий виклик за live-статусом, тож розмір видачі напряму впливає на
-# добову квоту TomTom.
+# TOMTOM_SEARCH_LIMIT — розмір ОДНІЄЇ відповіді nearbySearch, не кількість
+# HTTP-викликів (той самий один запит незалежно від значення) — піднятий
+# до 10, щоб після дедупу з OCM (_dedupe_by_proximity нижче) лишалось із
+# чого вибирати топ-5. Реальний бюджет квоти TomTom обмежує МАКСИМАЛЬНА
+# кількість станцій, що йдуть у видачу (MAX_STATIONS_SHOWN) — саме стільки
+# додаткових викликів get_availability() робиться щонайбільше.
 TOMTOM_SEARCH_RADIUS_KM = 15
-TOMTOM_SEARCH_LIMIT = 5
+TOMTOM_SEARCH_LIMIT = 10
+
+# Після об'єднання OCM+TomTom+оператор і дедупу — не більше стількох
+# станцій у видачі водію (той самий ліміт, що раніше неявно давав OCM
+# maxresults=3 + невеликий TomTom-список). Live-статус TomTom (окремий
+# виклик на станцію) тягнеться ЛИШЕ для станцій у межах цього ліміту.
+MAX_STATIONS_SHOWN = 5
+
+# Дві станції з РІЗНИХ джерел (OCM/TomTom/оператор) ближче цієї відстані
+# одна від одної вважаються однією фізичною зарядною станцією, що просто
+# потрапила в нашу видачу з кількох каталогів одразу.
+DEDUPE_DISTANCE_KM = 0.1
 
 # --- Купівля kWh-пакетів (buy-side гаманця) через Monobank-еквайринг ---
 #
@@ -198,6 +213,87 @@ def _merge_search_results(ocm_stations, operator_stations, tomtom_stations=None)
     return items
 
 
+def _station_coords(station: dict):
+    """(lat, lon) станції незалежно від джерела. Операторські станції
+    (app/database/operators_repo.py::list_public_stations_near) несуть
+    довготу під ключем `lng` (як колонка в БД), OCM і TomTom — під `lon`;
+    без цієї різниці дедуп ніколи не бачив би координат операторської
+    станції й правило «оператор перемагає завжди» не спрацьовувало б саме
+    для дублів із операторським джерелом."""
+    lat = station.get("lat")
+    lon = station.get("lon")
+    if lon is None:
+        lon = station.get("lng")
+    if lat is None or lon is None:
+        return None
+    return float(lat), float(lon)
+
+
+def _metadata_score(station: dict) -> int:
+    """Скільки корисних технічних метаданих має станція — критерій вибору
+    переможця дедупу між OCM і TomTom (операторська перемагає обидві
+    завжди, незалежно від цього)."""
+    score = 0
+    if station.get("power_kw"):
+        score += 1
+    if station.get("connector_type"):
+        score += 1
+    return score
+
+
+def _dedupe_winner(a: dict, b: dict) -> dict:
+    """Хто з двох дублікатів (елементів _merge_search_results, РІЗНІ
+    джерела) лишається у видачі: (1) операторська станція — завжди, це шар
+    дії з оплатою через бот; (2) інакше — та, у якої БІЛЬШЕ метаданих
+    (потужність/тип конектора); (3) при рівності — TomTom, бо може нести
+    live-статус доступності конектора, якого в OCM немає взагалі."""
+    if a["source"] == "operator":
+        return a
+    if b["source"] == "operator":
+        return b
+    score_a = _metadata_score(a["station"])
+    score_b = _metadata_score(b["station"])
+    if score_a != score_b:
+        return a if score_a > score_b else b
+    return a if a["source"] == "tomtom" else b
+
+
+def _dedupe_by_proximity(items):
+    """
+    Прибирає дублікати ОДНІЄЇ фізичної станції, що прийшла з КІЛЬКОХ джерел
+    одразу (типово: та сама заправка є і в OCM, і в TomTom). Чиста функція
+    — без Telegram і без БД.
+
+    `items` — вихід `_merge_search_results` (уже відсортований за
+    `distance_km`). Дві станції РІЗНИХ джерел ближче `DEDUPE_DISTANCE_KM`
+    одна від одної вважаються однією фізичною станцією — лишається одна,
+    за правилом `_dedupe_winner`. Станції ОДНОГО джерела між собою не
+    звіряються (не мета цієї функції — власні дублі кожне джерело або не
+    дає взагалі, або це вже його власний баг).
+    """
+    kept = []
+    for item in items:
+        coords = _station_coords(item["station"])
+        duplicate_idx = None
+        if coords is not None:
+            for idx, existing in enumerate(kept):
+                if existing["source"] == item["source"]:
+                    continue
+                existing_coords = _station_coords(existing["station"])
+                if existing_coords is None:
+                    continue
+                if haversine_km(*coords, *existing_coords) < DEDUPE_DISTANCE_KM:
+                    duplicate_idx = idx
+                    break
+
+        if duplicate_idx is None:
+            kept.append(item)
+        elif _dedupe_winner(kept[duplicate_idx], item) is item:
+            kept[duplicate_idx] = item
+
+    return kept
+
+
 def _format_operator_station_card(idx: int, station: dict) -> str:
     """
     Картка станції оператора: бейдж, відстань, потужність/конектор, тариф і
@@ -286,15 +382,18 @@ def _format_tomtom_station_card(idx: int, station: dict) -> str:
     return "\n".join(lines)
 
 
-async def _attach_tomtom_status(stations):
-    """Дотягує live-статус ОДНИМ додатковим TomTom-викликом на станцію —
-    і лише для станцій із переданого списку (уже обмеженого лімітом
-    пошуку), а не для всіх колись знайдених TomTom-станцій."""
-    for station in stations:
-        availability_id = station.get("charging_availability_id")
+async def _attach_tomtom_status(shown_items):
+    """Дотягує live-статус ОДНИМ додатковим TomTom-викликом на станцію — і
+    лише для TomTom-станцій, що реально потрапили у ФІНАЛЬНУ видачу (після
+    злиття, дедупу й обмеження MAX_STATIONS_SHOWN), а не для всіх станцій,
+    які взагалі повернув nearbySearch."""
+    for item in shown_items:
+        if item["source"] != "tomtom":
+            continue
+        availability_id = item["station"].get("charging_availability_id")
         if availability_id:
-            station["availability"] = await tomtom_service.get_availability(availability_id)
-    return stations
+            item["station"]["availability"] = await tomtom_service.get_availability(availability_id)
+    return shown_items
 
 
 @router.message(F.location, StateFilter("*"))
@@ -302,28 +401,28 @@ async def handle_location(message: types.Message, state: FSMContext):
     await message.answer("🔍 **Шукаємо станції поруч...**")
     lat, lon = message.location.latitude, message.location.longitude
 
+    # Джерела ОБ'ЄДНУЮТЬСЯ, а не заміщують одне одного (рев'ю живого смоуку
+    # 31.07.2026: коли TomTom відповідав успішно, OCM не запитувався
+    # взагалі — швидкі DC-станції, знані лише OCM, зникали з видачі). OCM
+    # тепер запитується завжди; TomTom, що технічно недоступний (None —
+    # немає ключа/вичерпана квота/помилка), просто дає порожній шар без
+    # окремого фолбеку — дублікатів об'єднання не створює, дедуп нижче все
+    # одно прибирає збіги.
     operator_stations = await op_repo.list_public_stations_near(lat, lon, OPERATOR_SEARCH_RADIUS_KM)
-
-    tomtom_raw = await tomtom_service.search_stations_near(
+    ocm_stations = await find_three_nearest_stations(lat, lon) or []
+    tomtom_stations = await tomtom_service.search_stations_near(
         lat, lon, TOMTOM_SEARCH_RADIUS_KM, TOMTOM_SEARCH_LIMIT
-    )
-    # Фолбек на OCM і при None (шар недоступний: немає ключа / вичерпано
-    # квоту / помилка), і при [] (запит успішний, але порожній) — покриття
-    # TomTom поза Львовом (де перевірявся ключ) не виміряне, тож порожня
-    # відповідь не гарантує "станцій справді немає". Дублікатів це не
-    # створює: tomtom_stations тоді теж порожній.
-    if tomtom_raw:
-        ocm_stations = []
-        tomtom_stations = await _attach_tomtom_status(tomtom_raw)
-    else:
-        ocm_stations = await find_three_nearest_stations(lat, lon) or []
-        tomtom_stations = []
+    ) or []
 
-    combined = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
+    merged = _merge_search_results(ocm_stations, operator_stations, tomtom_stations)
+    deduped = _dedupe_by_proximity(merged)
+    combined = deduped[:MAX_STATIONS_SHOWN]
 
     if not combined:
         await message.answer("❌ Станцій поблизу не знайдено.")
         return
+
+    await _attach_tomtom_status(combined)
 
     # Ручний запуск за ID (наступний крок FSM) працює лише для OCM-станцій —
     # операторську станцію водій оплачує через QR/посилання, а не введенням ID.

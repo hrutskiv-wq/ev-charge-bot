@@ -34,6 +34,15 @@ from app.database.operators_repo import init_operator_tables
 
 logging.basicConfig(level=logging.INFO)
 
+# httpx на рівні INFO логує повний URL кожного запиту, включно з query-
+# параметрами. TomTom (app/services/tomtom_service.py) приймає ключ саме
+# в query (?key=...) — без цього він лежав би відкритим текстом у логах
+# контейнера при кожному пошуку станцій (живий смоук 31.07.2026 підтвердив
+# витік). OCM/Monobank/OCPI передають свої секрети в заголовках (X-API-Key/
+# X-Token/Authorization), яких httpx на INFO не друкує, — їх це не
+# стосується, приглушення потрібне саме й лише для TomTom.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

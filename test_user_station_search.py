@@ -234,8 +234,113 @@ def test_merge_sorts_all_three_sources_by_distance():
 
 
 # ---------------------------------------------------------------------------
-# handle_location — маршрутизація TomTom/OCM (без Telegram/БД, лише мокнуті
-# сервіси; той самий підхід прямого виклику хендлера, що в
+# _dedupe_by_proximity / _dedupe_winner (фікс-бандл після живого смоуку
+# 31.07.2026: TomTom і OCM обидва індексують публічні станції — та сама
+# фізична точка на карті могла прийти двічі, коли джерела почали
+# об'єднуватись, а не заміщувати одне одного)
+# ---------------------------------------------------------------------------
+
+_BASE_LAT, _BASE_LON = 49.8000, 23.9000
+_NEAR_OFFSET_DEG = 0.0005   # ~55 м (широта) — усередині DEDUPE_DISTANCE_KM
+_FAR_OFFSET_DEG = 0.003     # ~334 м — за межею DEDUPE_DISTANCE_KM
+
+
+def test_dedupe_collapses_near_duplicate_from_different_sources():
+    ocm = {**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}
+    tomtom = {**TOMTOM_STATION, "lat": _BASE_LAT + _NEAR_OFFSET_DEG, "lon": _BASE_LON, "distance_km": 1.0}
+
+    merged = user_handlers._merge_search_results([ocm], [], [tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 1
+
+
+def test_dedupe_keeps_both_stations_beyond_100m():
+    ocm = {**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}
+    tomtom = {**TOMTOM_STATION, "lat": _BASE_LAT + _FAR_OFFSET_DEG, "lon": _BASE_LON, "distance_km": 1.0}
+
+    merged = user_handlers._merge_search_results([ocm], [], [tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 2
+
+
+def test_dedupe_winner_operator_beats_both_ocm_and_tomtom():
+    operator = {**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON, "distance_km": 1.0}
+    ocm = {**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}
+    tomtom = {**TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance_km": 1.0}
+
+    merged = user_handlers._merge_search_results([ocm], [operator], [tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 1
+    assert result[0]["source"] == "operator"
+
+
+def test_dedupe_winner_recognizes_operator_lng_key():
+    """Регресія: операторська станція з БД несе довготу під ключем `lng`
+    (app/database/operators_repo.py), а не `lon`, як OCM/TomTom. Без цього
+    _station_coords() ніколи не бачить координат оператора — дедуп мовчки
+    пропускає операторський дублікат замість того, щоб лишити саме його."""
+    operator = {**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON, "distance_km": 1.0}
+    tomtom = {**TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance_km": 1.0}
+
+    merged = user_handlers._merge_search_results([], [operator], [tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 1
+    assert result[0]["source"] == "operator"
+
+
+def test_dedupe_winner_prefers_station_with_more_metadata():
+    """Між OCM і TomTom (без операторської) перемагає та, у якої БІЛЬШЕ
+    метаданих (потужність/тип конектора) — навіть якщо це не TomTom."""
+    metadata_rich_ocm = {
+        **OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0,
+        "power_kw": 240, "connector_type": "CCS (Type 2)",
+    }
+    metadata_poor_tomtom = {
+        **TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance_km": 1.0,
+        "power_kw": None, "connector_type": None,
+    }
+
+    merged = user_handlers._merge_search_results([metadata_rich_ocm], [], [metadata_poor_tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 1
+    assert result[0]["source"] == "ocm"
+
+
+def test_dedupe_winner_prefers_tomtom_on_equal_metadata():
+    ocm = {
+        **OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0,
+        "power_kw": 150, "connector_type": "CCS (Type 2)",
+    }
+    tomtom = {
+        **TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance_km": 1.0,
+        "power_kw": 150, "connector_type": "CCS (Type 2)",
+    }
+
+    merged = user_handlers._merge_search_results([ocm], [], [tomtom])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 1
+    assert result[0]["source"] == "tomtom"
+
+
+def test_dedupe_does_not_compare_stations_from_the_same_source():
+    ocm_a = {**OCM_STATION, "id": "OCM-1", "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}
+    ocm_b = {**OCM_STATION, "id": "OCM-2", "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.1}
+
+    merged = user_handlers._merge_search_results([ocm_a, ocm_b], [], [])
+    result = user_handlers._dedupe_by_proximity(merged)
+
+    assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# handle_location — злиття OCM+TomTom+оператор, дедуп, ліміт (без Telegram/
+# БД, лише мокнуті сервіси; той самий підхід прямого виклику хендлера, що в
 # test_ocpp_admin_handlers.py)
 # ---------------------------------------------------------------------------
 
@@ -266,15 +371,119 @@ class _FakeState:
         self.state = None
 
 
-async def test_handle_location_uses_tomtom_and_skips_ocm_when_tomtom_available(monkeypatch):
+def _far_station(template, source_key, idx, km_offset):
+    """Станція на km_offset* _FAR_OFFSET_DEG*~370 км-масштабі від _BASE_LAT —
+    заздалегідь далеко за DEDUPE_DISTANCE_KM від будь-якої іншої такої ж
+    станції, щоб тести ліміту не випадково зачепили дедуп."""
+    lat = _BASE_LAT + km_offset * 0.01
+    station = {**template, "id": f"{source_key}-{idx}", "lat": lat, "lng": lat, "lon": lat}
+    if source_key == "ocm":
+        station["distance"] = km_offset
+    else:
+        station["distance_km"] = km_offset
+    return station
+
+
+async def test_handle_location_queries_ocm_even_when_tomtom_returns_results(monkeypatch):
+    """Регресія на саму причину бандла (живий смоук 31.07.2026): раніше
+    успішна відповідь TomTom вимикала запит до OCM повністю — швидкі
+    DC-станції, знані лише OCM, зникали з видачі. OCM тепер запитується
+    ЗАВЖДИ, паралельно з TomTom."""
     ocm_called = []
 
     async def fake_ocm(*a, **kw):
-        ocm_called.append((a, kw))
-        return [OCM_STATION]
+        ocm_called.append(1)
+        return [{**OCM_STATION, "lat": _BASE_LAT + 1.0, "lon": _BASE_LON, "distance": 50.0}]
 
     async def fake_tomtom_search(*a, **kw):
-        return [dict(TOMTOM_STATION)]
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance_km": 1.0}]
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return []
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    assert ocm_called == [1]
+    sent_texts = [text for text, _ in message.sent]
+    assert any("Зубра HyperCharger" in text for text in sent_texts)  # OCM-картка дійшла
+    assert any("© TomTom" in text for text in sent_texts)  # і TomTom-картка теж
+
+
+async def test_handle_location_dedupes_near_duplicate_across_sources(monkeypatch):
+    async def fake_ocm(*a, **kw):
+        return [{**OCM_STATION, "lat": _BASE_LAT, "lon": _BASE_LON, "distance": 1.0}]
+
+    async def fake_tomtom_search(*a, **kw):
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT + _NEAR_OFFSET_DEG, "lon": _BASE_LON, "distance_km": 1.0}]
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return []
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    sent_texts = [text for text, _ in message.sent]
+    assert sent_texts[1] == "🎯 **Знайдено 1 станцій поруч:**"
+
+
+async def test_handle_location_limits_shown_stations_to_five(monkeypatch):
+    async def fake_ocm(*a, **kw):
+        return [_far_station(OCM_STATION, "ocm", i, i) for i in range(1, 4)]  # 1,2,3 км
+
+    async def fake_tomtom_search(*a, **kw):
+        return [_far_station(TOMTOM_STATION, "tomtom", i, i) for i in range(4, 8)]  # 4,5,6,7 км
+
+    async def fake_get_availability(availability_id):
+        return None
+
+    async def fake_operator_stations(*a, **kw):
+        return []
+
+    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
+    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
+    monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
+    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
+
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
+    state = _FakeState()
+
+    await user_handlers.handle_location(message, state)
+
+    sent_texts = [text for text, _ in message.sent]
+    assert sent_texts[1] == "🎯 **Знайдено 5 станцій поруч:**"
+
+
+async def test_handle_location_fetches_availability_only_for_shown_tomtom_stations(monkeypatch):
+    """TOMTOM_SEARCH_LIMIT=10 навмисно ширший за MAX_STATIONS_SHOWN=5, щоб
+    після злиття/дедупу було з чого обирати — але live-статус має тягнутись
+    ЛИШЕ для станцій, що реально потрапили у фінальну видачу, не для всіх
+    10 сирих результатів nearbySearch."""
+    async def fake_ocm(*a, **kw):
+        return []
+
+    async def fake_tomtom_search(*a, **kw):
+        return [_far_station(TOMTOM_STATION, "tomtom", i, i) for i in range(1, 8)]  # 7 станцій
 
     availability_calls = []
 
@@ -290,89 +499,31 @@ async def test_handle_location_uses_tomtom_and_skips_ocm_when_tomtom_available(m
     monkeypatch.setattr(user_handlers.tomtom_service, "get_availability", fake_get_availability)
     monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
 
-    message = _FakeMessage(49.79, 23.95)
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
     state = _FakeState()
 
     await user_handlers.handle_location(message, state)
 
-    assert ocm_called == []  # TomTom доступний -> OCM не викликається взагалі
-    assert availability_calls == ["avail-1"]  # рівно один виклик, на показану станцію
-    sent_texts = [text for text, _ in message.sent]
-    assert any("© TomTom" in text for text in sent_texts)
-
-
-async def test_handle_location_falls_back_to_ocm_when_tomtom_unavailable(monkeypatch):
-    async def fake_ocm(*a, **kw):
-        return [OCM_STATION]
-
-    async def fake_tomtom_search(*a, **kw):
-        return None  # вимкнено / квота / помилка
-
-    async def fake_operator_stations(*a, **kw):
-        return []
-
-    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
-    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
-    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
-
-    message = _FakeMessage(49.79, 23.95)
-    state = _FakeState()
-
-    await user_handlers.handle_location(message, state)
-
-    sent_texts = [text for text, _ in message.sent]
-    assert any("Зубра HyperCharger" in text for text in sent_texts)  # OCM-картка дійшла
-    assert state.state == user_handlers.BotStates.waiting_for_station_id
-
-
-async def test_handle_location_tomtom_empty_result_falls_back_to_ocm(monkeypatch):
-    """ПРАВКА 3 (рев'ю Opus 31.07.2026): успішна, але порожня відповідь
-    TomTom теж фолбечить на OCM — покриття TomTom поза Львовом (де
-    перевірявся ключ) не виміряне, тож [] не гарантує "станцій справді
-    немає"; без фолбеку водій бачив би "не знайдено" там, де OCM щось має."""
-    ocm_called = []
-
-    async def fake_ocm(*a, **kw):
-        ocm_called.append(1)
-        return [OCM_STATION]
-
-    async def fake_tomtom_search(*a, **kw):
-        return []
-
-    async def fake_operator_stations(*a, **kw):
-        return []
-
-    monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
-    monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
-    monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
-
-    message = _FakeMessage(49.79, 23.95)
-    state = _FakeState()
-
-    await user_handlers.handle_location(message, state)
-
-    assert ocm_called == [1]
-    sent_texts = [text for text, _ in message.sent]
-    assert any("Зубра HyperCharger" in text for text in sent_texts)
+    assert len(availability_calls) == user_handlers.MAX_STATIONS_SHOWN
 
 
 async def test_handle_location_operator_stations_appear_first_when_closest(monkeypatch):
     """Регресія: операторський шар дії лишається у видачі й коректно
-    сортується разом із новим TomTom-джерелом."""
+    сортується разом із TomTom-джерелом."""
     async def fake_ocm(*a, **kw):
         return []
 
     async def fake_tomtom_search(*a, **kw):
-        return [{**TOMTOM_STATION, "distance_km": 5.0, "charging_availability_id": None}]
+        return [{**TOMTOM_STATION, "lat": _BASE_LAT + 5.0, "lon": _BASE_LON, "distance_km": 5.0}]
 
     async def fake_operator_stations(*a, **kw):
-        return [{**OPERATOR_STATION, "distance_km": 0.5}]
+        return [{**OPERATOR_STATION, "lat": _BASE_LAT, "lng": _BASE_LON, "distance_km": 0.5}]
 
     monkeypatch.setattr(user_handlers, "find_three_nearest_stations", fake_ocm)
     monkeypatch.setattr(user_handlers.tomtom_service, "search_stations_near", fake_tomtom_search)
     monkeypatch.setattr(user_handlers.op_repo, "list_public_stations_near", fake_operator_stations)
 
-    message = _FakeMessage(49.79, 23.95)
+    message = _FakeMessage(_BASE_LAT, _BASE_LON)
     state = _FakeState()
 
     await user_handlers.handle_location(message, state)
