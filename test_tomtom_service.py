@@ -38,20 +38,37 @@ def _make_mock_client(status_code=200, json_data=None, raise_timeout=False):
     return mock_client_cm, mock_client
 
 
+# Форма звірена з живою відповіддю TomTom 31.07.2026: chargingPark — поле
+# ВЕРХНЬОГО рівня result (НЕ всередині poi — poi.chargingPark у живій
+# відповіді завжди порожній), кожен конектор несе connectorType/ratedPowerKW/
+# voltageV/currentA/currentType. Той самий принцип, що mock_monobank.py —
+# мок підганяємо під реальність, а не навпаки.
 SAMPLE_SEARCH_RESULT = {
     "id": "abc123",
     "dist": 940.0,
     "poi": {
         "name": "Зубра HyperCharger",
-        "chargingPark": {
-            "connectors": [
-                {"connectorType": "IEC62196Type2CCS", "ratedPowerKW": 150},
-                {"connectorType": "Chademo", "ratedPowerKW": 50},
-            ]
-        },
     },
     "address": {"freeformAddress": "Зубра, 1, Львів"},
     "position": {"lat": 49.79, "lon": 23.95},
+    "chargingPark": {
+        "connectors": [
+            {
+                "connectorType": "IEC62196Type2CCS",
+                "ratedPowerKW": 150,
+                "voltageV": 500,
+                "currentA": 300,
+                "currentType": "DC",
+            },
+            {
+                "connectorType": "Chademo",
+                "ratedPowerKW": 50,
+                "voltageV": 500,
+                "currentA": 125,
+                "currentType": "DC",
+            },
+        ]
+    },
     "dataSources": {"chargingAvailability": {"id": "avail-xyz"}},
 }
 
@@ -134,6 +151,51 @@ def test_normalize_search_result_without_position_returns_none():
     assert _normalize_search_result(bare) is None
 
 
+def test_normalize_search_result_reads_chargingpark_from_result_not_poi():
+    """Регресія на БЛОКЕР 1 (рев'ю Opus 31.07.2026): TomTom повертає
+    chargingPark на ВЕРХньому рівні result, а не всередині poi. Раніше код
+    читав poi.chargingPark, який у живій відповіді завжди порожній —
+    connectors завжди виходили [], бейджа швидкості не було НІКОЛИ."""
+    result = {
+        "id": "toplevel",
+        "position": {"lat": 1.0, "lon": 2.0},
+        "poi": {
+            "name": "X",
+            # Пастка: якби код і далі читав звідси, тест пройшов би з
+            # НЕПРАВИЛЬНИМИ даними — навмисно інше значення потужності.
+            "chargingPark": {"connectors": [{"connectorType": "WrongPlace", "ratedPowerKW": 999}]},
+        },
+        "chargingPark": {"connectors": [{"connectorType": "IEC62196Type2CCS", "ratedPowerKW": 50}]},
+    }
+    normalized = _normalize_search_result(result)
+
+    assert normalized["power_kw"] == 50
+    assert normalized["connector_type"] == "CCS (Type 2)"
+
+
+def test_normalize_search_result_prefers_dc_connector_when_no_power_data():
+    """ПРАВКА 5 (рев'ю Opus): currentType (AC1/AC3/DC) — прямий сигнал
+    TomTom, використовується для вибору представницького конектора станції,
+    коли жоден конектор не дав ratedPowerKW. classify_station_speed сама не
+    змінювалась — це лише кращий вхід для неї."""
+    result = {
+        "id": "nopower",
+        "position": {"lat": 1.0, "lon": 2.0},
+        "chargingPark": {
+            "connectors": [
+                {"connectorType": "SomeUnmappedAC", "currentType": "AC1"},
+                {"connectorType": "SomeUnmappedDC", "currentType": "DC"},
+            ]
+        },
+    }
+    normalized = _normalize_search_result(result)
+
+    assert normalized["power_kw"] is None
+    assert normalized["connector_type"] == "SomeUnmappedDC"
+    assert normalized["connectors"][0]["current_type"] == "AC1"
+    assert normalized["connectors"][1]["current_type"] == "DC"
+
+
 def test_normalize_search_result_missing_optional_fields_uses_safe_defaults():
     minimal = {
         "id": "min1",
@@ -205,6 +267,21 @@ async def test_get_availability_end_to_end_success():
 
     assert result is not None
     assert len(result) == 2
+
+
+async def test_get_availability_uses_correct_query_param_name():
+    """Регресія на БЛОКЕР 2 (рев'ю Opus 31.07.2026): живий запит показав, що
+    параметр зветься "chargingAvailability", а не "chargingAvailabilityId" —
+    з "Id" TomTom відповідав 400 Bad Request, і get_availability() ЗАВЖДИ
+    мовчки повертав None (лише warning у лог)."""
+    mock_cm, mock_client = _make_mock_client(json_data=SAMPLE_AVAILABILITY)
+    with patch.object(tomtom_service, "TOMTOM_API_KEY", "fake-key"), \
+         patch("app.services.tomtom_service.httpx.AsyncClient", return_value=mock_cm):
+        await get_availability("avail-xyz")
+
+    called_params = mock_client.get.call_args.kwargs["params"]
+    assert called_params.get("chargingAvailability") == "avail-xyz"
+    assert "chargingAvailabilityId" not in called_params
 
 
 # ---------------------------------------------------------------------------

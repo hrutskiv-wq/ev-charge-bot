@@ -325,9 +325,11 @@ async def test_handle_location_falls_back_to_ocm_when_tomtom_unavailable(monkeyp
     assert state.state == user_handlers.BotStates.waiting_for_station_id
 
 
-async def test_handle_location_tomtom_empty_result_does_not_fall_back_to_ocm(monkeypatch):
-    """Успішна відповідь TomTom без станцій у радіусі — це НЕ підстава для
-    фолбеку на OCM (лише None вважається "недоступний")."""
+async def test_handle_location_tomtom_empty_result_falls_back_to_ocm(monkeypatch):
+    """ПРАВКА 3 (рев'ю Opus 31.07.2026): успішна, але порожня відповідь
+    TomTom теж фолбечить на OCM — покриття TomTom поза Львовом (де
+    перевірявся ключ) не виміряне, тож [] не гарантує "станцій справді
+    немає"; без фолбеку водій бачив би "не знайдено" там, де OCM щось має."""
     ocm_called = []
 
     async def fake_ocm(*a, **kw):
@@ -349,9 +351,9 @@ async def test_handle_location_tomtom_empty_result_does_not_fall_back_to_ocm(mon
 
     await user_handlers.handle_location(message, state)
 
-    assert ocm_called == []
+    assert ocm_called == [1]
     sent_texts = [text for text, _ in message.sent]
-    assert any("Станцій поблизу не знайдено" in text for text in sent_texts)
+    assert any("Зубра HyperCharger" in text for text in sent_texts)
 
 
 async def test_handle_location_operator_stations_appear_first_when_closest(monkeypatch):
