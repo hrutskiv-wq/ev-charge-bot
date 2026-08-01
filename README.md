@@ -18,7 +18,24 @@ alembic upgrade head
 python -m app.main                    # або: docker compose up -d --build
 ```
 
-Тести: `pytest` — 349 тестів, усі мокають БД і мережу, живі сервіси не потрібні.
+Тести: `pytest` — 875 тестів, усі мокають БД і мережу, живі сервіси не потрібні.
+
+### Бар'єр проти секретів у комітах
+
+`scripts/check_secrets.py` перевіряє ДОДАНІ рядки на форми, типові для
+секретів (ключі провайдерів, `KEY=`/`TOKEN=`/`SECRET=`/`PASSWORD=` з довгим
+значенням, спробу закомітити сам `.env`). Головний бар'єр — крок CI
+(`.github/workflows/ci.yml`), його не обійти. Локальний git-хук — зручність,
+що ловить те саме до пушу; встановити один раз:
+
+```bash
+cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+Хук чесно обходиться через `git commit --no-verify` — саме тому він не
+єдиний захист, а лише швидший фідбек локально. Хибне спрацювання? Розшир
+`PLACEHOLDER_VALUES`/`ALLOWLISTED_PATH_PATTERNS` у `scripts/check_secrets.py`
+(видимі константи на початку файлу), а не обходь перевірку.
 
 ## Чек-лист деплою
 
@@ -199,6 +216,7 @@ uvicorn mock_monobank:app --port 8081      # еквайринг Monobank
 | `reconcile_operators.py` | звірка операторського білінгу (Промпт 5) |
 | `reconcile_payments.py` | звірка платежів водіїв (поповнення балансу) |
 | `reconcile_charging_reservations.py` | звірка застряглих kWh-резервацій OCPP (Промпт 3c-i) |
+| `scripts/check_secrets.py` | бар'єр проти секретів у комітах — сканує додані рядки, крок CI + опційний git-хук |
 | `templates/driver/` | Jinja2-шаблони сторінок водія (без зовнішніх ресурсів) |
 | `migrations/versions/` | Alembic — **джерело правди** для схеми |
 

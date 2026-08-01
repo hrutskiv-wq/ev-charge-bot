@@ -9,6 +9,30 @@ name: CI
 # StartTransaction; test_charging_reservations_live.py — claim_reservation_
 # for_settlement() дійсно серіалізує паралельні виклики, Промпт 3c-ii) —
 # див. PROJECT_CONTEXT.md.
+#
+# Job `secret-scan` — бар'єр проти секретів у комітах (scripts/check_secrets.py).
+# ГОЛОВНИЙ бар'єр цього класу: локальний git-хук (scripts/pre-commit) можна не
+# встановити або обійти `--no-verify`, цей job — ні. Падає, а не лише попереджає.
+#
+# База для диффу залежить від події (round 2 рев'ю — БЛОКЕР 2, було: на
+# прямому push у main `origin/main` після фетчу дорівнює HEAD, диф порожній,
+# job зелений, не переглянувши жодного рядка — саме той шлях, яким прийшов
+# коміт 5566a42 31.07.2026):
+#   - pull_request: диф проти origin/main (three-dot, як GitHub рахує диф PR);
+#   - push: диф проти github.event.before (сам діапазон запушених комітів),
+#     origin/main — лише фолбек для щойно створеної гілки (before = усі нулі).
+#
+# round 3 рев'ю (БЛОКЕР): "before" з force-push (штатна операція цього
+# репозиторію — "кожен бандл змержено rebase'ом") стає недосяжним ні з
+# одного ref. Раніше це давало ТИХИЙ fail-open: `git diff` на недосяжний ref
+# падає (exit 128), а `check_secrets.py` ігнорував код повернення й
+# трактував порожній stdout як "секретів нема". Тепер: (1) сам скрипт при
+# збої git кидає GitDiffError і повертає exit 1, а не 0 (fail-closed на
+# рівні коду); (2) ТУТ, у CI, — явна перевірка досяжності `git cat-file -e`
+# ДО виклику скрипта, з відкатом на `origin/main` (сканує всю гілку —
+# безпечний бік) і ВИДИМИМ `::warning::` у лозі job'а, коли відкат
+# трапляється (мовчазний фолбек — той самий клас невидимості, що вже двічі
+# спливав у звірці резервацій, docs/SESSION_STATE.md).
 
 on:
   push:
@@ -17,6 +41,36 @@ on:
     branches: ["main"]
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Перевірити додані рядки на секрети
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          if [ "$GH_EVENT_NAME" = "push" ] && [ -n "$GH_EVENT_BEFORE" ] && [ "$GH_EVENT_BEFORE" != "$ZERO_SHA" ]; then
+            BASE_REF="$GH_EVENT_BEFORE"
+          else
+            BASE_REF="origin/main"
+          fi
+          if ! git cat-file -e "${BASE_REF}^{commit}" 2>/dev/null; then
+            echo "::warning::База $BASE_REF недосяжна (ймовірно force-push переписав історію) — відкіт на origin/main"
+            BASE_REF="origin/main"
+          fi
+          echo "Диф проти: $BASE_REF (подія: $GH_EVENT_NAME)"
+          python scripts/check_secrets.py --base "$BASE_REF"
+
   test:
     runs-on: ubuntu-latest
     steps:
