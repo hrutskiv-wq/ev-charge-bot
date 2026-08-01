@@ -1,0 +1,25 @@
+#!/bin/sh
+# Локальний git-хук: блокує коміт, якщо в ДОДАНИХ рядках staged-диффу
+# знайдено щось схоже на секрет (scripts/check_secrets.py).
+#
+# Git не версіонує хуки самостійно — встановити один раз (з кореня репо):
+#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# ЧЕСНО: цей хук легко обійти — `git commit --no-verify` пропускає його
+# без жодного сліду. Тому він лише зручність для локальної розробки, а не
+# гарантія. Справжній бар'єр — той самий check_secrets.py як крок CI
+# (.github/workflows/ci.yml), який обійти не можна: PR із секретом у
+# доданих рядках не пройде перевірку незалежно від того, чи стояв хук
+# у автора локально.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+else
+    PYTHON=python
+fi
+
+"$PYTHON" "$REPO_ROOT/scripts/check_secrets.py"

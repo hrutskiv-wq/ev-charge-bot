@@ -1,5 +1,8 @@
 # Секрети та конфігурація
-.env
+# .env* — не лише сам .env, а й .env.prod/.env.local тощо (round 2 рев'ю,
+# не-блокер 6); .env.example — єдиний свідомий виняток, комітиться навмисно.
+.env*
+!.env.example
 users.db
 *.db
 
