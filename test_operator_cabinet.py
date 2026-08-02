@@ -404,7 +404,11 @@ async def test_pending_operator_sees_status_note(rs):
 
     await ob.cmd_operator_cabinet(message, state)
 
-    assert "очікує" in message.sent[0][0].lower() or "розгляд" in message.sent[0][0].lower()
+    text = message.sent[0][0].lower()
+    # Не "розгляд" (ніхто нічого не розглядає — самообслуговуваний онбординг):
+    # текст має вказувати на дію оператора (чек-лист), не на пасивне чекання.
+    assert "розгляд" not in text
+    assert "чек-лист" in text or "прогрес активації" in text
 
 
 async def test_onboarding_name_step_asks_for_phone_next(rs):
@@ -508,6 +512,22 @@ async def test_onboarding_notification_escapes_html_in_name_so_the_push_is_not_l
     _chat_id, text, _kwargs = fake_bot.sent[0]
     assert "<b>Едем</b>" not in text
     assert "&lt;b&gt;Едем&lt;/b&gt; &amp; Ко" in text
+
+
+async def test_onboarding_notification_without_username_does_not_duplicate_id(rs, fake_bot, monkeypatch):
+    """Раніше без нікнейма виходило 'Telegram: 501 (id 501)' — id має бути рівно один раз."""
+    monkeypatch.setenv("LOGS_CHAT_ID", "-100999")
+    state = FakeFSMContext()
+    state.data["name"] = "Готель Едем"
+    await state.set_state(ob.OperatorOnboarding.waiting_for_phone)
+    message = FakeMessage("+380501234567", telegram_id=TELEGRAM_A)  # username=None за замовчуванням
+
+    await ob.onboarding_phone(message, state)
+
+    _chat_id, text, _kwargs = fake_bot.sent[0]
+    telegram_line = next(line for line in text.splitlines() if line.startswith("Telegram:"))
+    assert telegram_line.count(str(TELEGRAM_A)) == 1, f"id має зустрічатись рівно раз: {telegram_line!r}"
+    assert telegram_line == f"Telegram: {TELEGRAM_A}"
 
 
 async def test_onboarding_skips_notification_silently_without_logs_chat_id(rs, fake_bot):
@@ -1422,6 +1442,151 @@ async def test_save_monobank_token_bank_unavailable_leaves_pending_no_crash(rs, 
     assert not any(UNIQUE_MARKER in t for t in texts), "Текст винятку не має йти в чат"
 
 
+# ---------------------------------------------------------------------------
+# C: verify-перед-save — старий робочий токен не можна знищити невдалим
+# переоформленням (fix/operator-ux-before-first-tenant)
+# ---------------------------------------------------------------------------
+
+OLD_ENCRYPTED_TOKEN = "old-encrypted-value-untouched"
+
+
+async def test_reentering_token_bank_rejects_leaves_old_token_untouched(rs, fake_bot, encryption_key, monkeypatch):
+    """Активний оператор переоформлює токен, помиляється при копіюванні — старий лишається робочим."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    rs.tokens[OPERATOR_A] = OLD_ENCRYPTED_TOKEN
+    rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] = "VERIFIED"
+
+    async def fake_verify(token):
+        return False
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("typo-in-new-token")
+
+    await ob.save_monobank_token(message, state)
+
+    assert rs.tokens[OPERATOR_A] == OLD_ENCRYPTED_TOKEN, "Старий токен не мав змінитись"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] == "VERIFIED"
+    assert fake_bot.deleted == [(message.chat.id, message.message_id)], "Повідомлення з новим токеном теж видаляється"
+    text = message.sent[-1][0]
+    assert "не підтвердив" in text
+    assert "не змінив" in text.lower() or "без змін" in text.lower()
+
+
+async def test_reentering_token_bank_unavailable_leaves_old_token_untouched(rs, fake_bot, encryption_key, monkeypatch):
+    """Той самий сценарій, банк недоступний замість явної відмови — теж не чіпає старий токен."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    rs.tokens[OPERATOR_A] = OLD_ENCRYPTED_TOKEN
+    rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] = "VERIFIED"
+
+    async def fake_verify(token):
+        raise ob.MonobankError("тимчасово лежить")
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("new-token-bank-is-down")
+
+    await ob.save_monobank_token(message, state)
+
+    assert rs.tokens[OPERATOR_A] == OLD_ENCRYPTED_TOKEN, "Старий токен не мав змінитись"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] == "VERIFIED"
+    assert fake_bot.deleted == [(message.chat.id, message.message_id)]
+    text = message.sent[-1][0]
+    assert "тимчасова недоступність" in text
+    assert "не змінив" in text.lower() or "без змін" in text.lower()
+
+
+async def test_reentering_token_rejection_and_unavailability_messages_differ(rs, fake_bot, encryption_key, monkeypatch):
+    """Властивість 1 з плану: дві причини відмови розрізнені текстом, не злиті в одне повідомлення."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+
+    async def rejects(token):
+        return False
+    monkeypatch.setattr(ob, "verify_merchant_token", rejects)
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    rejected_message = FakeMessage("bad-token")
+    await ob.save_monobank_token(rejected_message, state)
+    rejected_text = rejected_message.sent[-1][0]
+
+    async def unavailable(token):
+        raise ob.MonobankError("down")
+    monkeypatch.setattr(ob, "verify_merchant_token", unavailable)
+    state2 = FakeFSMContext()
+    await state2.set_state(ob.MonobankConnect.waiting_for_token)
+    unavailable_message = FakeMessage("another-token")
+    await ob.save_monobank_token(unavailable_message, state2)
+    unavailable_text = unavailable_message.sent[-1][0]
+
+    assert rejected_text != unavailable_text
+    assert "не підтвердив" in rejected_text and "недоступність" not in rejected_text
+    assert "недоступність" in unavailable_text and "не підтвердив" not in unavailable_text
+
+
+async def test_first_token_bank_unavailable_saves_nothing(rs, fake_bot, encryption_key, monkeypatch):
+    """Оператор БЕЗ токена (не переоформлення) — при недоступності банку в БД не з'являється нічого."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
+    assert OPERATOR_A not in rs.tokens
+
+    async def fake_verify(token):
+        raise ob.MonobankError("down")
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("first-token-ever")
+
+    await ob.save_monobank_token(message, state)
+
+    assert OPERATOR_A not in rs.tokens, "Жодного токена не мало зʼявитись у сховищі"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] is None
+    assert fake_bot.deleted == [(message.chat.id, message.message_id)]
+
+
+async def test_successful_verification_saves_token_and_marks_verified_after_both_writes(
+    rs, fake_bot, encryption_key, monkeypatch
+):
+    """Успішний шлях: токен збережено, verified_at проставлено, повідомлення про успіх — після ОБОХ записів."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    assert OPERATOR_A not in rs.tokens
+
+    write_order = []
+    real_set_token = repo.set_operator_monobank_token
+    real_mark_verified = repo.mark_operator_token_verified
+
+    async def spy_set_token(operator_id, token_encrypted):
+        result = await real_set_token(operator_id, token_encrypted)
+        write_order.append("set_token")
+        return result
+
+    async def spy_mark_verified(operator_id):
+        result = await real_mark_verified(operator_id)
+        write_order.append("mark_verified")
+        return result
+
+    monkeypatch.setattr(repo, "set_operator_monobank_token", spy_set_token)
+    monkeypatch.setattr(repo, "mark_operator_token_verified", spy_mark_verified)
+
+    async def fake_verify(token):
+        return True
+    monkeypatch.setattr(ob, "verify_merchant_token", fake_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("brand-new-good-token")
+
+    await ob.save_monobank_token(message, state)
+
+    assert OPERATOR_A in rs.tokens, "Токен мав бути збережений"
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] == "VERIFIED"
+    assert write_order == ["set_token", "mark_verified"], "Порядок записів: спершу токен, потім verified_at"
+
+    success_texts = [t for t, _ in message.sent if "підтверджено" in t and "збережено" in t]
+    assert len(success_texts) == 1, "Повідомлення про успіх має бути надіслане рівно раз, після обох записів"
+
+
 async def test_cabinet_verify_token_without_saved_token_shows_alert(rs, monkeypatch):
     rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="pending")
     calls = []
@@ -1662,6 +1827,41 @@ async def test_suspended_operator_can_still_view_station_read_only(rs):
     assert callback.message.edited, "Перегляд картки станції має відбутись навіть для suspended"
 
 
+async def test_suspended_operator_menu_hides_mutating_buttons(rs):
+    """
+    Кабінет призупиненого не пропонує кнопок, що гарантовано відмовлять
+    (гард _is_suspended у самих хендлерах не змінюється — це про UX, не про
+    безпеку): «🔌 Мої станції» і «💰 Виручка» лишаються, «➕ Додати станцію»
+    і кнопка токена ховаються.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    message = FakeMessage("/operator")
+    state = FakeFSMContext()
+
+    await ob.cmd_operator_cabinet(message, state)
+
+    kb = message.sent[0][1]["reply_markup"]
+    button_texts = [b.text for row in kb.inline_keyboard for b in row]
+    assert any("Мої станції" in t for t in button_texts)
+    assert any("Виручка" in t for t in button_texts)
+    assert not any("Додати станцію" in t for t in button_texts)
+    assert not any("еквайринг" in t.lower() or "Еквайринг" in t for t in button_texts)
+
+
+async def test_active_operator_menu_still_shows_mutating_buttons(rs):
+    """Регресія проти суспенду, що ховає кнопки для всіх — не лише для призупинених."""
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="active")
+    message = FakeMessage("/operator")
+    state = FakeFSMContext()
+
+    await ob.cmd_operator_cabinet(message, state)
+
+    kb = message.sent[0][1]["reply_markup"]
+    button_texts = [b.text for row in kb.inline_keyboard for b in row]
+    assert any("Додати станцію" in t for t in button_texts)
+    assert any("еквайринг" in t.lower() or "Еквайринг" in t for t in button_texts)
+
+
 async def test_suspended_operator_cannot_verify_token(rs, monkeypatch):
     """
     Дірки в безпеці немає (try_auto_activate вимагає status='pending'), але
@@ -1700,3 +1900,35 @@ async def test_suspended_operator_mid_wizard_cannot_create_station(rs, monkeypat
 
     assert rs.created_stations == [], "Станція не мала створитись"
     assert "призупинено" in message.sent[0][0].lower()
+
+
+async def test_suspended_operator_mid_flow_cannot_save_token(rs, fake_bot, encryption_key, monkeypatch):
+    """
+    Той самий сценарій, що вище для майстра станції: вхід (cabinet_connect_
+    token) захищений, але FSM-стан живе в Redis — призупинення посеред
+    введення токена не скасовує вже розпочатий стан. save_monobank_token()
+    — місце, де рядок реально пишеться в БД (через _verify_and_save_new_
+    token), тож саме тут потрібен фінальний рубіж: система не має ходити в
+    банк заради призупиненого оператора взагалі.
+    """
+    rs.add_operator(id=OPERATOR_A, telegram_id=TELEGRAM_A, status="suspended")
+    rs.tokens[OPERATOR_A] = OLD_ENCRYPTED_TOKEN
+    rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] = "VERIFIED"
+
+    calls = []
+    async def spy_verify(token):
+        calls.append(token)
+        return True
+    monkeypatch.setattr(ob, "verify_merchant_token", spy_verify)
+
+    state = FakeFSMContext()
+    await state.set_state(ob.MonobankConnect.waiting_for_token)
+    message = FakeMessage("new-token-while-suspended")
+
+    await ob.save_monobank_token(message, state)
+
+    assert calls == [], "Банк не мав опитуватись заради призупиненого оператора"
+    assert rs.tokens[OPERATOR_A] == OLD_ENCRYPTED_TOKEN
+    assert rs.operators_by_id[OPERATOR_A]["monobank_token_verified_at"] == "VERIFIED"
+    assert fake_bot.deleted == [(message.chat.id, message.message_id)], "Повідомлення з токеном усе одно видаляється"
+    assert "призупинено" in message.sent[-1][0].lower()

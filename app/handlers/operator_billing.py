@@ -73,8 +73,12 @@ PUBLIC_BASE_URL = (
 ).rstrip("/")
 
 _OPERATOR_STATUS_NOTES = {
-    "pending": "⏳ Заявку на розгляді. Оплати водіїв поки не приймаються, "
-               "але еквайринг і станції можна налаштувати заздалегідь.",
+    # Раніше: «Заявку на розгляді» — але ніхто нічого не розглядає, кабінет
+    # активується сам за трьома критеріями чек-листа. Формулювання з
+    # «розглядом» змушувало оператора ЧЕКАТИ замість того, щоб іти закривати
+    # кроки. Без числа кроків навмисно — рахувати дорого, чек-лист один тап.
+    "pending": "⏳ Кабінет ще не активний — залишилось виконати кроки чек-листа. "
+               "Перевірте «📋 Прогрес активації».",
     "suspended": "⛔ Кабінет призупинено. Зверніться до підтримки.",
 }
 _STATION_STATUS_LABELS = {"active": "🟢 активна", "offline": "🟡 офлайн", "disabled": "⚪ вимкнена"}
@@ -133,7 +137,11 @@ async def _send_cabinet_home(target, operator, edit: bool = False):
     text = f"🏷️ <b>Кабінет оператора «{html.escape(operator['name'])}»</b>"
     if note:
         text += f"\n{note}"
-    kb = get_cabinet_menu(has_token, show_checklist=operator["status"] == "pending")
+    kb = get_cabinet_menu(
+        has_token,
+        show_checklist=operator["status"] == "pending",
+        is_suspended=_is_suspended(operator),
+    )
     if edit:
         await target.edit_text(text, parse_mode="HTML", reply_markup=kb)
     else:
@@ -174,13 +182,19 @@ async def _notify_admins_new_operator(operator_id: int, name: str, phone: str, f
     # випадків: непарсибельний HTML -> bot.send_message падає з винятком ->
     # заявка оператора "губиться" (адмін ніколи не дізнається про неї, хоча
     # рядок в operators уже записано).
-    username = f"@{from_user.username}" if from_user.username else str(from_user.id)
+    # Без нікнейма (username=None) старий код дублював id: "Telegram: 123
+    # (id 123)" — тепер "(id ...)" додається ЛИШЕ коли є чим його доповнити.
+    has_username = bool(from_user.username)
+    username_display = f"@{from_user.username}" if has_username else str(from_user.id)
+    telegram_line = f"Telegram: {html.escape(username_display)}"
+    if has_username:
+        telegram_line += f" (id {from_user.id})"
     text = (
         "🆕 <b>Новий оператор зареєструвався</b>\n"
         f"ID: <code>{operator_id}</code>\n"
         f"Назва: {html.escape(name)}\n"
         f"Телефон: {html.escape(phone)}\n"
-        f"Telegram: {html.escape(username)} (id {from_user.id})\n\n"
+        f"{telegram_line}\n\n"
         "Активується автоматично, щойно підтвердить токен Monobank і додасть "
         "станцію — дія не потрібна. Форсувати негайно (запасний шлях): "
         f"кнопка нижче, або set_operator_status({operator_id}, 'active')"
@@ -471,8 +485,8 @@ async def cabinet_connect_token(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.answer(
         "Надішліть токен мерчанта Monobank Acquiring (Особистий кабінет банку → "
-        "Мерчанти → Токен). Повідомлення з токеном буде видалено одразу після "
-        "збереження — ніде, крім зашифрованого запису в базі, він не лишиться."
+        "Мерчанти → Токен). Повідомлення з токеном буде видалено одразу — у базі "
+        "токен з'явиться лише зашифрованим і лише після того, як банк його підтвердить."
     )
 
 
@@ -491,10 +505,15 @@ async def _try_delete_token_message(message: Message, operator_id: int = None):
 
 async def _verify_token_and_respond(operator, encrypted_token: str, target: Message):
     """
-    Спільна перевірка токена для save_monobank_token() (одразу після
-    збереження) і cabinet_verify_token() (повторна спроба з чек-листа —
-    БЕЗ повторного вводу токена). Розшифровує токен лише в межах цього
-    виклику — назовні (лог, чат) відкритий токен ніколи не потрапляє.
+    Перевірка ВЖЕ збереженого токена — використовується лише
+    cabinet_verify_token() («🔁 Перевірити токен ще раз» з чек-листа, БЕЗ
+    повторного вводу). Розшифровує токен лише в межах цього виклику —
+    назовні (лог, чат) відкритий токен ніколи не потрапляє.
+
+    Для ЩОЙНО введеного токена (save_monobank_token()) використовується
+    _verify_and_save_new_token() нижче — там нічого не пишеться в базу, поки
+    банк не підтвердив, тому розшифровувати немає що: токен ще в пам'яті
+    у відкритому вигляді.
 
     Три можливі результати чітко розрізнені: банк явно відхилив токен
     (MonobankError НЕ кинуто, verify_merchant_token повернув False) —
@@ -537,6 +556,73 @@ async def _verify_token_and_respond(operator, encrypted_token: str, target: Mess
         await _announce_auto_activation(operator, target)
 
 
+async def _verify_and_save_new_token(operator, token_plain: str, target: Message):
+    """
+    Перевірка ЩОЙНО введеного токена (save_monobank_token()) — на відміну
+    від _verify_token_and_respond() (перевірка ВЖЕ збереженого), тут у базу
+    НІЧОГО не пишеться, поки банк не підтвердив.
+
+    ІНВАРІАНТ, який ця функція встановлює: ЗБЕРЕЖЕНИЙ ТОКЕН = ТОКЕН, ЯКИЙ
+    БАНК КОЛИСЬ ПІДТВЕРДИВ. Виняток — легасі-рядки, створені до цієї зміни
+    (токен оператора id=1 зберігався до живої перевірки за старим кодом).
+
+    Для активного оператора, що переоформлює токен, це і є сам фікс: помилка
+    при копіюванні (банк відмовив або тимчасово недоступний) більше не
+    знищує робочий токен — старий лишається в БД недоторканим, оплати не
+    зупиняються.
+    """
+    try:
+        valid = await verify_merchant_token(token_plain)
+    except MonobankError as e:
+        logger.error("Перевірка нового токена оператора %s не вдалась: %s", operator["id"], e)
+        await target.answer(
+            "⚠️ Не вдалось перевірити токен банком зараз (тимчасова недоступність). "
+            "Токен НЕ збережено — попередній токен (якщо був) лишився без змін. "
+            "Спробуйте надіслати токен ще раз трохи пізніше через «💳 Підключити еквайринг»."
+        )
+        return
+
+    if not valid:
+        await target.answer(
+            "❌ Банк не підтвердив токен. Токен НЕ збережено — попередній токен "
+            "(якщо був) лишився без змін. Перевірте, що скопіювали правильний токен "
+            "мерчанта, і підключіть його ще раз через «💳 Підключити еквайринг»."
+        )
+        return
+
+    # УМОВА 1 (рев'ю плану): між цими двома записами — НІЧОГО. Жодного await
+    # у мережу, жодного повідомлення, жодної спроби автоактивації.
+    #
+    # УМОВА 3 — чому це досі ДВА виклики, не один UPDATE: set_operator_
+    # monobank_token() скидає verified_at у NULL як ДРУГИЙ, підстраховувальний
+    # рубіж (див. її докстрінг у operators_repo.py) — самообслуговування не
+    # можна обійти, підмінивши токен на невалідний ПІСЛЯ автоактивації.
+    # mark_operator_token_verified() свідомо лишається окремою функцією, бо
+    # викликається ЛИШЕ після живої перевірки банком (її власний докстрінг).
+    # Вікно між двома UPDATE безпечне ОДНОБІЧНО: збій між ними лишає стан
+    # «токен є, не підтверджений» — систему, що вдає ГІРШЕ, ніж є насправді
+    # (самолікується кнопкою «Перевірити ще раз», грошей не чіпає, видно в
+    # чек-листі). Стану «підтверджено, хоч банк не питали» — коли одна
+    # функція могла б проштампувати verified_at без живого дзвінка — за
+    # такою побудовою не існує. Один UPDATE прибрав би це вікно ціною
+    # функції, здатної підтвердити токен без банку одним викликом, — свідомо
+    # НЕ робимо.
+    encrypted = encrypt_secret(token_plain)
+    await repo.set_operator_monobank_token(operator["id"], encrypted)
+    await repo.mark_operator_token_verified(operator["id"])
+    # УМОВА 2: до цього рядка "підтверджено" ніде не стверджувалось. Якщо
+    # mark_operator_token_verified() вище впаде — виняток іде нагору штатним
+    # шляхом (aiogram-обробник помилок), жодне повідомлення про успіх не
+    # надсилається.
+
+    tail = token_plain[-4:] if len(token_plain) >= 4 else token_plain
+    await target.answer(f"✅ Токен підтверджено банком і збережено, закінчується на …{tail}.")
+
+    just_activated = await operator_activation.try_auto_activate(operator["id"])
+    if just_activated:
+        await _announce_auto_activation(operator, target)
+
+
 @router.message(StateFilter(MonobankConnect.waiting_for_token), _is_free_text)
 async def save_monobank_token(message: Message, state: FSMContext):
     await state.clear()
@@ -550,13 +636,10 @@ async def save_monobank_token(message: Message, state: FSMContext):
 
     operator = await _resolve_operator_for(message.from_user.id)
     token = message.text.strip()
-    encrypted = None
 
-    if operator is not None and token:
-        encrypted = encrypt_secret(token)
-        await repo.set_operator_monobank_token(operator["id"], encrypted)
-
-    # Незалежно від того, чи вдалось зберегти токен вище.
+    # Видалення повідомлення з токеном — ЗАВЖДИ, незалежно від результату
+    # перевірки нижче (у жодній гілці, включно з невдалими, токен не має
+    # лишатись видимим в історії чату).
     await _try_delete_token_message(message, operator["id"] if operator else None)
 
     if operator is None:
@@ -565,10 +648,22 @@ async def save_monobank_token(message: Message, state: FSMContext):
     if not token:
         await message.answer("Порожній токен. Спробуйте ще раз через кнопку «Підключити еквайринг».")
         return
+    if _is_suspended(operator):
+        # Вхід (cabinet_connect_token) уже захищений, але FSM-стан живе в
+        # Redis — призупинення посеред введення токена не скасовує вже
+        # розпочатий стан. Це ОСТАННІЙ крок, де рядок реально пишеться в БД
+        # (через _verify_and_save_new_token), тож саме тут — фінальний
+        # рубіж. Повідомлення з токеном уже видалено вище незалежно від
+        # цієї перевірки — не дублювати видалення.
+        await message.answer(_OPERATOR_STATUS_NOTES["suspended"])
+        return
 
+    # У базі ще НІЧОГО не записано — рядок нижче лише підтверджує, що саме
+    # прийшло (для візуальної звірки копіпасту), не факт збереження. Токен
+    # потрапить у БД лише в _verify_and_save_new_token(), і лише на success.
     tail = token[-4:] if len(token) >= 4 else token
-    await message.answer(f"Токен збережено, закінчується на …{tail}. Перевіряю банком…")
-    await _verify_token_and_respond(operator, encrypted, message)
+    await message.answer(f"Перевіряю токен, що закінчується на …{tail}, банком…")
+    await _verify_and_save_new_token(operator, token, message)
 
 
 @router.callback_query(F.data == "opm:verify_token", StateFilter("*"))
