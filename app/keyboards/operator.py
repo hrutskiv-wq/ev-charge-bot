@@ -7,15 +7,26 @@ CONNECTOR_PRESETS = ["Type 2", "GB/T AC", "Schuko", "CEE 5-pin (3ф)"]
 CONNECTOR_OTHER_CALLBACK = "opconn:__other__"
 
 
-def get_cabinet_menu(has_token: bool, show_checklist: bool = False):
-    """show_checklist — лише поки status == 'pending' (самообслуговуваний онбординг)."""
+def get_cabinet_menu(has_token: bool, show_checklist: bool = False, is_suspended: bool = False):
+    """
+    show_checklist — лише поки status == 'pending' (самообслуговуваний онбординг).
+
+    is_suspended ховає МУТУЮЧІ кнопки («➕ Додати станцію», підключення/
+    перевірка токена) — призупинений оператор і так отримає відмову гарда
+    _is_suspended у самих хендлерах, але без цього він спершу тицяє кнопку,
+    що гарантовано відмовить, замість одразу бачити реальний стан. «🔌 Мої
+    станції» і «💰 Виручка» лишаються — перегляд для призупиненого свідомо
+    відкритий (рішення бандла self-service-onboarding, підтверджене живим
+    смоуком 28.07.2026).
+    """
     builder = InlineKeyboardBuilder()
     if show_checklist:
         builder.button(text="📋 Прогрес активації", callback_data="opm:checklist")
     builder.button(text="🔌 Мої станції", callback_data="opm:stations")
-    builder.button(text="➕ Додати станцію", callback_data="opm:add_station")
-    token_label = "💳 Еквайринг підключено" if has_token else "💳 Підключити еквайринг"
-    builder.button(text=token_label, callback_data="opm:token")
+    if not is_suspended:
+        builder.button(text="➕ Додати станцію", callback_data="opm:add_station")
+        token_label = "💳 Еквайринг підключено" if has_token else "💳 Підключити еквайринг"
+        builder.button(text=token_label, callback_data="opm:token")
     builder.button(text="💰 Виручка", callback_data="opm:revenue")
     builder.adjust(1)
     return builder.as_markup()
