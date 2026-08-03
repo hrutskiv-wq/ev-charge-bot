@@ -90,7 +90,26 @@ async def lifespan(app: FastAPI):
     logging.info("💤 Всі сервіси безпечно зупинено.")
 
 
-app = FastAPI(title="eVolt UA API Server", lifespan=lifespan)
+# /docs, /redoc, /openapi.json — публічні за замовчуванням у FastAPI, і це
+# НЕ косметика: живий запит 03.08.2026 на проді підтвердив, що /openapi.json
+# віддавав повну специфікацію API включно з трьома грошовими вебхуками
+# (/webhook/operator/{operator_id}, /webhook/wallet/{operator_id},
+# /webhook/charging-hold/{operator_id}) і OCPI-колбеками з {user_id} у
+# шляху. Самі ендпоінти від цього не вразливі (вебхуки не вірять тілу,
+# невідомий invoiceId -> тихий 200; OCPI має токен) — але безкоштовна
+# розвідка структури API прямо суперечить свідомому принципу цього проєкту
+# "ендпоінт не має бути оракулом" (той самий, що анти-оракул у Monobank-
+# вебхуку й OCPP-хендшейку). Прапорець — той самий ідіом, що
+# TELEGRAM_PAYMENTS_ENABLED/SEARCH_SINGLE_MESSAGE: дефолт ВИМКНЕНО.
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "0") == "1"
+
+app = FastAPI(
+    title="eVolt UA API Server",
+    lifespan=lifespan,
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
 
 # Зберігаємо бот у state додатка для доступу з ендпоінтів без циклічного імпорту
 app.state.bot = bot
