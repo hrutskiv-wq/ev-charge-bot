@@ -17,8 +17,13 @@ from app.core.loader import bot, dp
 from app.database import connection
 from app.database.connection import init_postgres, close_postgres
 from app.services.ocm_service import find_three_nearest_stations
-from app.handlers.ocpi_stations import router as bot_stations_router
-from app.api.ocpi import router as api_cdr_router
+# 06.08.2026 — OCPI законсервовано. Звірка check_ocpi.py + перевірка проду:
+# партнера-CPO немає, OCPI_CPO_BASE_URL не заданий (клієнт дивився в mock_cpo.py),
+# три рядки в ocpi_cdrs виявились власними тестами (списували total_cost замість
+# total_energy, тобто до виправлення 17.07). Роутери відключено, код лишається.
+# Розбір: CLAUDE.md §6a. Вмикати назад — тільки коли зʼявиться реальний CPO.
+# from app.handlers.ocpi_stations import router as bot_stations_router
+# from app.api.ocpi import router as api_cdr_router
 from app.handlers.user import router as user_router
 from app.handlers.charge import router as charge_router
 from app.handlers.operator_billing import router as operator_billing_router
@@ -132,7 +137,7 @@ app.add_middleware(
 )
 
 # Реєстрація роутерів FastAPI (HTTP API)
-app.include_router(api_cdr_router)
+# app.include_router(api_cdr_router)   # OCPI законсервовано 06.08.2026, див. рядок 20
 app.include_router(operator_webhook_router)
 app.include_router(wallet_webhook_router)
 app.include_router(charging_hold_webhook_router)
@@ -151,7 +156,7 @@ app.include_router(driver_router)
 # catch-all явно виключає текст, що починається з "/" — але лишається тут
 # заради тієї самої конвенції й щоб регресія (test_ocpp_admin_router.py)
 # перевіряла реальний порядок, а не лише сподівання на нього.
-dp.include_router(bot_stations_router)
+# dp.include_router(bot_stations_router)   # команда /ocpi, законсервовано 06.08.2026
 dp.include_router(operator_billing_router)
 dp.include_router(ocpp_admin_router)
 dp.include_router(user_router)
