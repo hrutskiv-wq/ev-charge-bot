@@ -221,6 +221,22 @@ async def get_stations(lat: float = Query(...), lon: float = Query(...)):
     return {"success": True, "stations": stations}
 
 
+@app.get("/", include_in_schema=False)
+async def get_landing():
+    """
+    Коренева сторінка домену.
+
+    До 11.08.2026 GET / повертав {"detail": "Not Found"}: StaticFiles
+    змонтована на "/" без html=True, тому кореневий запит не мав обробника
+    взагалі. Водіям це не заважало — вони заходять за QR одразу на /s/<id> —
+    але контрагенти, які перевіряють домен із підпису в листі, бачили
+    JSON-помилку.
+
+    Карта станцій лишається на /pwa, як і була.
+    """
+    return FileResponse("public/landing.html")
+
+
 @app.get("/pwa")
 async def get_pwa_index():
     return FileResponse("public/index.html")
