@@ -1,7 +1,7 @@
 """white_label_tenants
 
 Revision ID: 0010_white_label_tenants
-Revises: 0008_add_refund_type
+Revises: 0009_users_and_stations
 Create Date: 2026-07-21 10:00:00.000000
 
 Промпт 1 White-Label білінгу: тенанти (оператори зарядних станцій) та їхні
@@ -33,7 +33,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '0010_white_label_tenants'
-down_revision: Union[str, Sequence[str], None] = '0008_add_refund_type'
+down_revision: Union[str, Sequence[str], None] = '0009_users_and_stations'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
