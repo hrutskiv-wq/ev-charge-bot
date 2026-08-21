@@ -7,8 +7,12 @@ name: CI
 # інтеграційних тестів, які моки принципово не покривають
 # (test_start_ocpp_transaction_live.py — регресія на writable-CTE
 # StartTransaction; test_charging_reservations_live.py — claim_reservation_
-# for_settlement() дійсно серіалізує паралельні виклики, Промпт 3c-ii) —
-# див. PROJECT_CONTEXT.md.
+# for_settlement() дійсно серіалізує паралельні виклики, Промпт 3c-ii;
+# test_alembic_from_scratch_live.py — `alembic upgrade head` на ПОРОЖНІЙ базі
+# дає робочу схему, регресія на міграцію 0009: до неї `users`/`stations`
+# створював лише бутстрап, і ланцюг падав на 0012;
+# test_schema_parity_live.py — схема Alembic проти схеми бутстрапу, базлайн
+# відомих розходжень, падає на НОВОМУ) — див. PROJECT_CONTEXT.md.
 #
 # Job `secret-scan` — бар'єр проти секретів у комітах (scripts/check_secrets.py).
 # ГОЛОВНИЙ бар'єр цього класу: локальний git-хук (scripts/pre-commit) можна не
@@ -126,4 +130,4 @@ jobs:
           OCPI_SECRET_TOKEN: ci-placeholder-token
           BOT_TOKEN: "123456:ci-placeholder-bot-token"
           GEMINI_API_KEY: ci-placeholder-gemini-key
-        run: pytest test_start_ocpp_transaction_live.py test_charging_reservations_live.py -v
+        run: pytest test_start_ocpp_transaction_live.py test_charging_reservations_live.py test_alembic_from_scratch_live.py test_schema_parity_live.py -v
