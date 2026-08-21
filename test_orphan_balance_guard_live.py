@@ -99,6 +99,25 @@ async def pooled(fresh_schema):
         await pool.close()
 
 
+@pytest.fixture
+async def schema_before_fk(fresh_schema):
+    """
+    Схема на 0019 — ДО зовнішнього ключа `kw_transactions.user_id`.
+
+    Потрібна тестам, вихідний стан яких — осиротілий рядок журналу: після
+    0020 такий рядок фізично не вставити, у цьому й сенс ключа. Відкат
+    робиться самим Alembic, а не ручним DROP CONSTRAINT, — щоб перевірявся
+    той самий downgrade, яким користуватиметься людина.
+    """
+    down = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "0019_add_telegram_provider"],
+        cwd=REPO_ROOT, env={**os.environ, "DB_URL": fresh_schema},
+        capture_output=True, text=True,
+    )
+    assert down.returncode == 0, f"downgrade на 0019 впав:\n{down.stderr}"
+    yield fresh_schema
+
+
 def _new_user_id() -> int:
     return int.from_bytes(secrets.token_bytes(5), "big")
 
@@ -161,6 +180,143 @@ async def test_credit_creates_account_and_keeps_invariant(pooled):
         assert balance is not None, "кредит не створив рахунок"
         assert float(balance) == 50.0
         assert float(ledger) == 50.0, "журнал розійшовся з балансом"
+
+
+async def test_correction_requires_existing_account(pooled):
+    """
+    Гілка correction рахунку НЕ створює: коригувати можна лише наявне.
+    Контракт той самий, що на дебетних гілках — BalanceRowMissing і чистий
+    журнал.
+    """
+    user_id = _new_user_id()
+
+    with pytest.raises(BalanceRowMissing):
+        await update_user_balance(user_id, -50.0, t_type="correction")
+
+    async with pooled.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM kw_transactions WHERE user_id = $1", user_id
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM users WHERE user_id = $1", user_id
+        ) == 0
+
+
+async def test_correction_amount_is_signed_both_ways(pooled):
+    """
+    Знак приходить ЗЗОВНІ, функція його не вигадує: correction(-N) списує,
+    correction(+N) нараховує. Це єдина знакова гілка, і саме тому переплутати
+    її з рештою (які беруть модуль) — дорого.
+
+    Тип у журналі має бути 'correction', а не 'withdrawal': до 21.08.2026
+    його не було в enum-розгалуженні функції, і correction мовчки лягав
+    у загальний else саме як 'withdrawal'.
+    """
+    user_id = _new_user_id()
+    await update_user_balance(user_id, 100.0, t_type="deposit")
+
+    await update_user_balance(user_id, -30.0, t_type="correction", description="мінус")
+    await update_user_balance(user_id, 5.0, t_type="correction", description="плюс")
+
+    async with pooled.acquire() as conn:
+        balance = float(await conn.fetchval(
+            "SELECT balance FROM users WHERE user_id = $1", user_id
+        ))
+        ledger = float(await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1", user_id
+        ))
+        amounts = [float(r["amount"]) for r in await conn.fetch(
+            "SELECT amount FROM kw_transactions WHERE user_id = $1 AND type = 'correction' "
+            "ORDER BY id", user_id
+        )]
+
+    assert balance == 75.0, "100 - 30 + 5"
+    assert ledger == balance, "журнал розійшовся з балансом"
+    assert amounts == [-30.0, 5.0], "знак не збережено як переданий"
+
+
+async def test_repair_script_default_keeps_ledger_balance(schema_before_fk):
+    """
+    Дефолт скрипта — створити рахунок із сумою журналу, НЕ занулювати.
+    Для справжнього осиротілого користувача занулення знищило б реальні
+    кВт·год, тому мовчазним воно бути не може.
+    """
+    orphan_id = _new_user_id()
+    conn = await asyncpg.connect(schema_before_fk)
+    try:
+        await conn.execute(
+            "INSERT INTO kw_transactions (user_id, type, amount, description) "
+            "VALUES ($1, 'deposit', 42.00, 'справжній осиротілий користувач')",
+            orphan_id,
+        )
+    finally:
+        await conn.close()
+
+    done = subprocess.run(
+        [sys.executable, "scripts/repair_orphan_balance.py", str(orphan_id), "--apply"],
+        cwd=REPO_ROOT, env={**os.environ, "DB_URL": schema_before_fk},
+        capture_output=True, text=True,
+    )
+    assert done.returncode == 0, f"{done.stdout}\n{done.stderr}"
+
+    conn = await asyncpg.connect(schema_before_fk)
+    try:
+        assert float(await conn.fetchval(
+            "SELECT balance FROM users WHERE user_id = $1", orphan_id
+        )) == 42.0, "дефолт занулив баланс — реальні кВт·год загинули б"
+        assert await conn.fetchval(
+            "SELECT count(*) FROM kw_transactions WHERE user_id = $1", orphan_id
+        ) == 1, "дефолт дописав рядок у журнал, хоч не мав"
+    finally:
+        await conn.close()
+
+
+async def test_repair_script_zero_out_appends_correction(schema_before_fk):
+    """
+    `--zero-out` створює рахунок І зануляє його коригувальним рядком.
+    Початковий рядок журналу НЕ зникає — append-only: слід помилки має
+    лишитись видимим назавжди.
+    """
+    orphan_id = _new_user_id()
+    reason = "ID самого бота, нараховано помилково видаленим вебхуком"
+    conn = await asyncpg.connect(schema_before_fk)
+    try:
+        await conn.execute(
+            "INSERT INTO kw_transactions (user_id, type, amount, description) "
+            "VALUES ($1, 'deposit', 50.00, 'Успішна оплата пакету: 50.0 кВт·год через Банку Monobank')",
+            orphan_id,
+        )
+    finally:
+        await conn.close()
+
+    done = subprocess.run(
+        [sys.executable, "scripts/repair_orphan_balance.py", str(orphan_id),
+         "--apply", "--zero-out", reason],
+        cwd=REPO_ROOT, env={**os.environ, "DB_URL": schema_before_fk},
+        capture_output=True, text=True,
+    )
+    assert done.returncode == 0, f"{done.stdout}\n{done.stderr}"
+
+    conn = await asyncpg.connect(schema_before_fk)
+    try:
+        assert float(await conn.fetchval(
+            "SELECT balance FROM users WHERE user_id = $1", orphan_id
+        )) == 0.0, "фантомний баланс лишився"
+        rows = await conn.fetch(
+            "SELECT type::text AS t, amount, description FROM kw_transactions "
+            "WHERE user_id = $1 ORDER BY id", orphan_id
+        )
+        assert len(rows) == 2, "початковий рядок мав ЛИШИТИСЬ, а коригувальний — додатись"
+        assert rows[0]["t"] == "deposit" and float(rows[0]["amount"]) == 50.0
+        assert rows[1]["t"] == "correction" and float(rows[1]["amount"]) == -50.0
+        assert reason in rows[1]["description"], (
+            "причина не потрапила в журнал — а це єдине місце, де вона лишиться"
+        )
+        assert float(await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1", orphan_id
+        )) == 0.0
+    finally:
+        await conn.close()
 
 
 async def test_fk_migration_fails_on_orphan_and_passes_after_repair(fresh_schema):

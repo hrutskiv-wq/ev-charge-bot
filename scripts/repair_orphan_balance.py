@@ -2,34 +2,42 @@
 Ремонт осиротілого балансу: створити відсутній рядок `users` для
 користувача, на якого вже посилається журнал `kw_transactions`.
 
-    python scripts/repair_orphan_balance.py                 # знайти всіх, нічого не міняти
-    python scripts/repair_orphan_balance.py 8855895437      # dry-run по одному
+    python scripts/repair_orphan_balance.py                      # перелік, нічого не міняти
+    python scripts/repair_orphan_balance.py 8855895437           # dry-run по одному
     python scripts/repair_orphan_balance.py 8855895437 --apply
+    python scripts/repair_orphan_balance.py 8855895437 --apply --zero-out "причина"
 
 ## Навіщо окремий скрипт
 
-Штатного способу зробити це не існує, і саме тому потрібен скрипт, а не
-виклик наявної функції:
+Штатного способу привести кеш до наявного журналу не існує:
 
   * `get_user_data()` створює рядок із `balance = 0.00`. Журнал каже +50 —
     інваріант лишається зламаним, лише інакше;
-  * `update_user_balance()` допише ЩЕ ОДИН рядок у журнал: сума стане +100
-    при балансі 50. Гірше, ніж було;
-  * гілки `correction` у ній немає взагалі — `correction` потрапив би у
-    фінальний `else` і СПИСАВСЯ б. Спостерігалось 06.08.2026, задокументовано
-    в `CLAUDE.md` §6b.
+  * `update_user_balance()` сам по собі допише ЩЕ ОДИН рядок у журнал:
+    сума стане +100 при балансі 50. Гірше, ніж було.
 
-## Що робить і чого не робить
+Тому баланс береться з журналу прямою вставкою, а далі — за потреби —
+коригується ШТАТНО, через `update_user_balance(t_type="correction")`.
 
-Рахує баланс як `SUM(kw_transactions.amount)` по цьому користувачу і
-створює рядок `users` з цим значенням. **Журналу не торкається взагалі** —
-ні INSERT, ні UPDATE, ні DELETE.
+## Два режими, і різниця між ними коштує реальних кВт·год
 
-Коригувальний рядок навмисно НЕ додається. Журнал append-only і є джерелом
-правди; рядок +50 не був помилковим — була відсутня похідна від нього.
-Занулення означало б дописати `correction −50`, тобто стверджувати, що
-відбулась компенсація, якої не було. Розбір і обґрунтування —
-`docs/plan-orphan-balance-guard.md` §2.3.
+**Дефолт — створити рахунок із сумою журналу.** Для справжнього осиротілого
+користувача це єдине правильне: журнал каже, що йому належить N кВт·год,
+і рахунок має це відображати.
+
+**`--zero-out "причина"` — додатково занулити коригувальним рядком.**
+Вмикається ЯВНО й лише тоді, коли нарахування було помилковим по суті.
+Дефолтом бути не може: мовчазне занулення знищило б реальні кВт·год
+справжнього користувача.
+
+Обидві дії йдуть в ОДНІЙ транзакції, тому проміжний баланс (сума журналу
+до коригування) ззовні не спостерігається.
+
+## Журнал
+
+Не редагується й не видаляється **ніколи**. `--zero-out` не прибирає
+початковий рядок, а ДОПИСУЄ коригувальний — append-only лишається
+append-only, а слід помилки лишається видимим назавжди.
 
 ## Порядок
 
@@ -52,6 +60,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.database import connection  # noqa: E402
 
+# LEFT JOIN, не JOIN — з тієї самої причини, що в канонічному запиті
+# інваріанта (`CLAUDE.md` §6b): внутрішнє з'єднання не бачить саме тих
+# рядків, які шукаємо.
 ORPHANS_SQL = """
     SELECT t.user_id,
            SUM(t.amount) AS ledger_sum,
@@ -63,10 +74,6 @@ ORPHANS_SQL = """
     ORDER BY t.user_id
 """
 
-# LEFT JOIN, не JOIN — з тієї самої причини, що в канонічному запиті
-# інваріанта (`CLAUDE.md` §6b): внутрішнє з'єднання не бачить саме тих
-# рядків, які шукаємо.
-
 
 async def _list_orphans(conn, user_id=None):
     rows = await conn.fetch(ORPHANS_SQL)
@@ -75,7 +82,64 @@ async def _list_orphans(conn, user_id=None):
     return rows
 
 
-async def repair(user_id: int | None, apply: bool) -> int:
+async def _repair_one(conn, user_id: int, zero_out: str | None) -> None:
+    """Один осиротілий користувач, одна транзакція."""
+    async with conn.transaction():
+        # Баланс беремо з журналу тим самим запитом, у тій самій транзакції —
+        # щоб між читанням і вставкою не з'явився новий рядок журналу й
+        # значення не розійшлись.
+        tag = await conn.execute(
+            """
+            INSERT INTO users (user_id, balance)
+            SELECT $1, COALESCE(SUM(amount), 0)
+            FROM kw_transactions
+            WHERE user_id = $1
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            user_id,
+        )
+        if connection._rows_affected(tag) == 0:
+            print(f"  user_id={user_id}: рядок уже існує — пропущено")
+            return
+
+        created = await conn.fetchval(
+            "SELECT balance FROM users WHERE user_id = $1", user_id
+        )
+        print(f"  user_id={user_id}: рахунок створено, balance={created}")
+
+        if zero_out:
+            # Штатний шлях: гілка correction зі ЗНАКОВОЮ сумою, у ТІЙ САМІЙ
+            # транзакції (conn передається). Проміжний баланс ззовні не
+            # спостерігається.
+            await connection.update_user_balance(
+                user_id=user_id,
+                amount_kwh=-float(created),
+                t_type="correction",
+                conn=conn,
+                description=zero_out,
+            )
+            print(f"  user_id={user_id}: коригування {-float(created)} записано")
+
+        balance = await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id)
+        ledger = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1", user_id
+        )
+        ok = abs(float(balance) - float(ledger)) < 0.0001
+        print(
+            f"  user_id={user_id}: balance={balance}, сума журналу={ledger} — "
+            f"{'OK' if ok else 'РОЗБІЖНІСТЬ'}"
+        )
+        if not ok:
+            raise RuntimeError(
+                f"інваріант не зійшовся для user_id={user_id} — транзакцію відкочено"
+            )
+
+
+async def repair(user_id: int | None, apply: bool, zero_out: str | None) -> int:
+    if zero_out and user_id is None:
+        print("--zero-out вимагає конкретного user_id: занулювати всіх підряд не можна.")
+        return 2
+
     await connection.init_postgres()
     pool = await connection.get_db_pool()
     try:
@@ -95,46 +159,13 @@ async def repair(user_id: int | None, apply: bool) -> int:
                 )
 
             if not apply:
-                print("\nDRY-RUN: нічого не змінено. Для запису додайте --apply.")
+                mode = "створити рахунок + занулити коригуванням" if zero_out else "створити рахунок із сумою журналу"
+                print(f"\nРежим: {mode}")
+                print("DRY-RUN: нічого не змінено. Для запису додайте --apply.")
                 return 0
 
             for row in orphans:
-                uid = row["user_id"]
-                async with conn.transaction():
-                    # Баланс береться з журналу тим самим запитом, в одній
-                    # транзакції — щоб між читанням і вставкою не з'явився
-                    # новий рядок журналу й не розійшлись значення.
-                    tag = await conn.execute(
-                        """
-                        INSERT INTO users (user_id, balance)
-                        SELECT $1, COALESCE(SUM(amount), 0)
-                        FROM kw_transactions
-                        WHERE user_id = $1
-                        ON CONFLICT (user_id) DO NOTHING
-                        """,
-                        uid,
-                    )
-                    if connection._rows_affected(tag) == 0:
-                        print(f"  user_id={uid}: рядок уже існує — пропущено")
-                        continue
-
-                    balance = await conn.fetchval(
-                        "SELECT balance FROM users WHERE user_id = $1", uid
-                    )
-                    ledger = await conn.fetchval(
-                        "SELECT COALESCE(SUM(amount), 0) FROM kw_transactions WHERE user_id = $1",
-                        uid,
-                    )
-                    ok = abs(float(balance) - float(ledger)) < 0.0001
-                    mark = "OK" if ok else "РОЗБІЖНІСТЬ"
-                    print(
-                        f"  user_id={uid}: створено, balance={balance}, "
-                        f"сума журналу={ledger} — {mark}"
-                    )
-                    if not ok:
-                        raise RuntimeError(
-                            f"інваріант не зійшовся для user_id={uid} — транзакцію відкочено"
-                        )
+                await _repair_one(conn, row["user_id"], zero_out)
 
             remaining = await _list_orphans(conn, user_id)
             print(f"\nЗалишилось осиротілих: {len(remaining)}")
@@ -144,9 +175,25 @@ async def repair(user_id: int | None, apply: bool) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("user_id", nargs="?", type=int, help="полагодити лише цього; без нього — лише перелік")
-    parser.add_argument("--apply", action="store_true", help="справді записати (без нього — dry-run)")
+    parser = argparse.ArgumentParser(
+        description="Ремонт осиротілого балансу: створити відсутній рядок users.",
+    )
+    parser.add_argument(
+        "user_id", nargs="?", type=int,
+        help="полагодити лише цього; без нього — лише перелік",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="справді записати (без нього — dry-run)",
+    )
+    parser.add_argument(
+        "--zero-out", metavar="ПРИЧИНА", default=None,
+        help=(
+            "додатково занулити баланс коригувальним рядком із цим описом. "
+            "ЛИШЕ коли нарахування помилкове по суті — для справжнього "
+            "користувача це знищить реальні кВт·год"
+        ),
+    )
     args = parser.parse_args()
 
-    sys.exit(asyncio.run(repair(args.user_id, args.apply)))
+    sys.exit(asyncio.run(repair(args.user_id, args.apply, args.zero_out)))
