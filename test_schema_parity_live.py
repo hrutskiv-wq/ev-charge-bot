@@ -94,13 +94,18 @@ KNOWN_DIFFERENCES = frozenset({
     "A col ocpi_cdrs.user_id bigint(64,0,-1) null=NO",
     "B col ocpi_cdrs.user_id bigint(64,0,-1) null=YES",
 
-    # -- Зовнішні ключі на users. У схемі Alembic їх НЕМАЄ ЖОДНОГО.
+    # -- Зовнішні ключі на users. У схемі Alembic їх спершу не було ЖОДНОГО.
     #    Це пояснює спостереження на проді 06.08.2026 (`CLAUDE.md` §6a):
     #    "FK ocpi_cdrs.user_id → users(user_id) у проді не діє" — таблиця
     #    приїхала з початкової міграції, де ключа ніколи не було, а не
     #    зіпсувалась пізніше.
+    #
+    #    `kw_transactions.user_id` звідси ПРИБРАНО 21.08.2026: міграція 0020
+    #    додала ключ в Alembic-гілку, розходження зникло. Рядок прибрано тим
+    #    самим комітом, що й міграція — інакше `main` червоний в один бік
+    #    або в інший (див. другу перевірку test_no_new_schema_divergence).
+    #    Два, що лишились, — наступний пункт боргу.
     "B fk payments.user_id -> users.user_id",
-    "B fk kw_transactions.user_id -> users.user_id",
     "B fk ocpi_cdrs.user_id -> users.user_id",
 
     # -- ENUM. 0019 додав 'telegram' в Alembic-гілку, але 'liqpay' лишився
