@@ -245,6 +245,14 @@ async def update_user_balance(
         Списати з рахунку, якого не існує, неможливо за визначенням. До
         цієї правки такий виклик створював рядок і заганяв баланс у мінус.
 
+    t_type="correction" — ЄДИНА гілка зі ЗНАКОВИМ amount_kwh. Решта беруть
+    модуль і напрям визначають типом; коригування спрямоване за природою
+    (буває в обидва боки), тому знак приходить ззовні: correction(-50)
+    списує, correction(50) нараховує. Рахунок не створює — коригувати можна
+    лише наявне; відсутній рядок дає BalanceRowMissing, як на дебетних
+    гілках. Гілку додано 21.08.2026: до того "correction" мовчки потрапляв
+    у загальний else і лягав у журнал типом 'withdrawal' (CLAUDE.md §6b).
+
     ВАЖЛИВО про знак amount у kw_transactions: депозит пишеться додатним
     числом, списання — від'ємним. Це зроблено навмисно, бо в кількох
     місцях системи (app/services/ocpi/commands_service.py,
@@ -332,6 +340,37 @@ async def update_user_balance(
                 VALUES ($1, $2::transaction_type, $3, $4, $5, $6)
                 """,
                 user_id, "release", amount_kwh, payment_id, session_id, desc,
+            )
+            return True
+
+        if t_type == "correction":
+            # ЗНАКОВА гілка — єдина така. Решта беруть модуль і напрям
+            # визначають типом; коригування спрямоване за своєю природою
+            # (буває і в плюс, і в мінус), тому знак приходить ЗЗОВНІ й
+            # функція його не вигадує. Плутати ці дві конвенції не можна:
+            # correction(-50) списує, correction(50) нараховує.
+            #
+            # Рахунок НЕ створюється: коригувати можна лише те, що існує.
+            # Тому t_type="correction" немає у списку автостворення вище.
+            #
+            # До 21.08.2026 гілки не було зовсім, і "correction" потрапляв
+            # у фінальний else — тобто списувався й лягав у журнал типом
+            # 'withdrawal'. Через це коригування 06.08.2026 довелось писати
+            # в журнал руками (CLAUDE.md §6b).
+            tag = await active_conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
+            )
+            if _rows_affected(tag) == 0:
+                raise BalanceRowMissing(
+                    f"users.user_id={user_id} відсутній — коригувати нічого"
+                )
+            desc = description or "Коригування балансу"
+            await active_conn.execute(
+                """
+                INSERT INTO kw_transactions (user_id, type, amount, payment_id, session_id, description)
+                VALUES ($1, $2::transaction_type, $3, $4, $5, $6)
+                """,
+                user_id, "correction", amount_kwh, payment_id, session_id, desc,
             )
             return True
 
