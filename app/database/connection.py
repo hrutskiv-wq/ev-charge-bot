@@ -9,6 +9,35 @@ _initializing = False
 
 PRICE_PER_KWH = 15.0  # Вартість 1 кВт·год у гривнях
 
+
+class BalanceRowMissing(RuntimeError):
+    """
+    Спроба змінити баланс користувача, рядка якого немає в `users`.
+
+    Навмисно виняток, а не False: False на дебетних гілках уже означає
+    «не вистачило балансу» — очікуваний бізнес-результат, який викликач
+    обробляє (`operators_repo.create_charging_reservation` відкочує
+    резервацію). Відсутній користувач — не бізнес-результат, а баг; якби
+    він приходив тим самим False, резервація тихо не створювалась би
+    замість того, щоб голосно впасти.
+
+    Виняток відкочує транзакцію, тому запис у `kw_transactions` НЕ
+    залишається — саме це й потрібно: журнал не має поповнюватись
+    записом про рахунок, якого не існує.
+    """
+
+
+def _rows_affected(command_tag: str) -> int:
+    """
+    Кількість рядків із тега команди asyncpg («UPDATE 1», «INSERT 0 1»).
+
+    Раніше гілка `hold` перевіряла це як `result.endswith("1")` — на
+    однорядковому UPDATE за первинним ключем воно працює, але так само
+    прийняло б «UPDATE 11» чи «UPDATE 21». На грошовому шляху такої
+    приблизності краще не лишати.
+    """
+    return int(command_tag.rsplit(" ", 1)[-1])
+
 def uah_to_kwh(amount_uah: float) -> float:
     return amount_uah / PRICE_PER_KWH
 
@@ -186,9 +215,35 @@ async def update_user_balance(
     description: str = None,
 ):
     """
-    Єдина точка запису балансу (кВт·год). Атомарно оновлює кешоване
-    users.balance І пише запис у журнал kw_transactions в одній транзакції,
-    тому вони ніколи не розходяться між собою.
+    Єдина точка запису балансу (кВт·год). Оновлює кешоване users.balance
+    і пише запис у журнал kw_transactions в одній транзакції.
+
+    МЕЖА ГАРАНТІЇ — читати уважно, тут раніше стояло хибне твердження.
+    Попередня редакція докстрінга обіцяла, що баланс і журнал «ніколи не
+    розходяться між собою». Атомарність справді є, але вона поширюється
+    ЛИШЕ на записи, що йдуть через цю функцію. Записи в обхід вона не
+    бачить і захистити не може.
+
+    Саме так і стався інцидент 15.07.2026: вебхук Monobank
+    (`app/api/payments.py`, видалений 28.07.2026) писав у `payments` і
+    `kw_transactions` власною транзакцією, не викликаючи цю функцію й не
+    торкаючись `users`. Результат — рядок журналу на +50 кВт·год для
+    користувача, якого не існує. Розбір — `docs/plan-orphan-balance-guard.md`.
+
+    Відомі обхідні шляхи, що лишились: текстовий ваучер
+    (`app/handlers/user.py`, прямий UPDATE+INSERT) і разовий `add_deposit.py`.
+    Перелік порушень правила «одна точка запису» — `PROJECT_CONTEXT.md` §6.3.
+    Цілісність `user_id` незалежно від шляху запису тримає зовнішній ключ
+    `kw_transactions.user_id -> users(user_id)` (міграція 0020).
+
+    ВІДСУТНІЙ КОРИСТУВАЧ — по-різному для кредиту й дебету:
+      * кредит (deposit / monobank_jar / refund / release) — рядок `users`
+        створюється (INSERT ... ON CONFLICT DO NOTHING). Гроші вже прийняті;
+        відмовити в зарахуванні оплаченого поповнення через відсутній рядок
+        кешу означало б втратити гроші користувача заради чистоти схеми;
+      * дебет (hold і загальна гілка) — піднімається BalanceRowMissing.
+        Списати з рахунку, якого не існує, неможливо за визначенням. До
+        цієї правки такий виклик створював рядок і заганяв баланс у мінус.
 
     ВАЖЛИВО про знак amount у kw_transactions: депозит пишеться додатним
     числом, списання — від'ємним. Це зроблено навмисно, бо в кількох
@@ -226,13 +281,27 @@ async def update_user_balance(
     """
 
     async def _apply(active_conn) -> bool:
-        await active_conn.execute(
-            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
-        )
-        if t_type in ["deposit", "monobank_jar", "refund"]:
+        # Автостворення рахунку — ТІЛЬКИ на кредитних гілках (див. докстрінг).
+        # Раніше цей INSERT стояв тут безумовно, тому дебет неіснуючому
+        # користувачеві створював рядок із balance = 0.00 і далі заганяв
+        # його у мінус.
+        if t_type in ["deposit", "monobank_jar", "refund", "release"]:
             await active_conn.execute(
+                "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+            )
+
+        if t_type in ["deposit", "monobank_jar", "refund"]:
+            tag = await active_conn.execute(
                 "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
             )
+            if _rows_affected(tag) == 0:
+                # Недосяжно за нормального ходу — рядок щойно створено вище.
+                # Перевірка лишається як запобіжник від регресії: якщо той
+                # INSERT колись приберуть чи перенесуть, це впаде голосно,
+                # а не допише в журнал запис без рахунку.
+                raise BalanceRowMissing(
+                    f"users.user_id={user_id} відсутній на кредитній гілці t_type={t_type}"
+                )
             ledger_type = "refund" if t_type == "refund" else "deposit"
             default_desc = (
                 "Повернення коштів (компенсація)" if t_type == "refund"
@@ -249,9 +318,13 @@ async def update_user_balance(
             return True
 
         if t_type == "release":
-            await active_conn.execute(
+            tag = await active_conn.execute(
                 "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount_kwh, user_id
             )
+            if _rows_affected(tag) == 0:
+                raise BalanceRowMissing(
+                    f"users.user_id={user_id} відсутній на кредитній гілці t_type=release"
+                )
             desc = description or "Звільнення невикористаного резерву"
             await active_conn.execute(
                 """
@@ -263,11 +336,22 @@ async def update_user_balance(
             return True
 
         if t_type == "hold":
-            result = await active_conn.execute(
+            tag = await active_conn.execute(
                 "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1",
                 amount_kwh, user_id,
             )
-            if not result.endswith("1"):
+            if _rows_affected(tag) == 0:
+                # Нуль рядків тут означає ОДНЕ З ДВОХ: не вистачило балансу
+                # або рахунку не існує — умова WHERE перевіряє обидва.
+                # Розрізняємо додатковим запитом лише на цій гілці, щоб не
+                # платити зайвим SELECT у щасливому шляху.
+                account_exists = await active_conn.fetchval(
+                    "SELECT 1 FROM users WHERE user_id = $1", user_id
+                )
+                if account_exists is None:
+                    raise BalanceRowMissing(
+                        f"users.user_id={user_id} відсутній — резерв неможливий"
+                    )
                 return False
             desc = description or "Резерв кВт·год на сесію зарядки"
             await active_conn.execute(
@@ -279,10 +363,16 @@ async def update_user_balance(
             )
             return True
 
-        # Загальне списання (напр. t_type="ocpi_session") — БЕЗ ЗМІН.
-        await active_conn.execute(
+        # Загальне списання (напр. t_type="ocpi_session"). Захисту від мінуса
+        # тут навмисно немає — на відміну від "hold" (див. вище). Тому нуль
+        # зачеплених рядків означає рівно одне: рахунку не існує.
+        tag = await active_conn.execute(
             "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount_kwh, user_id
         )
+        if _rows_affected(tag) == 0:
+            raise BalanceRowMissing(
+                f"users.user_id={user_id} відсутній — списання t_type={t_type} неможливе"
+            )
         desc = description or f"Списання за сесію зарядки ({t_type})"
         await active_conn.execute(
             """

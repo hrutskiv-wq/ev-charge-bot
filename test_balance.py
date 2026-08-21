@@ -15,14 +15,32 @@ from app.database.connection import update_user_balance
 
 
 class FakeConnection:
-    """Мінімальна заглушка asyncpg.Connection: лише запам'ятовує виклики execute()."""
+    """Мінімальна заглушка asyncpg.Connection: лише запам'ятовує виклики execute().
+
+    Повертає тег команди («UPDATE 1»), а не «OK», бо з 21.08.2026
+    update_user_balance() рахує з нього кількість зачеплених рядків
+    (`_rows_affected`) — нуль означає, що рядка `users` немає, і піднімає
+    BalanceRowMissing. «OK» давало ValueError на int(); заглушка має
+    віддавати те саме, що віддає asyncpg, інакше вона перевіряє не той код.
+
+    fetchval потрібен тій самій логіці: на гілці 'hold' нуль рядків
+    неоднозначний (немає коштів АБО немає рахунку), і код розрізняє їх
+    додатковим SELECT. Тут рахунок вважається наявним — сценарій
+    «рахунку немає» перевіряється на живій базі
+    (test_orphan_balance_guard_live.py), бо мок не має ні транзакції,
+    ні відкоту й довести незаписаність журналу не може.
+    """
 
     def __init__(self):
         self.calls = []
 
     async def execute(self, query, *args):
         self.calls.append((" ".join(query.split()), args))
-        return "OK"
+        return "UPDATE 1"
+
+    async def fetchval(self, query, *args):
+        self.calls.append((" ".join(query.split()), args))
+        return 1
 
 
 def _find_call(fake_conn, needle):
@@ -127,7 +145,7 @@ class FakeConnectionWithBalance(FakeConnection):
                 self.balance -= amount_kwh
                 return "UPDATE 1"
             return "UPDATE 0"
-        return "OK"
+        return "UPDATE 1"
 
 
 async def test_hold_decreases_balance_and_stores_hold_type_when_sufficient():
