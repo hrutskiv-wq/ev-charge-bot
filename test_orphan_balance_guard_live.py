@@ -163,6 +163,66 @@ async def test_credit_creates_account_and_keeps_invariant(pooled):
         assert float(ledger) == 50.0, "журнал розійшовся з балансом"
 
 
+async def test_fk_migration_fails_on_orphan_and_passes_after_repair(fresh_schema):
+    """
+    Порядок «спершу залатати, потім FK» — доведений, а не заявлений.
+
+    На схемі 0019 (до FK) вставляємо осиротілий рядок журналу, потім
+    пробуємо накотити 0020: має впасти. Далі проганяємо
+    scripts/repair_orphan_balance.py --apply і накочуємо знову: має пройти.
+
+    Це і є вплив FK на наявні дані: `ADD CONSTRAINT` без `NOT VALID`
+    перевіряє всі наявні рядки негайно, тому один осиротілий user_id
+    зупиняє міграцію.
+    """
+    downgraded = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "0019_add_telegram_provider"],
+        cwd=REPO_ROOT, env={**os.environ, "DB_URL": fresh_schema},
+        capture_output=True, text=True,
+    )
+    assert downgraded.returncode == 0, downgraded.stderr
+
+    orphan_id = _new_user_id()
+    conn = await asyncpg.connect(fresh_schema)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO kw_transactions (user_id, type, amount, description)
+            VALUES ($1, 'deposit', 50.00, 'осиротілий рядок для тесту')
+            """,
+            orphan_id,
+        )
+    finally:
+        await conn.close()
+
+    env = {**os.environ, "DB_URL": fresh_schema}
+
+    failed = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+    )
+    assert failed.returncode != 0, (
+        "0020 накотилась попри осиротілий рядок — FK не перевіряє наявні дані"
+    )
+    assert "ForeignKeyViolation" in failed.stderr or "foreign key" in failed.stderr.lower(), (
+        f"впало не на зовнішньому ключі:\n{failed.stderr[-800:]}"
+    )
+
+    repaired = subprocess.run(
+        [sys.executable, "scripts/repair_orphan_balance.py", str(orphan_id), "--apply"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+    )
+    assert repaired.returncode == 0, f"ремонт не спрацював:\n{repaired.stdout}\n{repaired.stderr}"
+
+    migrated = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+    )
+    assert migrated.returncode == 0, (
+        f"після ремонту 0020 все одно не накотилась:\n{migrated.stderr[-800:]}"
+    )
+
+
 async def test_hold_without_funds_still_returns_false(pooled):
     """
     Нестача коштів лишилась `False`, а не стала винятком. Це різні події:
