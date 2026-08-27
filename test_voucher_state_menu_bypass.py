@@ -86,8 +86,20 @@ async def test_actually_invalid_code_still_shows_invalid_code_message():
     assert "Невірний код ваучера" in sent_text
 
 
-async def test_valid_promo_code_still_credits_balance():
-    """І що реально валідний код досі нараховує кВт·год (не зачеплено фіксом)."""
+async def test_former_hardcoded_code_is_now_rejected():
+    """
+    "VOLT100" більше не нараховує нічого.
+
+    Цей тест раніше стверджував протилежне («Код прийнято») — він перевіряв
+    поведінку, яку видалено 24.08.2026 разом із захардкодженим кодом
+    (PROJECT_CONTEXT.md §6.3). Лишається інвертованим, а не прибраним, бо
+    саме рядок `VOLT100` у тестах — єдине місце, з якого видно, що код колись
+    існував і що його прибрали свідомо, а не загубили.
+
+    Перевірка, що при цьому НІЧОГО не записано в базу, — на живому Postgres
+    (`test_voucher_removed_live.py`): мок не має ані транзакції, ані стану,
+    тому «не нарахувало» він довести не може.
+    """
     message = _make_message("VOLT100")
     state = AsyncMock()
 
@@ -95,4 +107,4 @@ async def test_valid_promo_code_still_credits_balance():
         await process_text_voucher(message, state)
 
     sent_text = message.answer.call_args[0][0]
-    assert "Код прийнято" in sent_text
+    assert "Невірний код ваучера" in sent_text
