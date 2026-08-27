@@ -1022,21 +1022,28 @@ async def process_text_voucher(message: types.Message, state: FSMContext):
         await cmd_back_to_menu(message, state)
         return
 
-    user_id = message.from_user.id
-
-    if user_code in ["VOLTie100", "VOLT100"]:
-        bonus_kwh = 100.0
-        async with db_conn.db_pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", bonus_kwh, user_id)
-                await conn.execute("""
-                    INSERT INTO kw_transactions (user_id, type, amount, description) 
-                    VALUES ($1, 'deposit', $2, $3)
-                """, user_id, bonus_kwh, f"Активація текстового ваучера {user_code}")
-                
-        await message.answer(f"✅ Код прийнято! Нараховано +100.00 кВт·год.", reply_markup=get_main_menu())
-    else:
-        await message.answer("❌ Невірний код ваучера.", reply_markup=get_main_menu())
+    # Захардкоджений код "VOLTie100" / "VOLT100" видалено 24.08.2026.
+    #
+    # Він нараховував 100 кВт·год прямим UPDATE users + INSERT kw_transactions,
+    # тобто в обхід update_user_balance() — четверте й останнє порушення правила
+    # "одна точка запису" (PROJECT_CONTEXT.md §6.3). Без ідемпотентності: код
+    # можна було ввести необмежену кількість разів. Без запису в `payments`,
+    # тому reconcile_payments.py цього шляху не бачив узагалі.
+    #
+    # Підстава для видалення, а не для ремонту, — запит до прода 21.08.2026:
+    # у kw_transactions ЖОДНОГО рядка з description LIKE '%ваучер%', усі шість
+    # депозитів пояснені (Monobank-пакети, Telegram Invoice, один "Test
+    # Deposit"). Активацій не було ніколи — це залишок тестового гачка, а не
+    # промокод у роздачі.
+    #
+    # Механізму роздачі промокодів у продукті немає. Якщо він знадобиться —
+    # це окремий бандл із планом ДО коду: таблиця погашень, ідемпотентність,
+    # запис через update_user_balance(). Повертати рядок за фіче-флагом чи
+    # env-змінною не можна: флаг лише ховає той самий обхідний запис.
+    #
+    # Перехоплення кнопок меню вище НЕ чіпати — воно закриває окремий баг
+    # (хендлер ковтав будь-яке повідомлення, поки бот чекав код).
+    await message.answer("❌ Невірний код ваучера.", reply_markup=get_main_menu())
 
 # --- Обробка платіжних інвойсів Telegram ---
 
